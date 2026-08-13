@@ -2,11 +2,25 @@
 //! ponytail: 够读就行，不追求完整 HTML 渲染；坏在这里也只是排版丑，不会崩。
 
 /// 正文按 HTML 解析出的一个有序单元。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineLinkRange {
+    pub url: String,
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Block {
     Text(String),
     Strong(String),
     /// HTML `h1`–`h6` 标题；与正文中的行内加粗分开保留。
     Heading(String),
+    /// A heading whose visible text is also an anchor. Keeping this separate
+    /// lets index/guide pages retain both their card hierarchy and navigation.
+    HeadingLink {
+        text: String,
+        links: Vec<InlineLinkRange>,
+    },
     /// HTML `blockquote` 引用块。块内的行内标签会被折叠为可读文本，
     /// 但引用边界会保留给渲染层。
     Quote(String),
@@ -20,6 +34,19 @@ pub enum Block {
         text: String,
         url: String,
         link_start: usize,
+        /// Literal whitespace followed the closing anchor before the next
+        /// inline text. This preserves `<a>docs</a> and` without breaking
+        /// `<a>modif</a>y`.
+        space_after: bool,
+    },
+    /// Structural boundary for one HTML list item. The markers keep inline
+    /// fragments inside the item without letting the renderer absorb the
+    /// paragraph that follows `</li>`.
+    ListItemStart {
+        depth: usize,
+    },
+    ListItemEnd {
+        depth: usize,
     },
     /// 绝对图片 URL（已按文章 base 补全）。
     Image(String),
@@ -56,24 +83,30 @@ struct LinkState {
 
 /// Prepare a complete web page for local storage and later rendering.
 ///
-/// The largest `<article>` is preferred when a page contains more than one;
-/// otherwise the largest `<main>`, then `<body>`, and finally the full input is
-/// used.  Script, style and surrounding navigation elements are removed even
-/// when the caller supplied only an HTML fragment.
+/// The page's `<main>`, then `<body>`, and finally the full input determines
+/// the broad reading scope.  A single `<article>` inside that scope narrows it
+/// further; multiple articles mean the page is probably an index and are kept
+/// together. Script, style and surrounding navigation elements are removed
+/// even when the caller supplied only an HTML fragment.
 pub fn prepare_html_snapshot(html: &str) -> HtmlSnapshot {
     let title = extract_html_title(html);
     let base_href = extract_html_base_href(html);
     let cleaned = strip_ignored_elements(html);
-    let readable = ["article", "main", "body"]
+    let broad_scope = ["main", "body"]
         .into_iter()
         .find_map(|name| largest_element_inner(&cleaned, name))
-        .unwrap_or(cleaned.as_str())
-        .trim()
-        .to_owned();
+        .unwrap_or(cleaned.as_str());
+    let articles = element_bounds(broad_scope, "article");
+    let readable = if let [article] = articles.as_slice() {
+        &broad_scope[article.inner_start..article.inner_end]
+    } else {
+        broad_scope
+    };
+    let readable = remove_duplicate_leading_h1(readable, title.as_deref());
 
     HtmlSnapshot {
         title,
-        content: readable,
+        content: readable.trim().to_owned(),
         base_href,
     }
 }
@@ -119,6 +152,50 @@ struct HtmlTagToken {
     end: usize,
     closing: bool,
     self_closing: bool,
+}
+
+#[derive(Clone, Copy)]
+struct HtmlElementBounds {
+    outer_start: usize,
+    outer_end: usize,
+    inner_start: usize,
+    inner_end: usize,
+}
+
+fn remove_duplicate_leading_h1<'a>(html: &'a str, title: Option<&str>) -> &'a str {
+    let Some(title) = title else {
+        return html;
+    };
+    let Some(first_content) = first_meaningful_content_offset(html) else {
+        return html;
+    };
+    let Some(h1) = element_bounds(html, "h1").into_iter().next() else {
+        return html;
+    };
+    if h1.outer_start != first_content {
+        return html;
+    }
+    let h1_title = clean_title(html[h1.inner_start..h1.inner_end].to_owned());
+    if h1_title.as_deref() == Some(title) {
+        &html[h1.outer_end..]
+    } else {
+        html
+    }
+}
+
+fn first_meaningful_content_offset(html: &str) -> Option<usize> {
+    let mut cursor = 0;
+    loop {
+        let remaining = &html[cursor..];
+        let trimmed = remaining.trim_start_matches(char::is_whitespace);
+        cursor += remaining.len() - trimmed.len();
+        if trimmed.starts_with("<!--") {
+            let end = trimmed.find("-->")? + 3;
+            cursor += end;
+            continue;
+        }
+        return (!trimmed.is_empty()).then_some(cursor);
+    }
 }
 
 fn clean_title(raw: String) -> Option<String> {
@@ -250,26 +327,41 @@ fn comment_ranges(html: &str) -> Vec<(usize, usize)> {
 }
 
 fn largest_element_inner<'a>(html: &'a str, name: &str) -> Option<&'a str> {
+    element_bounds(html, name)
+        .into_iter()
+        .max_by_key(|bounds| bounds.inner_end.saturating_sub(bounds.inner_start))
+        .map(|bounds| &html[bounds.inner_start..bounds.inner_end])
+}
+
+fn element_bounds(html: &str, name: &str) -> Vec<HtmlElementBounds> {
     let mut stack = Vec::new();
     let mut candidates = Vec::new();
     let mut cursor = 0;
     while let Some(token) = next_named_tag(html, name, cursor) {
         cursor = token.end;
         if token.closing {
-            if let Some(open_end) = stack.pop() {
-                candidates.push((open_end, token.start));
+            if let Some((outer_start, inner_start)) = stack.pop() {
+                candidates.push(HtmlElementBounds {
+                    outer_start,
+                    outer_end: token.end,
+                    inner_start,
+                    inner_end: token.start,
+                });
             }
         } else if !token.self_closing {
-            stack.push(token.end);
+            stack.push((token.start, token.end));
         }
     }
-    for open_end in stack {
-        candidates.push((open_end, html.len()));
+    for (outer_start, inner_start) in stack {
+        candidates.push(HtmlElementBounds {
+            outer_start,
+            outer_end: html.len(),
+            inner_start,
+            inner_end: html.len(),
+        });
     }
+    candidates.sort_unstable_by_key(|bounds| bounds.outer_start);
     candidates
-        .into_iter()
-        .max_by_key(|(start, end)| end.saturating_sub(*start))
-        .map(|(start, end)| &html[start..end])
 }
 
 fn find_tag_token(html: &str, name: &str, from: usize, closing: bool) -> Option<HtmlTagToken> {
@@ -350,11 +442,14 @@ pub fn content_blocks(html: &str, base: Option<&str>) -> Vec<Block> {
     let mut buf = String::new();
     let mut strong = false;
     let mut heading = false;
+    let mut heading_link_block = None;
+    let mut list_item_depth = 0usize;
     let mut quote_depth = 0usize;
     let mut quote_buf = String::new();
     let mut code_depth = 0usize;
     let mut code_buf = String::new();
     let mut link: Option<LinkState> = None;
+    let mut pending_link_boundary: Option<(usize, bool)> = None;
     let mut seen_images = std::collections::HashSet::new();
     let mut chars = html.chars().peekable();
     while let Some(c) = chars.next() {
@@ -373,6 +468,10 @@ pub fn content_blocks(html: &str, base: Option<&str>) -> Vec<Block> {
                 .unwrap_or("")
                 .to_ascii_lowercase();
             let closing = tag.trim_start().starts_with('/');
+
+            if pending_link_boundary.is_some() && inline_flow_boundary(&name) {
+                pending_link_boundary = None;
+            }
 
             // Once inside a code block, HTML formatting must no longer alter
             // the surrounding parser state. `<pre><code>…</code></pre>` is
@@ -453,7 +552,20 @@ pub fn content_blocks(html: &str, base: Option<&str>) -> Vec<Block> {
             if name == "a" {
                 if closing {
                     if let Some(state) = link.take() {
-                        finish_link(state, &mut buf, &mut blocks);
+                        if heading {
+                            heading_link_block = finish_heading_link(
+                                state,
+                                heading_link_block,
+                                &mut buf,
+                                &mut blocks,
+                            );
+                        } else {
+                            let before = blocks.len();
+                            finish_link(state, &mut buf, &mut blocks);
+                            if blocks.len() > before {
+                                pending_link_boundary = Some((blocks.len() - 1, false));
+                            }
+                        }
                     }
                 } else if link.is_none() {
                     // Ignore anchors without a usable target in place. This
@@ -493,11 +605,16 @@ pub fn content_blocks(html: &str, base: Option<&str>) -> Vec<Block> {
             }
             if is_html_heading_tag(&name) {
                 if closing {
-                    flush_text_kind(&mut buf, &mut blocks, strong, heading);
+                    if let Some(index) = heading_link_block.take() {
+                        append_heading_suffix(index, &mut buf, &mut blocks);
+                    } else {
+                        flush_text_kind(&mut buf, &mut blocks, strong, heading);
+                    }
                     heading = false;
                 } else {
                     flush_text_kind(&mut buf, &mut blocks, strong, heading);
                     heading = true;
+                    heading_link_block = None;
                 }
                 continue;
             }
@@ -512,9 +629,21 @@ pub fn content_blocks(html: &str, base: Option<&str>) -> Vec<Block> {
             }
             if BLOCK_TAGS.contains(&name.as_str()) {
                 if name == "li" && !closing {
-                    buf.push_str("▪ ");
+                    if list_item_depth > 0 {
+                        flush_text_kind(&mut buf, &mut blocks, strong, heading);
+                    }
+                    list_item_depth += 1;
+                    blocks.push(Block::ListItemStart {
+                        depth: list_item_depth,
+                    });
                 } else if name == "li" && closing {
                     flush_text_kind(&mut buf, &mut blocks, strong, heading);
+                    if list_item_depth > 0 {
+                        blocks.push(Block::ListItemEnd {
+                            depth: list_item_depth,
+                        });
+                        list_item_depth -= 1;
+                    }
                 } else if closing {
                     flush_text_kind(&mut buf, &mut blocks, strong, heading);
                 } else {
@@ -522,6 +651,18 @@ pub fn content_blocks(html: &str, base: Option<&str>) -> Vec<Block> {
                 }
             }
         } else {
+            if let Some((block_index, saw_space)) = pending_link_boundary.as_mut() {
+                if c.is_whitespace() || (c == '&' && consume_whitespace_entity(&mut chars)) {
+                    *saw_space = true;
+                    continue;
+                }
+                if *saw_space
+                    && let Some(Block::Link { space_after, .. }) = blocks.get_mut(*block_index)
+                {
+                    *space_after = true;
+                }
+                pending_link_boundary = None;
+            }
             if code_depth > 0 {
                 code_buf.push(c);
             } else if quote_depth > 0 {
@@ -529,7 +670,13 @@ pub fn content_blocks(html: &str, base: Option<&str>) -> Vec<Block> {
             } else if let Some(state) = link.as_mut() {
                 state.text.push(c);
             } else {
-                buf.push(c);
+                if list_item_depth > 0 && c.is_whitespace() {
+                    if !buf.is_empty() && !buf.ends_with(char::is_whitespace) {
+                        buf.push(' ');
+                    }
+                } else {
+                    buf.push(c);
+                }
             }
         }
     }
@@ -543,6 +690,12 @@ pub fn content_blocks(html: &str, base: Option<&str>) -> Vec<Block> {
         flush_code(&mut code_buf, &mut blocks);
     }
     flush_text_kind(&mut buf, &mut blocks, strong, heading);
+    while list_item_depth > 0 {
+        blocks.push(Block::ListItemEnd {
+            depth: list_item_depth,
+        });
+        list_item_depth -= 1;
+    }
     merge_bare_number_markers(&mut blocks);
     blocks
 }
@@ -602,7 +755,134 @@ fn finish_link(state: LinkState, buf: &mut String, blocks: &mut Vec<Block>) {
         text: combined,
         url: state.url,
         link_start,
+        space_after: false,
     });
+}
+
+fn finish_heading_link(
+    state: LinkState,
+    existing_index: Option<usize>,
+    buf: &mut String,
+    blocks: &mut Vec<Block>,
+) -> Option<usize> {
+    let link_text = clean_text(&state.text);
+    if link_text.is_empty() {
+        // Permalink anchors are often visually empty. They must not swallow
+        // the title text that appeared before the anchor.
+        if let Some(index) = existing_index {
+            if let Some(Block::HeadingLink { text, .. }) = blocks.get_mut(index) {
+                append_clean_fragment(text, &state.prefix);
+            }
+            return Some(index);
+        }
+        buf.push_str(&state.prefix);
+        return None;
+    }
+
+    if let Some(index) = existing_index {
+        if let Some(Block::HeadingLink { text, links }) = blocks.get_mut(index) {
+            append_clean_fragment(text, &state.prefix);
+            let prefix_ended_with_space =
+                state.prefix.chars().last().is_some_and(char::is_whitespace);
+            let link_started_with_space =
+                state.text.chars().next().is_some_and(char::is_whitespace);
+            if !text.is_empty()
+                && (prefix_ended_with_space || link_started_with_space)
+                && !text.ends_with(char::is_whitespace)
+            {
+                text.push(' ');
+            }
+            let start = text.len();
+            text.push_str(&link_text);
+            links.push(InlineLinkRange {
+                url: state.url,
+                start,
+                end: text.len(),
+            });
+        }
+        return Some(index);
+    }
+
+    let mut text = String::new();
+    append_clean_fragment(&mut text, &state.prefix);
+    let prefix_ended_with_space = state.prefix.chars().last().is_some_and(char::is_whitespace);
+    let link_started_with_space = state.text.chars().next().is_some_and(char::is_whitespace);
+    if !text.is_empty()
+        && (prefix_ended_with_space || link_started_with_space)
+        && !text.ends_with(char::is_whitespace)
+    {
+        text.push(' ');
+    }
+    let start = text.len();
+    text.push_str(&link_text);
+    blocks.push(Block::HeadingLink {
+        text,
+        links: vec![InlineLinkRange {
+            url: state.url,
+            start,
+            end: start + link_text.len(),
+        }],
+    });
+    Some(blocks.len() - 1)
+}
+
+fn append_heading_suffix(index: usize, buf: &mut String, blocks: &mut [Block]) {
+    if let Some(Block::HeadingLink { text, .. }) = blocks.get_mut(index) {
+        append_clean_fragment(text, buf);
+    }
+    buf.clear();
+}
+
+fn append_clean_fragment(target: &mut String, raw: &str) {
+    let cleaned = clean_text(raw);
+    if cleaned.is_empty() {
+        return;
+    }
+    if !target.is_empty()
+        && raw.chars().next().is_some_and(char::is_whitespace)
+        && !target.ends_with(char::is_whitespace)
+    {
+        target.push(' ');
+    }
+    target.push_str(&cleaned);
+}
+
+fn inline_flow_boundary(name: &str) -> bool {
+    BLOCK_TAGS.contains(&name)
+        || is_html_heading_tag(name)
+        || matches!(
+            name,
+            "img" | "source" | "blockquote" | "pre" | "code" | "hr" | "ul" | "ol"
+        )
+}
+
+fn consume_whitespace_entity(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+    let mut lookahead = chars.clone();
+    let mut body = String::new();
+    let mut consumed = 0usize;
+    let mut terminated = false;
+    for next in lookahead.by_ref().take(16) {
+        consumed += 1;
+        if next == ';' {
+            terminated = true;
+            break;
+        }
+        if !(next.is_ascii_alphanumeric() || matches!(next, '#' | 'x' | 'X')) {
+            return false;
+        }
+        body.push(next);
+    }
+    if !terminated || body.is_empty() {
+        return false;
+    }
+    let decoded = decode_entities(&format!("&{body};"));
+    if decoded.is_empty() || !decoded.chars().all(char::is_whitespace) {
+        return false;
+    }
+    for _ in 0..consumed {
+        chars.next();
+    }
+    true
 }
 
 fn flush_link_fragment(state: &mut LinkState, buf: &mut String, blocks: &mut Vec<Block>) {
@@ -860,9 +1140,12 @@ fn merge_bare_number_markers(blocks: &mut Vec<Block>) {
         let following = match &blocks[i + 1] {
             Block::Text(text) | Block::Strong(text) => text.trim().to_owned(),
             Block::Heading(_)
+            | Block::HeadingLink { .. }
             | Block::Quote(_)
             | Block::Code(_)
             | Block::Link { .. }
+            | Block::ListItemStart { .. }
+            | Block::ListItemEnd { .. }
             | Block::Image(_) => {
                 i += 1;
                 continue;
@@ -1187,10 +1470,11 @@ mod tests {
                 Block::Text(text)
                 | Block::Strong(text)
                 | Block::Heading(text)
+                | Block::HeadingLink { text, .. }
                 | Block::Quote(text)
                 | Block::Code(text)
                 | Block::Link { text, .. } => Some(text.as_str()),
-                Block::Image(_) => None,
+                Block::ListItemStart { .. } | Block::ListItemEnd { .. } | Block::Image(_) => None,
             })
             .collect::<Vec<_>>()
             .join("|")
@@ -1277,7 +1561,7 @@ mod tests {
     }
 
     #[test]
-    fn largest_article_is_selected_and_nested_markup_is_balanced() {
+    fn main_scope_takes_priority_over_articles_elsewhere_on_page() {
         let html = concat!(
             "<article><p>teaser</p></article>",
             "<article><div><p>long article paragraph</p></div><p>ending</p></article>",
@@ -1285,10 +1569,312 @@ mod tests {
         );
         let snapshot = prepare_html_snapshot(html);
         let visible = all_visible_text(&content_blocks(&snapshot.content, None));
-        assert!(visible.contains("long article paragraph"));
-        assert!(visible.contains("ending"));
+        assert!(!visible.contains("long article paragraph"));
+        assert!(!visible.contains("ending"));
         assert!(!visible.contains("teaser"));
-        assert!(!visible.contains("main fallback"));
+        assert!(visible.contains("main fallback"));
+    }
+
+    #[test]
+    fn one_article_inside_main_is_selected() {
+        let snapshot = prepare_html_snapshot(concat!(
+            "<main><p>section chrome</p><article>",
+            "<div><p>article paragraph</p></div><p>ending</p>",
+            "</article><p>related footer</p></main>"
+        ));
+        let visible = all_visible_text(&content_blocks(&snapshot.content, None));
+        assert!(visible.contains("article paragraph"));
+        assert!(visible.contains("ending"));
+        assert!(!visible.contains("section chrome"));
+        assert!(!visible.contains("related footer"));
+    }
+
+    #[test]
+    fn multiple_articles_inside_main_are_kept_as_an_index() {
+        let snapshot = prepare_html_snapshot(concat!(
+            "<html><head><title>Index</title></head><body><main>",
+            "<h1>Index</h1><p>intro</p>",
+            "<article><h2><a href='/a'>A</a></h2><p>Alpha</p></article>",
+            "<article><h2><a href='/b'>B</a></h2><p>Beta</p></article>",
+            "</main></body></html>"
+        ));
+        let blocks = content_blocks(&snapshot.content, Some("https://example.com/index"));
+        let visible = all_visible_text(&blocks);
+        for expected in ["intro", "A", "Alpha", "B", "Beta"] {
+            assert!(
+                visible.contains(expected),
+                "missing {expected:?}: {visible:?}"
+            );
+        }
+        assert!(
+            blocks
+                .iter()
+                .any(|block| matches!(block, Block::HeadingLink { text, .. } if text == "A"))
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|block| matches!(block, Block::HeadingLink { text, .. } if text == "B"))
+        );
+    }
+
+    #[test]
+    #[ignore = "live webpage smoke test; run explicitly before packaging"]
+    fn martin_fowler_architecture_guide_keeps_cards_and_links() {
+        let client = crate::web_clip::client().unwrap();
+        let fetched =
+            crate::web_clip::fetch_html(&client, "https://martinfowler.com/architecture/").unwrap();
+        let snapshot = prepare_html_snapshot(&fetched.html);
+        assert_eq!(
+            snapshot.title.as_deref(),
+            Some("Software Architecture Guide")
+        );
+        let blocks = content_blocks(&snapshot.content, Some(&fetched.final_url));
+        let visible = all_visible_text(&blocks);
+        for expected in [
+            "What is architecture?",
+            "Application Architecture",
+            "Application Boundary",
+            "Microservices Guide",
+            "Enterprise Architecture",
+        ] {
+            assert!(
+                visible.contains(expected),
+                "live snapshot omitted {expected:?}"
+            );
+        }
+        assert!(blocks.iter().any(|block| matches!(
+            block,
+            Block::HeadingLink { text, links }
+                if text == "Application Boundary"
+                    && links.iter().any(|link| link.url == "https://martinfowler.com/bliki/ApplicationBoundary.html")
+        )));
+        assert!(blocks.iter().any(|block| matches!(
+            block,
+            Block::HeadingLink { text, links }
+                if text == "Microservices Guide"
+                    && links.iter().any(|link| link.url == "https://martinfowler.com/microservices")
+        )));
+        assert!(
+            blocks
+                .iter()
+                .filter(|block| matches!(block, Block::Image(_)))
+                .count()
+                >= 10
+        );
+    }
+
+    #[test]
+    fn duplicate_leading_h1_is_removed_but_other_h1_is_kept() {
+        let duplicate = prepare_html_snapshot(
+            "<html><head><title>Guide</title></head><body><main><h1>Guide</h1><p>Intro</p></main></body></html>",
+        );
+        let blocks = content_blocks(&duplicate.content, None);
+        assert!(
+            !blocks
+                .iter()
+                .any(|block| matches!(block, Block::Heading(text) if text == "Guide"))
+        );
+        assert_eq!(all_visible_text(&blocks), "Intro");
+
+        let distinct = prepare_html_snapshot(
+            "<html><head><title>Site · Guide</title></head><body><main><h1>Guide</h1><p>Intro</p></main></body></html>",
+        );
+        assert!(
+            content_blocks(&distinct.content, None)
+                .iter()
+                .any(|block| matches!(block, Block::Heading(text) if text == "Guide"))
+        );
+    }
+
+    #[test]
+    fn linked_card_heading_keeps_heading_boundary_before_abstract() {
+        let snapshot = prepare_html_snapshot(concat!(
+            "<main><h1>Guide</h1><div class='article-card'>",
+            "<h3><a href='/x'>Application Boundary</a></h3>",
+            "<p>Abstract</p></div></main>"
+        ));
+        let blocks = content_blocks(&snapshot.content, Some("https://example.com/guide"));
+        assert!(matches!(
+            &blocks[0],
+            Block::HeadingLink { text, links }
+                if text == "Application Boundary"
+                    && links.len() == 1
+                    && links[0].url == "https://example.com/x"
+        ));
+        assert!(matches!(&blocks[1], Block::Text(text) if text == "Abstract"));
+    }
+
+    #[test]
+    fn inline_link_suffix_remains_adjacent() {
+        let blocks = content_blocks(
+            "<p>harder to <a href='/x'>modif</a>y, leading</p>",
+            Some("https://example.com/guide"),
+        );
+        // Keep the anchor range exact; the GUI removes the visual separator
+        // between adjacent ASCII word characters, rendering `modify` while
+        // only the source anchor text `modif` remains clickable.
+        assert_eq!(all_visible_text(&blocks), "harder to modif|y, leading");
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(
+            &blocks[0],
+            Block::Link { text, url, link_start, .. }
+                if text == "harder to modif"
+                    && url == "https://example.com/x"
+                    && *link_start == "harder to ".len()
+        ));
+        assert!(matches!(&blocks[1], Block::Text(text) if text == "y, leading"));
+    }
+
+    #[test]
+    fn normal_space_after_link_is_preserved() {
+        let blocks = content_blocks(
+            "<p>See <a href='/docs'>docs</a> and notes</p>",
+            Some("https://example.com/guide"),
+        );
+        assert!(matches!(
+            &blocks[0],
+            Block::Link { text, space_after, .. }
+                if text == "See docs" && *space_after
+        ));
+        assert!(matches!(&blocks[1], Block::Text(text) if text == "and notes"));
+    }
+
+    #[test]
+    fn entity_space_after_link_is_preserved() {
+        for entity in ["&nbsp;", "&#32;", "&#x20;"] {
+            let html = format!("<p><a href='/docs'>docs</a>{entity}and notes</p>");
+            let blocks = content_blocks(&html, Some("https://example.com/guide"));
+            assert!(matches!(
+                &blocks[0],
+                Block::Link { text, space_after: true, .. } if text == "docs"
+            ));
+            assert!(matches!(&blocks[1], Block::Text(text) if text == "and notes"));
+        }
+    }
+
+    #[test]
+    fn heading_links_keep_prefix_suffix_and_exact_range() {
+        let blocks = content_blocks(
+            "<h2>New: <a href='/guide'>Guide</a> — updated</h2>",
+            Some("https://example.com/index"),
+        );
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(
+            &blocks[0],
+            Block::HeadingLink { text, links }
+                if text == "New: Guide — updated"
+                    && links.len() == 1
+                    && links[0].url == "https://example.com/guide"
+                    && &text[links[0].start..links[0].end] == "Guide"
+        ));
+    }
+
+    #[test]
+    fn heading_keeps_text_before_an_empty_permalink() {
+        let blocks = content_blocks(
+            "<h2>Visible title <a href='#permalink'></a></h2>",
+            Some("https://example.com/guide"),
+        );
+        assert_eq!(blocks, vec![Block::Heading("Visible title".to_owned())]);
+    }
+
+    #[test]
+    fn heading_keeps_multiple_links_on_one_line() {
+        let blocks = content_blocks(
+            "<h2><a href='/a'>Alpha</a> and <a href='/b'>Beta</a></h2>",
+            Some("https://example.com/index"),
+        );
+        assert_eq!(blocks.len(), 1);
+        let Block::HeadingLink { text, links } = &blocks[0] else {
+            panic!("expected one linked heading: {blocks:?}");
+        };
+        assert_eq!(text, "Alpha and Beta");
+        assert_eq!(links.len(), 2);
+        assert_eq!(&text[links[0].start..links[0].end], "Alpha");
+        assert_eq!(links[0].url, "https://example.com/a");
+        assert_eq!(&text[links[1].start..links[1].end], "Beta");
+        assert_eq!(links[1].url, "https://example.com/b");
+    }
+
+    #[test]
+    fn multiline_list_items_keep_continuation_text_inside_item() {
+        let blocks = content_blocks(
+            "<ul><li>A line that\nwraps</li><li>Second\nwraps too</li></ul>",
+            None,
+        );
+        assert_eq!(blocks.len(), 6);
+        assert!(matches!(&blocks[0], Block::ListItemStart { depth: 1 }));
+        assert!(matches!(&blocks[1], Block::Text(text) if text == "A line that wraps"));
+        assert!(matches!(&blocks[2], Block::ListItemEnd { depth: 1 }));
+        assert!(matches!(&blocks[3], Block::ListItemStart { depth: 1 }));
+        assert!(matches!(&blocks[4], Block::Text(text) if text == "Second wraps too"));
+        assert!(matches!(&blocks[5], Block::ListItemEnd { depth: 1 }));
+    }
+
+    #[test]
+    fn list_items_keep_links_emphasis_and_images() {
+        let blocks = content_blocks(
+            "<ul><li>See <a href='/docs'>docs</a> and <strong>notes</strong><img src='/a.png'></li></ul>",
+            Some("https://example.com/guide/"),
+        );
+        assert!(blocks.iter().any(|block| matches!(
+            block,
+            Block::Link { text, url, .. }
+                if text == "See docs" && url == "https://example.com/docs"
+        )));
+        assert!(
+            blocks
+                .iter()
+                .any(|block| matches!(block, Block::Text(text) if text == "and"))
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|block| matches!(block, Block::Strong(text) if text == "notes"))
+        );
+        assert!(blocks.iter().any(|block| matches!(
+            block,
+            Block::Image(url) if url == "https://example.com/a.png"
+        )));
+    }
+
+    #[test]
+    fn rich_list_item_stops_before_following_paragraph() {
+        let blocks = content_blocks(
+            "<ul><li><strong>Label</strong> rest</li></ul><p>outside</p>",
+            None,
+        );
+        assert!(matches!(&blocks[0], Block::ListItemStart { depth: 1 }));
+        assert!(matches!(&blocks[1], Block::Strong(text) if text == "Label"));
+        assert!(matches!(&blocks[2], Block::Text(text) if text == "rest"));
+        assert!(matches!(&blocks[3], Block::ListItemEnd { depth: 1 }));
+        assert!(matches!(&blocks[4], Block::Text(text) if text == "outside"));
+    }
+
+    #[test]
+    fn list_item_can_start_with_a_link() {
+        let blocks = content_blocks(
+            "<ul><li><a href='/guide'>Guide</a> details</li></ul>",
+            Some("https://example.com"),
+        );
+        assert!(matches!(&blocks[0], Block::ListItemStart { depth: 1 }));
+        assert!(matches!(
+            &blocks[1],
+            Block::Link { text, url, space_after: true, .. }
+                if text == "Guide" && url == "https://example.com/guide"
+        ));
+        assert!(matches!(&blocks[2], Block::Text(text) if text == "details"));
+        assert!(matches!(&blocks[3], Block::ListItemEnd { depth: 1 }));
+    }
+
+    #[test]
+    fn quoted_lists_keep_bullets() {
+        let blocks = content_blocks(
+            "<blockquote><ul><li>A</li><li>B</li></ul></blockquote>",
+            None,
+        );
+        assert!(matches!(&blocks[0], Block::Quote(text) if text == "▪ A\n▪ B"));
     }
 
     #[test]
@@ -1367,14 +1953,14 @@ mod tests {
 
         assert!(matches!(
             &blocks[0],
-            Block::Link { text, url, link_start }
+            Block::Link { text, url, link_start, .. }
                 if text == "查看文档重点"
                     && *link_start == "查看".len()
                     && url == "https://site.com/docs?a=1&b=2"
         ));
         assert!(matches!(
             &blocks[1],
-            Block::Link { text, url, link_start }
+            Block::Link { text, url, link_start, .. }
                 if text == "，或发邮件"
                     && *link_start == "，或".len()
                     && url == "mailto:team@example.com"
@@ -1394,14 +1980,14 @@ mod tests {
         );
         assert!(matches!(
             &blocks[0],
-            Block::Link { text, url, link_start }
+            Block::Link { text, url, link_start, .. }
                 if text == "章节"
                     && *link_start == 0
                     && url == "https://site.com/posts/1#section"
         ));
         assert!(matches!(
             &blocks[1],
-            Block::Link { text, url, link_start }
+            Block::Link { text, url, link_start, .. }
                 if text == "相对链接"
                     && *link_start == 0
                     && url == "https://site.com/posts/relative.html"
@@ -1410,7 +1996,7 @@ mod tests {
         let blocks = content_blocks("<a href=\"relative.html\">链接</a>", None);
         assert!(matches!(
             &blocks[0],
-            Block::Link { text, url, link_start }
+            Block::Link { text, url, link_start, .. }
                 if text == "链接" && *link_start == 0 && url == "relative.html"
         ));
     }
@@ -1427,7 +2013,7 @@ mod tests {
         ));
         assert!(matches!(
             &blocks[1],
-            Block::Link { text, url, link_start }
+            Block::Link { text, url, link_start, .. }
                 if text == "封面" && *link_start == 0 && url == "https://site.com/cover"
         ));
     }
@@ -1448,13 +2034,24 @@ mod tests {
                 Block::Text(t) => format!("T:{t}"),
                 Block::Strong(t) => format!("S:{t}"),
                 Block::Heading(t) => format!("H:{t}"),
+                Block::HeadingLink { text, links } => format!(
+                    "HL:{text}@{}",
+                    links
+                        .iter()
+                        .map(|link| link.url.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
                 Block::Quote(t) => format!("Q:{t}"),
                 Block::Code(t) => format!("C:{t}"),
                 Block::Link {
                     text,
                     url,
                     link_start,
+                    ..
                 } => format!("L:{text}@{url}#{link_start}"),
+                Block::ListItemStart { depth } => format!("LS:{depth}"),
+                Block::ListItemEnd { depth } => format!("LE:{depth}"),
                 Block::Image(t) => format!("I:{t}"),
             })
             .collect();

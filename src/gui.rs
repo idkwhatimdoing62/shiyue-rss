@@ -747,14 +747,53 @@ impl GuiApp {
     }
 
     fn toggle_star(&mut self, id: i64) {
-        if let Some(a) = self.articles.iter_mut().find(|a| a.id == id) {
-            let _ = self.db.toggle_star(id);
-            a.starred = !a.starred;
+        let Some(was_starred) = self
+            .articles
+            .iter()
+            .find(|article| article.id == id)
+            .map(|article| article.starred)
+        else {
+            return;
+        };
+
+        match self.db.toggle_star(id) {
+            Ok(()) => {
+                if self.content_mode == ContentMode::Saved && was_starred {
+                    // Removing the open article from the saved view must not
+                    // leave its body or selection overlays visible after the
+                    // middle-column row disappears.
+                    if self.sel_article_id == Some(id) {
+                        self.sel_article_id = None;
+                        self.body_article_id = None;
+                        self.comment_dialog = None;
+                        self.selection_popup = None;
+                        self.article_selection_drag = None;
+                    }
+                    self.load_articles();
+                } else if let Some(article) =
+                    self.articles.iter_mut().find(|article| article.id == id)
+                {
+                    article.starred = !was_starred;
+                }
+                self.refresh_saved_article_count();
+                self.selection_notice = Some((
+                    if was_starred {
+                        "已取消文章收藏".to_owned()
+                    } else {
+                        "已收藏文章，可在左侧「文章收藏」查看".to_owned()
+                    },
+                    Instant::now(),
+                ));
+            }
+            Err(error) => {
+                let action = if was_starred {
+                    "取消文章收藏"
+                } else {
+                    "收藏文章"
+                };
+                self.selection_notice = Some((format!("{action}失败：{error}"), Instant::now()));
+            }
         }
-        if self.content_mode == ContentMode::Saved {
-            self.load_articles();
-        }
-        self.refresh_saved_article_count();
     }
 
     fn archive_article(&mut self, id: i64) {
@@ -769,6 +808,9 @@ impl GuiApp {
                 if self.sel_article_id == Some(id) {
                     self.sel_article_id = None;
                     self.body_article_id = None;
+                    self.comment_dialog = None;
+                    self.selection_popup = None;
+                    self.article_selection_drag = None;
                 }
                 if was_unread {
                     if let Some((_, unread)) = self
@@ -941,27 +983,7 @@ impl GuiApp {
                 title,
             });
         } else {
-            let is_starred = self
-                .articles
-                .iter()
-                .find(|article| article.id == id)
-                .is_some_and(|article| article.starred);
-            let result = if is_starred {
-                self.db.toggle_star(id)
-            } else {
-                Ok(())
-            };
-            match result {
-                Ok(_) => {
-                    self.load_articles();
-                    self.refresh_saved_article_count();
-                    self.selection_notice = Some(("已取消文章收藏".to_owned(), Instant::now()));
-                }
-                Err(error) => {
-                    self.selection_notice =
-                        Some((format!("取消收藏失败：{error}"), Instant::now()));
-                }
-            }
+            self.toggle_star(id);
         }
     }
 
@@ -977,12 +999,12 @@ impl GuiApp {
             Ok(_) => {
                 self.refresh_saved_selection_count();
                 self.selection_notice = Some((
-                    "已收藏，可在左侧「摘录与想法」查看".to_owned(),
+                    "已摘录，可在左侧「摘录与想法」查看".to_owned(),
                     Instant::now(),
                 ));
             }
             Err(error) => {
-                self.selection_notice = Some((format!("收藏失败：{error}"), Instant::now()));
+                self.selection_notice = Some((format!("摘录失败：{error}"), Instant::now()));
             }
         }
     }
@@ -1086,7 +1108,7 @@ impl GuiApp {
         let mut open = true;
         let mut import = false;
         let mut cancel = false;
-        egui::Window::new("收藏网页")
+        egui::Window::new("保存网页")
             .id(egui::Id::new("web-clipping-import"))
             .open(&mut open)
             .collapsible(false)
@@ -1152,7 +1174,7 @@ impl GuiApp {
                     let import_label = if dialog.fetching {
                         "正在抓取网页…"
                     } else {
-                        "保存到收藏"
+                        "保存网页"
                     };
                     if ui
                         .add_enabled(
@@ -1274,7 +1296,7 @@ impl GuiApp {
             )
             .show(ctx, |ui| {
                 ui.label(
-                    egui::RichText::new("收藏用于保留原文摘录；想法是附在摘录上的个人笔记。")
+                    egui::RichText::new("摘录用于保留原文片段；想法是附在摘录上的个人笔记。")
                         .size(13.0)
                         .color(theme.muted),
                 );
@@ -1297,7 +1319,7 @@ impl GuiApp {
                         );
                         ui.add_space(8.0);
                         ui.label(
-                            egui::RichText::new("在正文中选中文字，然后点击“收藏”或“写想法”。")
+                            egui::RichText::new("在正文中选中文字，然后点击“摘录”或“写想法”。")
                                 .size(13.0)
                                 .color(theme.muted),
                         );
@@ -1319,7 +1341,7 @@ impl GuiApp {
                                     ui.horizontal(|ui| {
                                         if selection.is_favorite {
                                             ui.label(
-                                                egui::RichText::new("★ 收藏")
+                                                egui::RichText::new("★ 摘录")
                                                     .size(12.0)
                                                     .color(theme.accent),
                                             );
@@ -1614,6 +1636,7 @@ impl GuiApp {
             return;
         }
         let theme = ReaderTheme::sspai();
+        let failed = message.contains("失败") || message.contains("错误");
         egui::Area::new(egui::Id::new("selection-notice"))
             .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 24.0))
             .order(egui::Order::Foreground)
@@ -1632,9 +1655,9 @@ impl GuiApp {
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.label(
-                                egui::RichText::new("✓")
+                                egui::RichText::new(if failed { "!" } else { "✓" })
                                     .size(16.0)
-                                    .color(theme.accent)
+                                    .color(if failed { theme.accent } else { theme.link })
                                     .family(egui::FontFamily::Name("cjk-bold".into())),
                             );
                             ui.label(egui::RichText::new(message).size(13.0).color(theme.text));
@@ -1690,7 +1713,7 @@ impl GuiApp {
                 if selection_toolbar_button(ui, "▣", "复制") {
                     action = Some(SelectionAction::Copy);
                 }
-                if selection_toolbar_button(ui, "★", "收藏") {
+                if selection_toolbar_button(ui, "★", "摘录") {
                     action = Some(SelectionAction::Favorite);
                 }
                 if selection_toolbar_button(ui, "✎", "写想法") {
@@ -1930,7 +1953,7 @@ impl eframe::App for GuiApp {
                 ui.add_space(4.0);
                 let saved_articles_response = ui.add(
                     egui::Button::new(
-                        egui::RichText::new(format!("★ 收藏  {}", self.saved_article_count))
+                        egui::RichText::new(format!("★ 文章收藏  {}", self.saved_article_count))
                             .size(13.0)
                             .color(if self.content_mode == ContentMode::Saved {
                                 theme.text
@@ -2083,7 +2106,7 @@ impl eframe::App for GuiApp {
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new(if self.content_mode == ContentMode::Saved {
-                            "收藏"
+                            "文章收藏"
                         } else {
                             "文章"
                         })
@@ -2104,7 +2127,7 @@ impl eframe::App for GuiApp {
                                     )
                                     .stroke(egui::Stroke::NONE),
                                 )
-                                .on_hover_text("收藏网页或粘贴 HTML")
+                                .on_hover_text("保存网页或粘贴 HTML")
                                 .clicked()
                             {
                                 self.open_web_clip_dialog();
@@ -2118,14 +2141,16 @@ impl eframe::App for GuiApp {
                     ui.add_space(26.0);
                     ui.vertical_centered(|ui| {
                         ui.label(
-                            egui::RichText::new("还没有收藏")
+                            egui::RichText::new("还没有文章收藏")
                                 .size(15.0)
                                 .color(theme.text)
                                 .family(egui::FontFamily::Name("cjk-bold".into())),
                         );
                         ui.add_space(6.0);
                         ui.label(
-                            egui::RichText::new("点击右上角＋，粘贴网址或 HTML")
+                            egui::RichText::new(
+                                "打开订阅文章，点击正文标题下方「收藏文章」；也可点右上角＋保存网页。",
+                            )
                                 .size(12.0)
                                 .color(theme.muted),
                         );
@@ -2186,7 +2211,7 @@ impl eframe::App for GuiApp {
                                     let remove_label = if is_web_clip {
                                         "删除本地网页…"
                                     } else {
-                                        "取消收藏"
+                                        "取消文章收藏"
                                     };
                                     if ui.button(remove_label).clicked() {
                                         star_article = Some(a.id);
@@ -2197,9 +2222,9 @@ impl eframe::App for GuiApp {
                                         unread_article = Some(a.id);
                                     }
                                     let star_label = if a.starred {
-                                        "取消星标"
+                                        "取消文章收藏"
                                     } else {
-                                        "加星标"
+                                        "收藏文章"
                                     };
                                     if ui.button(star_label).clicked() {
                                         star_article = Some(a.id);
@@ -2270,6 +2295,8 @@ impl eframe::App for GuiApp {
                 let date = a.published.map(text::fmt_ts).unwrap_or_default();
                 let url = a.url.clone();
                 let author = a.author.clone();
+                let article_starred = a.starred;
+                let is_web_clipping = self.web_clipping_ids.contains(&article_id);
                 let blocks = match a.content.as_deref() {
                     Some(c) if !c.trim().is_empty() => text::content_blocks(c, a.url.as_deref()),
                     _ => Vec::new(),
@@ -2279,6 +2306,7 @@ impl eframe::App for GuiApp {
                     .selections_for_article(article_id)
                     .unwrap_or_default();
                 let mut delete_selection = None;
+                let mut toggle_article_star = false;
                 let mut selection_frame = ArticleSelectionFrame::default();
                 let mut body_scroll = egui::ScrollArea::vertical()
                     .id_salt(("article-body-v2", article_id))
@@ -2315,7 +2343,7 @@ impl eframe::App for GuiApp {
                                 if reset_body_scroll {
                                     title_response.scroll_to_me(Some(egui::Align::Min));
                                 }
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     if let Some(author) = &author {
                                         ui.label(
                                             egui::RichText::new(author)
@@ -2344,6 +2372,34 @@ impl eframe::App for GuiApp {
                                             open_in_browser(u);
                                         }
                                     }
+                                    if is_web_clipping {
+                                        ui.label(
+                                            egui::RichText::new("◫ 已保存网页")
+                                                .size(12.0)
+                                                .color(theme.muted),
+                                        );
+                                    } else {
+                                        let (label, color, fill) = if article_starred {
+                                            ("★ 已收藏", theme.accent, theme.selected_bg)
+                                        } else {
+                                            ("☆ 收藏文章", theme.muted, egui::Color32::TRANSPARENT)
+                                        };
+                                        if ui
+                                            .add(
+                                                egui::Button::new(
+                                                    egui::RichText::new(label)
+                                                        .size(12.0)
+                                                        .color(color),
+                                                )
+                                                .fill(fill)
+                                                .stroke(egui::Stroke::new(1.0, theme.border))
+                                                .corner_radius(egui::CornerRadius::same(4)),
+                                            )
+                                            .clicked()
+                                        {
+                                            toggle_article_star = true;
+                                        }
+                                    }
                                 });
                                 ui.separator();
                                 ui.add_space(18.0);
@@ -2356,7 +2412,7 @@ impl eframe::App for GuiApp {
                                                     ui.label(&saved.selected_text);
                                                     ui.horizontal(|ui| {
                                                         if saved.is_favorite {
-                                                            ui.label("★ 已收藏");
+                                                            ui.label("★ 已摘录");
                                                         }
                                                         if let Some(comment) = &saved.comment {
                                                             ui.weak(format!("评论：{comment}"));
@@ -2456,51 +2512,81 @@ impl eframe::App for GuiApp {
                                             );
                                             index += 1;
                                         }
-                                        Block::Text(row) if is_bullet_text(row) => {
+                                        Block::ListItemStart { depth } => {
                                             let start = index;
-                                            let mut list_text = String::new();
+                                            let item_depth = *depth;
+                                            let mut list_text = String::from("▪ ");
+                                            let mut list_strong_ranges = Vec::new();
                                             let mut list_link_ranges = Vec::new();
+                                            let mut previous_was_strong = false;
+                                            let mut previous_was_link = false;
+                                            let mut previous_link_had_space_after = false;
+                                            index += 1;
                                             while index < blocks.len() {
-                                                let Block::Text(row) = &blocks[index] else {
-                                                    break;
-                                                };
-                                                if !is_bullet_text(row) {
-                                                    break;
-                                                }
-                                                if !list_text.is_empty() {
-                                                    list_text.push('\n');
-                                                }
-                                                list_text.push_str(&normalize_bullet_row(row));
-                                                index += 1;
-                                                if let Some(Block::Strong(value)) =
-                                                    blocks.get(index)
-                                                {
-                                                    list_text.push(' ');
-                                                    list_text.push_str(value.trim());
+                                                if matches!(
+                                                    &blocks[index],
+                                                    Block::ListItemEnd { depth } if *depth == item_depth
+                                                ) {
                                                     index += 1;
-                                                    if let Some(Block::Text(punctuation)) =
-                                                        blocks.get(index)
-                                                    {
-                                                        if is_punctuation_only(punctuation) {
-                                                            list_text.push_str(punctuation.trim());
-                                                            index += 1;
-                                                        }
+                                                    break;
+                                                }
+                                                let block = &blocks[index];
+                                                let value = match block {
+                                                    Block::Text(text)
+                                                    | Block::Strong(text)
+                                                    | Block::Link { text, .. } => text,
+                                                    _ => break,
+                                                };
+                                                let next_link_has_prefix = matches!(
+                                                    block,
+                                                    Block::Link { link_start, .. } if *link_start > 0
+                                                );
+                                                if list_text != "▪ " {
+                                                    if previous_link_had_space_after {
+                                                        list_text.push(' ');
+                                                    } else {
+                                                        list_text.push_str(body_block_separator(
+                                                            &list_text,
+                                                            value,
+                                                            previous_was_strong,
+                                                            previous_was_link,
+                                                            matches!(block, Block::Strong(_)),
+                                                            matches!(block, Block::Link { .. }),
+                                                            next_link_has_prefix,
+                                                        ));
                                                     }
-                                                } else if let Some(Block::Link {
-                                                    text,
+                                                }
+                                                let value_start = list_text.len();
+                                                list_text.push_str(value);
+                                                if matches!(block, Block::Strong(_)) {
+                                                    list_strong_ranges.push(
+                                                        value_start..value_start + value.len(),
+                                                    );
+                                                }
+                                                if let Block::Link {
                                                     url,
                                                     link_start,
-                                                }) = blocks.get(index)
+                                                    ..
+                                                } = block
                                                 {
-                                                    let value_start = list_text.len();
-                                                    list_text.push_str(text.trim());
                                                     list_link_ranges.push(ArticleLinkRange {
                                                         range: value_start + *link_start
-                                                            ..value_start + text.trim().len(),
+                                                            ..value_start + value.len(),
                                                         url: url.clone(),
                                                     });
-                                                    index += 1;
                                                 }
+                                                previous_was_strong =
+                                                    matches!(block, Block::Strong(_));
+                                                previous_was_link =
+                                                    matches!(block, Block::Link { .. });
+                                                previous_link_had_space_after = matches!(
+                                                    block,
+                                                    Block::Link {
+                                                        space_after: true,
+                                                        ..
+                                                    }
+                                                );
+                                                index += 1;
                                             }
                                             ui.add_space(4.0);
                                             ui.horizontal(|ui| {
@@ -2512,7 +2598,7 @@ impl eframe::App for GuiApp {
                                                         article_id,
                                                         start,
                                                         &list_text,
-                                                        &[],
+                                                        &list_strong_ranges,
                                                         &list_link_ranges,
                                                         ArticleTextStyle::List,
                                                         &mut selection_frame,
@@ -2535,6 +2621,30 @@ impl eframe::App for GuiApp {
                                             index += 1;
                                             ui.add_space(20.0);
                                         }
+                                        Block::HeadingLink {
+                                            text,
+                                            links,
+                                        } => {
+                                            let link_ranges = links
+                                                .iter()
+                                                .map(|link| ArticleLinkRange {
+                                                    range: link.start..link.end,
+                                                    url: link.url.clone(),
+                                                })
+                                                .collect::<Vec<_>>();
+                                            selectable_text_block_with_style(
+                                                ui,
+                                                article_id,
+                                                index,
+                                                text,
+                                                &[],
+                                                &link_ranges,
+                                                ArticleTextStyle::Heading,
+                                                &mut selection_frame,
+                                            );
+                                            index += 1;
+                                            ui.add_space(20.0);
+                                        }
                                         Block::Strong(heading)
                                             if text::is_numbered_heading(heading) =>
                                         {
@@ -2551,6 +2661,9 @@ impl eframe::App for GuiApp {
                                             index += 1;
                                             ui.add_space(20.0);
                                         }
+                                        Block::ListItemEnd { .. } => {
+                                            index += 1;
+                                        }
                                         _ => {
                                             let start = index;
                                             let mut run = String::new();
@@ -2558,14 +2671,18 @@ impl eframe::App for GuiApp {
                                             let mut link_ranges = Vec::new();
                                             let mut previous_was_strong = false;
                                             let mut previous_was_link = false;
+                                            let mut previous_link_had_space_after = false;
                                             while index < blocks.len() {
                                                 let block = &blocks[index];
                                                 if matches!(
                                                     block,
                                                     Block::Image(_)
                                                         | Block::Heading(_)
+                                                        | Block::HeadingLink { .. }
                                                         | Block::Quote(_)
                                                         | Block::Code(_)
+                                                        | Block::ListItemStart { .. }
+                                                        | Block::ListItemEnd { .. }
                                                 ) || matches!(
                                                     block,
                                                     Block::Text(text) if is_bullet_text(text)
@@ -2582,8 +2699,11 @@ impl eframe::App for GuiApp {
                                                     | Block::Link { text, .. } => text,
                                                     Block::Image(_)
                                                     | Block::Heading(_)
+                                                    | Block::HeadingLink { .. }
                                                     | Block::Quote(_)
-                                                    | Block::Code(_) => {
+                                                    | Block::Code(_)
+                                                    | Block::ListItemStart { .. }
+                                                    | Block::ListItemEnd { .. } => {
                                                         unreachable!()
                                                     }
                                                 };
@@ -2593,15 +2713,19 @@ impl eframe::App for GuiApp {
                                                         if *link_start > 0
                                                 );
                                                 if !run.is_empty() {
-                                                    run.push_str(body_block_separator(
-                                                        &run,
-                                                        value,
-                                                        previous_was_strong,
-                                                        previous_was_link,
-                                                        matches!(block, Block::Strong(_)),
-                                                        matches!(block, Block::Link { .. }),
-                                                        next_link_has_prefix,
-                                                    ));
+                                                    if previous_link_had_space_after {
+                                                        run.push(' ');
+                                                    } else {
+                                                        run.push_str(body_block_separator(
+                                                            &run,
+                                                            value,
+                                                            previous_was_strong,
+                                                            previous_was_link,
+                                                            matches!(block, Block::Strong(_)),
+                                                            matches!(block, Block::Link { .. }),
+                                                            next_link_has_prefix,
+                                                        ));
+                                                    }
                                                 }
                                                 let value_start = run.len();
                                                 run.push_str(value);
@@ -2624,6 +2748,13 @@ impl eframe::App for GuiApp {
                                                 }
                                                 previous_was_strong = is_strong;
                                                 previous_was_link = is_link;
+                                                previous_link_had_space_after = matches!(
+                                                    block,
+                                                    Block::Link {
+                                                        space_after: true,
+                                                        ..
+                                                    }
+                                                );
                                                 index += 1;
                                             }
                                             if !run.trim().is_empty() {
@@ -2696,6 +2827,9 @@ impl eframe::App for GuiApp {
                                 Some((format!("删除失败：{error}"), Instant::now()));
                         }
                     }
+                }
+                if toggle_article_star {
+                    self.toggle_star(article_id);
                 }
             });
         self.show_saved_library_window(&ctx);
@@ -2966,6 +3100,12 @@ fn body_block_separator(
     let Some(next_char) = next.chars().find(|ch| !ch.is_whitespace()) else {
         return "";
     };
+    // Some sites place only part of a word inside an anchor, e.g.
+    // `<a>modif</a>y`. The link and suffix remain separate semantic blocks so
+    // the click range is exact, but they must render as one visible word.
+    if previous_was_link && is_ascii_word_char(previous_char) && is_ascii_word_char(next_char) {
+        return "";
+    }
     if is_closing_punctuation(next_char) {
         return "";
     }
@@ -2982,6 +3122,10 @@ fn body_block_separator(
     } else {
         ""
     }
+}
+
+fn is_ascii_word_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
 }
 
 fn is_closing_punctuation(ch: char) -> bool {
@@ -3015,6 +3159,7 @@ fn is_sentence_ending(ch: char) -> bool {
     matches!(ch, '。' | '．' | '.' | '！' | '!' | '？' | '?')
 }
 
+#[cfg(test)]
 fn is_punctuation_only(text: &str) -> bool {
     let mut chars = text.trim().chars();
     let Some(first) = chars.next() else {
@@ -3027,14 +3172,6 @@ fn needs_typographic_space(left: char, right: char) -> bool {
     let left_word = left.is_alphanumeric() || left == '_';
     let right_word = right.is_alphanumeric() || right == '_';
     left_word && right_word && (left.is_ascii() || right.is_ascii())
-}
-
-fn normalize_bullet_row(text: &str) -> String {
-    let body = text
-        .trim_start()
-        .trim_start_matches(['▪', '•', '·', '‣', '◦'])
-        .trim_start();
-    format!("▪ {body}")
 }
 
 /// 为图片预留稳定空间，只在接近可视区域时才启动 HTTP 请求。
@@ -3138,10 +3275,19 @@ fn selectable_text_block_with_style(
             .nth(char_index)
             .map(|(offset, _)| offset)
             .unwrap_or(text.len());
-        if let Some(link) = link_ranges.iter().find(|link| {
-            link.range.contains(&byte_index)
-                || (byte_index > 0 && link.range.contains(&(byte_index - 1)))
-        }) {
+        let exact = link_ranges
+            .iter()
+            .find(|link| link.range.contains(&byte_index));
+        let link = exact.or_else(|| {
+            (byte_index > 0)
+                .then(|| {
+                    link_ranges
+                        .iter()
+                        .find(|link| link.range.contains(&(byte_index - 1)))
+                })
+                .flatten()
+        });
+        if let Some(link) = link {
             open_in_browser(&link.url);
         }
     }
@@ -3222,9 +3368,18 @@ fn article_layout_job(
     if matches!(style, ArticleTextStyle::Code) {
         job.append(text, 0.0, normal);
     } else if matches!(style, ArticleTextStyle::List) {
-        append_list_layout(&mut job, text, link_ranges, &normal, &heading);
-    } else if matches!(style, ArticleTextStyle::Title | ArticleTextStyle::Heading) {
+        append_list_layout(
+            &mut job,
+            text,
+            strong_ranges,
+            link_ranges,
+            &normal,
+            &heading,
+        );
+    } else if matches!(style, ArticleTextStyle::Title) {
         job.append(text, 0.0, heading);
+    } else if matches!(style, ArticleTextStyle::Heading) {
+        append_body_layout(&mut job, text, &[], link_ranges, &heading, &heading);
     } else {
         append_body_layout(
             &mut job,
@@ -3292,6 +3447,7 @@ fn append_body_layout(
 fn append_list_layout(
     job: &mut egui::text::LayoutJob,
     text: &str,
+    explicit_strong_ranges: &[Range<usize>],
     link_ranges: &[ArticleLinkRange],
     normal: &egui::text::TextFormat,
     strong: &egui::text::TextFormat,
@@ -3300,7 +3456,7 @@ fn append_list_layout(
     // a comparison list, so give it the installed bold CJK face. Build those
     // ranges first, then use the same range compositor as body paragraphs so
     // links retain their blue/underlined treatment inside a list card.
-    let mut strong_ranges = Vec::new();
+    let mut strong_ranges = explicit_strong_ranges.to_vec();
     let mut offset = 0;
     for line in text.split('\n') {
         if let Some(colon) = line.rfind(['：', ':']) {
@@ -3880,6 +4036,20 @@ mod tests {
             body_block_separator("本杂志开源", "，欢迎投稿", false, true, false, true, true,),
             ""
         );
+        assert_eq!(
+            body_block_separator(
+                "harder to modif",
+                "y, leading",
+                false,
+                true,
+                false,
+                false,
+                false
+            ),
+            ""
+        );
+        // `space_after` on Block::Link bypasses this fallback and inserts a
+        // literal space for ordinary `<a>docs</a> and` markup.
         assert_eq!(
             body_block_separator(
                 "（#357）",

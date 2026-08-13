@@ -1,6 +1,6 @@
 [package]
 name = "rrss"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "拾阅，一款专注阅读体验的 Windows 桌面 RSS 阅读器"
 license = "MIT"

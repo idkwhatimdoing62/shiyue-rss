@@ -493,10 +493,13 @@ impl Db {
     }
 
     pub fn toggle_star(&self, article_id: i64) -> Result<()> {
-        self.conn.execute(
+        let changed = self.conn.execute(
             "UPDATE articles SET starred = 1 - starred WHERE id = ?1",
             params![article_id],
         )?;
+        if changed == 0 {
+            bail!("文章不存在或已被删除");
+        }
         Ok(())
     }
 
@@ -922,6 +925,12 @@ mod tests {
 
         assert!(db.saved_articles().unwrap().is_empty());
         assert_eq!(db.saved_article_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn toggling_a_missing_article_reports_failure() {
+        let db = mem();
+        assert!(db.toggle_star(999_999).is_err());
     }
 
     #[test]
