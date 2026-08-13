@@ -1,0 +1,23 @@
+/target/
+/.idea/
+/.agents/
+
+# Local development captures and historical binaries. Release executables
+# are uploaded to GitHub Releases instead of being committed to Git.
+/*.exe
+/*.png
+
+# Local runtime data and logs (the app normally stores these in AppData).
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.log
+config.toml
+
+# Editor/OS leftovers.
+*.swp
+*.tmp
+.DS_Store
+Thumbs.db
