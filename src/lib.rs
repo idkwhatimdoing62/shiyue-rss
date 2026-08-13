@@ -7,6 +7,7 @@ mod gui;
 mod model;
 mod notify;
 mod text;
+mod web_clip;
 
 use anyhow::Result;
 use chrono::Utc;

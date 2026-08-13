@@ -7,7 +7,7 @@
 use anyhow::Result;
 use chrono::Utc;
 use eframe::egui::{self, ViewportCommand};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error as _;
 use std::io::Read as _;
 use std::ops::Range;
@@ -336,6 +336,11 @@ struct GuiApp {
     tray_quit: MenuId,
     feeds: Vec<(Feed, i64)>,
     articles: Vec<Article>,
+    /// 中栏当前展示普通订阅文章，还是统一的文章收藏库。
+    content_mode: ContentMode,
+    /// 收藏库中的本地网页快照 id。用集合缓存，避免 UI 每帧逐条查库。
+    web_clipping_ids: HashSet<i64>,
+    saved_article_count: usize,
     // 选中态存 id 而非下标，后台刷新重排后也不跳（ADR-14）。
     sel_feed_id: Option<i64>,
     sel_article_id: Option<i64>,
@@ -363,6 +368,43 @@ struct GuiApp {
     selection_popup_generation: u64,
     /// 跨标题、正文、列表和图片的文章级拖选状态。
     article_selection_drag: Option<ArticleSelectionDrag>,
+    /// “导入网页”窗口及其后台抓取状态。
+    web_clip_dialog: Option<WebClipDialog>,
+    web_clip_event_tx: std_mpsc::Sender<WebClipEvent>,
+    web_clip_event_rx: std_mpsc::Receiver<WebClipEvent>,
+    web_clip_request_generation: u64,
+    delete_web_clip_dialog: Option<DeleteWebClipDialog>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContentMode {
+    Feed,
+    Saved,
+}
+
+#[derive(Debug, Default)]
+struct WebClipDialog {
+    /// 可以是 http(s) 地址，也可以是用户粘贴的完整 HTML / HTML 片段。
+    source: String,
+    title: String,
+    /// 粘贴 HTML 时用于解析相对链接；网址抓取模式会自动使用最终地址。
+    base_url: String,
+    fetching: bool,
+    active_request: Option<u64>,
+    error: Option<String>,
+}
+
+enum WebClipEvent {
+    Complete {
+        request_id: u64,
+        result: Result<crate::web_clip::FetchedWebClip, String>,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct DeleteWebClipDialog {
+    article_id: i64,
+    title: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -527,6 +569,7 @@ impl GuiApp {
         let (tray, tray_toggle, tray_fetch, tray_quit) = build_tray()?;
         let (image_job_tx, image_job_rx) = std_mpsc::channel();
         let (image_event_tx, image_event_rx) = std_mpsc::channel();
+        let (web_clip_event_tx, web_clip_event_rx) = std_mpsc::channel();
         let image_client = reqwest::blocking::Client::builder()
             // A single article can expose many CDN images at once. HTTP/1.1
             // plus a small worker pool is markedly steadier than opening an
@@ -536,6 +579,15 @@ impl GuiApp {
             .timeout(Duration::from_secs(30))
             .pool_idle_timeout(Duration::from_secs(30))
             .pool_max_idle_per_host(IMAGE_WORKER_COUNT)
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() > 10 {
+                    return attempt.error("图片重定向次数过多");
+                }
+                if let Err(message) = crate::web_clip::validate_public_url(attempt.url()) {
+                    return attempt.error(message);
+                }
+                attempt.follow()
+            }))
             .user_agent(concat!("Shiyue/", env!("CARGO_PKG_VERSION")))
             .build()?;
         spawn_image_workers(image_client, image_job_rx, image_event_tx);
@@ -549,6 +601,9 @@ impl GuiApp {
             tray_quit,
             feeds: Vec::new(),
             articles: Vec::new(),
+            content_mode: ContentMode::Feed,
+            web_clipping_ids: HashSet::new(),
+            saved_article_count: 0,
             sel_feed_id: None,
             sel_article_id: None,
             hidden: false,
@@ -566,10 +621,16 @@ impl GuiApp {
             selection_popup: None,
             selection_popup_generation: 0,
             article_selection_drag: None,
+            web_clip_dialog: None,
+            web_clip_event_tx,
+            web_clip_event_rx,
+            web_clip_request_generation: 0,
+            delete_web_clip_dialog: None,
         };
         app.reload();
         app.refresh_saved_selection_count();
         app.refresh_archived_article_count();
+        app.refresh_saved_article_count();
         Ok(app)
     }
 
@@ -579,6 +640,10 @@ impl GuiApp {
 
     fn refresh_archived_article_count(&mut self) {
         self.archived_article_count = self.db.archived_article_count().unwrap_or_default();
+    }
+
+    fn refresh_saved_article_count(&mut self) {
+        self.saved_article_count = self.db.saved_article_count().unwrap_or_default();
     }
 
     fn reload(&mut self) {
@@ -593,10 +658,20 @@ impl GuiApp {
     }
 
     fn load_articles(&mut self) {
-        self.articles = match self.sel_feed_id {
-            Some(id) => self.db.articles_for_feed(id).unwrap_or_default(),
-            None => Vec::new(),
+        self.articles = match self.content_mode {
+            ContentMode::Saved => self.db.saved_articles().unwrap_or_default(),
+            ContentMode::Feed => match self.sel_feed_id {
+                Some(id) => self.db.articles_for_feed(id).unwrap_or_default(),
+                None => Vec::new(),
+            },
         };
+        self.web_clipping_ids = self
+            .db
+            .web_clippings()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|article| article.id)
+            .collect();
         if self
             .sel_article_id
             .map_or(false, |id| !self.articles.iter().any(|a| a.id == id))
@@ -606,7 +681,8 @@ impl GuiApp {
     }
 
     fn select_feed(&mut self, id: i64) {
-        if self.sel_feed_id != Some(id) {
+        if self.content_mode != ContentMode::Feed || self.sel_feed_id != Some(id) {
+            self.content_mode = ContentMode::Feed;
             self.sel_feed_id = Some(id);
             self.sel_article_id = None;
             self.body_article_id = None;
@@ -615,6 +691,19 @@ impl GuiApp {
             self.article_selection_drag = None;
             self.load_articles();
         }
+    }
+
+    fn select_saved_articles(&mut self) {
+        if self.content_mode != ContentMode::Saved {
+            self.content_mode = ContentMode::Saved;
+            self.sel_article_id = None;
+            self.body_article_id = None;
+            self.comment_dialog = None;
+            self.selection_popup = None;
+            self.article_selection_drag = None;
+        }
+        self.load_articles();
+        self.refresh_saved_article_count();
     }
 
     /// 点开即已读（ADR-16），未读数同步减一。
@@ -662,6 +751,10 @@ impl GuiApp {
             let _ = self.db.toggle_star(id);
             a.starred = !a.starred;
         }
+        if self.content_mode == ContentMode::Saved {
+            self.load_articles();
+        }
+        self.refresh_saved_article_count();
     }
 
     fn archive_article(&mut self, id: i64) {
@@ -687,6 +780,7 @@ impl GuiApp {
                     }
                 }
                 self.refresh_archived_article_count();
+                self.refresh_saved_article_count();
                 self.selection_notice = Some((
                     "文章已归档，后续刷新不会重新出现".to_owned(),
                     Instant::now(),
@@ -702,6 +796,173 @@ impl GuiApp {
     fn selected_article(&self) -> Option<&Article> {
         let id = self.sel_article_id?;
         self.articles.iter().find(|a| a.id == id)
+    }
+
+    fn open_web_clip_dialog(&mut self) {
+        self.web_clip_dialog
+            .get_or_insert_with(WebClipDialog::default);
+        self.selection_popup = None;
+    }
+
+    fn begin_web_clip_import(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.web_clip_dialog.as_mut() else {
+            return;
+        };
+        if dialog.fetching {
+            return;
+        }
+        let source = dialog.source.trim().to_owned();
+        if source.is_empty() {
+            dialog.error = Some("请粘贴网页地址或 HTML".to_owned());
+            return;
+        }
+        dialog.error = None;
+
+        if let Some(fetch_source) = normalized_web_url(&source) {
+            self.web_clip_request_generation = self.web_clip_request_generation.wrapping_add(1);
+            let request_id = self.web_clip_request_generation;
+            dialog.fetching = true;
+            dialog.active_request = Some(request_id);
+            let event_tx = self.web_clip_event_tx.clone();
+            let repaint = ctx.clone();
+            std::thread::spawn(move || {
+                let result = crate::web_clip::client()
+                    .and_then(|client| crate::web_clip::fetch_html(&client, &fetch_source))
+                    .map_err(|error| error.to_string());
+                let _ = event_tx.send(WebClipEvent::Complete { request_id, result });
+                repaint.request_repaint();
+            });
+            return;
+        }
+        if !source.trim_start().starts_with('<')
+            && source.lines().count() == 1
+            && (source.contains("://") || source.to_ascii_lowercase().starts_with("http:"))
+        {
+            dialog.error = Some("网页地址格式不正确，只支持 http:// 或 https://".to_owned());
+            return;
+        }
+
+        let title_override = non_empty_owned(&dialog.title);
+        let explicit_base = non_empty_owned(&dialog.base_url);
+        match prepare_pasted_web_clip(&source, explicit_base.as_deref()) {
+            Ok((snapshot_title, content)) => {
+                let title = title_override
+                    .or(snapshot_title)
+                    .unwrap_or_else(|| "未命名网页".to_owned());
+                self.finish_web_clip_save(None, &title, &content);
+            }
+            Err(error) => dialog.error = Some(error),
+        }
+    }
+
+    fn receive_web_clip_events(&mut self, ctx: &egui::Context) {
+        while let Ok(event) = self.web_clip_event_rx.try_recv() {
+            match event {
+                WebClipEvent::Complete { request_id, result } => {
+                    let Some(dialog) = self.web_clip_dialog.as_mut() else {
+                        continue;
+                    };
+                    if dialog.active_request != Some(request_id) {
+                        continue;
+                    }
+                    dialog.fetching = false;
+                    dialog.active_request = None;
+                    match result {
+                        Ok(fetched) => {
+                            let snapshot = text::prepare_html_snapshot(&fetched.html);
+                            if snapshot.content.trim().is_empty() {
+                                dialog.error =
+                                    Some("网页抓取成功，但没有识别到可阅读正文".to_owned());
+                                continue;
+                            }
+                            let title = non_empty_owned(&dialog.title)
+                                .or(snapshot.title)
+                                .unwrap_or_else(|| fetched.original_url.clone());
+                            let effective_base = snapshot
+                                .base_href
+                                .as_deref()
+                                .and_then(|base| resolve_http_url(base, Some(&fetched.final_url)))
+                                .or_else(|| Some(fetched.final_url.clone()));
+                            let content =
+                                with_html_base(&snapshot.content, effective_base.as_deref());
+                            self.finish_web_clip_save(
+                                Some(&fetched.original_url),
+                                &title,
+                                &content,
+                            );
+                        }
+                        Err(error) => {
+                            dialog.error = Some(format!("抓取失败：{error}"));
+                        }
+                    }
+                }
+            }
+            ctx.request_repaint();
+        }
+    }
+
+    fn finish_web_clip_save(&mut self, source_url: Option<&str>, title: &str, content: &str) {
+        match self
+            .db
+            .save_web_clipping(source_url, Some(title), content, Utc::now().timestamp())
+        {
+            Ok(article_id) => {
+                self.web_clip_dialog = None;
+                self.content_mode = ContentMode::Saved;
+                self.load_articles();
+                self.refresh_saved_article_count();
+                self.select_article(article_id);
+                self.selection_notice = Some((
+                    "正文快照已保存到本机；网页图片仍需联网加载".to_owned(),
+                    Instant::now(),
+                ));
+            }
+            Err(error) => {
+                if let Some(dialog) = self.web_clip_dialog.as_mut() {
+                    dialog.error = Some(format!("保存失败：{error}"));
+                } else {
+                    self.selection_notice =
+                        Some((format!("网页保存失败：{error}"), Instant::now()));
+                }
+            }
+        }
+    }
+
+    fn remove_saved_article(&mut self, id: i64) {
+        if self.web_clipping_ids.contains(&id) {
+            let title = self
+                .articles
+                .iter()
+                .find(|article| article.id == id)
+                .and_then(|article| article.title.clone())
+                .unwrap_or_else(|| "未命名网页".to_owned());
+            self.delete_web_clip_dialog = Some(DeleteWebClipDialog {
+                article_id: id,
+                title,
+            });
+        } else {
+            let is_starred = self
+                .articles
+                .iter()
+                .find(|article| article.id == id)
+                .is_some_and(|article| article.starred);
+            let result = if is_starred {
+                self.db.toggle_star(id)
+            } else {
+                Ok(())
+            };
+            match result {
+                Ok(_) => {
+                    self.load_articles();
+                    self.refresh_saved_article_count();
+                    self.selection_notice = Some(("已取消文章收藏".to_owned(), Instant::now()));
+                }
+                Err(error) => {
+                    self.selection_notice =
+                        Some((format!("取消收藏失败：{error}"), Instant::now()));
+                }
+            }
+        }
     }
 
     fn save_favorite_quote(&mut self, quote: SelectedQuote) {
@@ -814,6 +1075,166 @@ impl GuiApp {
             self.comment_dialog = None;
         } else if submit {
             self.submit_comment();
+        }
+    }
+
+    fn show_web_clip_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.web_clip_dialog.as_mut() else {
+            return;
+        };
+        let theme = ReaderTheme::sspai();
+        let mut open = true;
+        let mut import = false;
+        let mut cancel = false;
+        egui::Window::new("收藏网页")
+            .id(egui::Id::new("web-clipping-import"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(620.0)
+            .min_width(480.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme.canvas)
+                    .stroke(egui::Stroke::new(1.0, theme.border))
+                    .corner_radius(egui::CornerRadius::same(9))
+                    .inner_margin(egui::Margin::same(18)),
+            )
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new("粘贴网页地址，或直接粘贴 HTML 源码")
+                        .size(15.0)
+                        .color(theme.text),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("正文会作为本地快照保存；网页中的远程图片仍需要联网加载。")
+                        .size(12.0)
+                        .color(theme.muted),
+                );
+                ui.add_space(12.0);
+                ui.label("网页地址 / HTML");
+                let source_response = ui.add_enabled(
+                    !dialog.fetching,
+                    egui::TextEdit::multiline(&mut dialog.source)
+                        .desired_rows(10)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("https://example.com/article\n\n或\n\n<article>…</article>"),
+                );
+                if source_response.changed() {
+                    dialog.error = None;
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label("标题（可选）");
+                    ui.add_enabled(
+                        !dialog.fetching,
+                        egui::TextEdit::singleline(&mut dialog.title)
+                            .desired_width(ui.available_width())
+                            .hint_text("留空则从 HTML 自动识别"),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("基础网址（可选）");
+                    ui.add_enabled(
+                        !dialog.fetching,
+                        egui::TextEdit::singleline(&mut dialog.base_url)
+                            .desired_width(ui.available_width())
+                            .hint_text("仅粘贴 HTML 时，用于解析相对图片和链接"),
+                    );
+                });
+                if let Some(error) = &dialog.error {
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(error).color(theme.link).size(12.0));
+                }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    let import_label = if dialog.fetching {
+                        "正在抓取网页…"
+                    } else {
+                        "保存到收藏"
+                    };
+                    if ui
+                        .add_enabled(
+                            !dialog.fetching,
+                            egui::Button::new(import_label)
+                                .fill(theme.accent)
+                                .stroke(egui::Stroke::NONE),
+                        )
+                        .clicked()
+                    {
+                        import = true;
+                    }
+                    if dialog.fetching {
+                        ui.spinner();
+                    }
+                    let cancel_label = if dialog.fetching {
+                        "关闭窗口"
+                    } else {
+                        "取消"
+                    };
+                    if ui.button(cancel_label).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if cancel || !open {
+            self.web_clip_dialog = None;
+        } else if import {
+            self.begin_web_clip_import(ctx);
+        }
+    }
+
+    fn show_delete_web_clip_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.delete_web_clip_dialog.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new("删除本地网页")
+            .id(egui::Id::new("delete-web-clipping-confirm"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                ui.label(format!("确定永久删除「{}」吗？", dialog.title));
+                ui.weak("正文快照及其摘录、想法会一起删除，无法撤销。");
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("永久删除").clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if confirm {
+            match self.db.delete_web_clipping(dialog.article_id) {
+                Ok(changed) if changed > 0 => {
+                    if self.sel_article_id == Some(dialog.article_id) {
+                        self.sel_article_id = None;
+                        self.body_article_id = None;
+                    }
+                    self.load_articles();
+                    self.refresh_saved_article_count();
+                    self.refresh_saved_selection_count();
+                    self.selection_notice = Some(("本地网页已永久删除".to_owned(), Instant::now()));
+                }
+                Ok(_) => {
+                    self.selection_notice =
+                        Some(("网页不存在或已经删除".to_owned(), Instant::now()));
+                }
+                Err(error) => {
+                    self.selection_notice = Some((format!("删除失败：{error}"), Instant::now()));
+                }
+            }
+            self.delete_web_clip_dialog = None;
+        } else if cancel || !open {
+            self.delete_web_clip_dialog = None;
         }
     }
 
@@ -1018,7 +1439,13 @@ impl GuiApp {
             }
         }
         if let Some((feed_id, article_id)) = open_article {
-            self.select_feed(feed_id);
+            if self.web_clipping_ids.contains(&article_id)
+                || self.db.is_web_clipping(article_id).unwrap_or(false)
+            {
+                self.select_saved_articles();
+            } else {
+                self.select_feed(feed_id);
+            }
             self.select_article(article_id);
             self.show_saved_library = false;
             self.selection_notice = Some(("已打开原文章".to_owned(), Instant::now()));
@@ -1159,6 +1586,7 @@ impl GuiApp {
             match self.db.set_article_archived(article_id, false) {
                 Ok(changed) if changed > 0 => {
                     self.refresh_archived_article_count();
+                    self.refresh_saved_article_count();
                     // Re-read feed unread counts before opening the restored
                     // article. `select_article` will mark it read, so this
                     // keeps the badge exact even when the feed already had
@@ -1434,6 +1862,7 @@ impl eframe::App for GuiApp {
             Ordering::Relaxed,
         );
         self.receive_images(&ctx);
+        self.receive_web_clip_events(&ctx);
         self.handle_tray_events(&ctx);
 
         // 关窗 → 隐藏到托盘（除非托盘"退出"已置 quitting，ADR-15）。
@@ -1498,6 +1927,32 @@ impl eframe::App for GuiApp {
                     });
                 });
                 ui.separator();
+                ui.add_space(4.0);
+                let saved_articles_response = ui.add(
+                    egui::Button::new(
+                        egui::RichText::new(format!("★ 收藏  {}", self.saved_article_count))
+                            .size(13.0)
+                            .color(if self.content_mode == ContentMode::Saved {
+                                theme.text
+                            } else {
+                                theme.accent
+                            }),
+                    )
+                    .fill(if self.content_mode == ContentMode::Saved {
+                        theme.selected_bg
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    })
+                    .stroke(egui::Stroke::NONE)
+                    .corner_radius(egui::CornerRadius::same(4))
+                    .min_size(egui::vec2(ui.available_width(), 34.0)),
+                );
+                if saved_articles_response.clicked() {
+                    self.select_saved_articles();
+                    self.show_saved_library = false;
+                    self.show_archive_library = false;
+                    self.selection_popup = None;
+                }
                 ui.add_space(4.0);
                 let library_response = ui.add(
                     egui::Button::new(
@@ -1568,7 +2023,8 @@ impl eframe::App for GuiApp {
                             } else {
                                 " "
                             };
-                            let sel = self.sel_feed_id == Some(fd.id);
+                            let sel = self.content_mode == ContentMode::Feed
+                                && self.sel_feed_id == Some(fd.id);
                             let fill = if sel {
                                 theme.selected_bg
                             } else {
@@ -1626,23 +2082,67 @@ impl eframe::App for GuiApp {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("文章")
-                            .size(18.0)
-                            .family(egui::FontFamily::Name("cjk-bold".into())),
+                        egui::RichText::new(if self.content_mode == ContentMode::Saved {
+                            "收藏"
+                        } else {
+                            "文章"
+                        })
+                        .size(18.0)
+                        .family(egui::FontFamily::Name("cjk-bold".into())),
                     );
                     ui.label(
                         egui::RichText::new(format!("{} 篇", self.articles.len()))
                             .size(12.0)
                             .color(theme.muted),
                     );
+                    if self.content_mode == ContentMode::Saved {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("＋").size(20.0).color(theme.accent),
+                                    )
+                                    .stroke(egui::Stroke::NONE),
+                                )
+                                .on_hover_text("收藏网页或粘贴 HTML")
+                                .clicked()
+                            {
+                                self.open_web_clip_dialog();
+                            }
+                        });
+                    }
                 });
                 ui.separator();
                 ui.add_space(4.0);
+                if self.content_mode == ContentMode::Saved && self.articles.is_empty() {
+                    ui.add_space(26.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("还没有收藏")
+                                .size(15.0)
+                                .color(theme.text)
+                                .family(egui::FontFamily::Name("cjk-bold".into())),
+                        );
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new("点击右上角＋，粘贴网址或 HTML")
+                                .size(12.0)
+                                .color(theme.muted),
+                        );
+                    });
+                }
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         for a in &self.articles {
-                            let star = if a.starred { " ★" } else { "" };
+                            let is_web_clip = self.web_clipping_ids.contains(&a.id);
+                            let star = if is_web_clip {
+                                "  ◫"
+                            } else if a.starred {
+                                " ★"
+                            } else {
+                                ""
+                            };
                             let dot = if a.is_read { "" } else { "● " };
                             let title = a.title.clone().unwrap_or_default();
                             let sel = self.sel_article_id == Some(a.id);
@@ -1682,21 +2182,33 @@ impl eframe::App for GuiApp {
                                 open_article = Some(a.id);
                             }
                             resp.context_menu(|ui| {
-                                if ui.button("标为未读").clicked() {
-                                    unread_article = Some(a.id);
-                                }
-                                let star_label = if a.starred {
-                                    "取消星标"
+                                if self.content_mode == ContentMode::Saved {
+                                    let remove_label = if is_web_clip {
+                                        "删除本地网页…"
+                                    } else {
+                                        "取消收藏"
+                                    };
+                                    if ui.button(remove_label).clicked() {
+                                        star_article = Some(a.id);
+                                        ui.close();
+                                    }
                                 } else {
-                                    "加星标"
-                                };
-                                if ui.button(star_label).clicked() {
-                                    star_article = Some(a.id);
-                                }
-                                ui.separator();
-                                if ui.button("归档文章").clicked() {
-                                    archive_article = Some(a.id);
-                                    ui.close();
+                                    if ui.button("标为未读").clicked() {
+                                        unread_article = Some(a.id);
+                                    }
+                                    let star_label = if a.starred {
+                                        "取消星标"
+                                    } else {
+                                        "加星标"
+                                    };
+                                    if ui.button(star_label).clicked() {
+                                        star_article = Some(a.id);
+                                    }
+                                    ui.separator();
+                                    if ui.button("归档文章").clicked() {
+                                        archive_article = Some(a.id);
+                                        ui.close();
+                                    }
                                 }
                             });
                             let meta = match (a.author.as_deref(), a.published) {
@@ -1726,7 +2238,11 @@ impl eframe::App for GuiApp {
             self.mark_unread(id);
         }
         if let Some(id) = star_article {
-            self.toggle_star(id);
+            if self.content_mode == ContentMode::Saved {
+                self.remove_saved_article(id);
+            } else {
+                self.toggle_star(id);
+            }
         }
         if let Some(id) = archive_article {
             self.archive_article(id);
@@ -2184,6 +2700,8 @@ impl eframe::App for GuiApp {
             });
         self.show_saved_library_window(&ctx);
         self.show_archive_library_window(&ctx);
+        self.show_web_clip_dialog(&ctx);
+        self.show_delete_web_clip_dialog(&ctx);
         self.show_selection_popup(&ctx);
         self.show_comment_dialog(&ctx);
         self.show_selection_notice(&ctx);
@@ -3038,8 +3556,21 @@ fn download_image_once(
     uri: &str,
     attempt: u8,
 ) -> Result<Arc<[u8]>, ImageFailure> {
+    let url = reqwest::Url::parse(uri).map_err(|error| ImageFailure {
+        message: "图片地址无效，已停止加载".to_owned(),
+        detail: error.to_string(),
+        attempts: attempt,
+        retryable: false,
+    })?;
+    crate::web_clip::validate_public_url(&url).map_err(|detail| ImageFailure {
+        message: "为保护本机数据，已阻止加载该图片".to_owned(),
+        detail,
+        attempts: attempt,
+        retryable: false,
+    })?;
+
     let response = client
-        .get(uri)
+        .get(url)
         // The bundled decoder supports WebP/PNG/JPEG/GIF. Do not advertise
         // AVIF: a CDN may otherwise return a healthy image we cannot decode.
         .header(
@@ -3047,7 +3578,18 @@ fn download_image_once(
             "image/webp,image/png,image/jpeg,image/gif,*/*",
         )
         .send()
-        .map_err(|error| image_request_failure(error, attempt))?
+        .map_err(|error| image_request_failure(error, attempt))?;
+    if let Some(peer) = response.remote_addr()
+        && !crate::web_clip::is_public_ip(peer.ip())
+    {
+        return Err(ImageFailure {
+            message: "为保护本机数据，已阻止加载该图片".to_owned(),
+            detail: format!("图片服务器连接到了本机或内网地址：{}", peer.ip()),
+            attempts: attempt,
+            retryable: false,
+        });
+    }
+    let response = response
         .error_for_status()
         .map_err(|error| image_request_failure(error, attempt))?;
     if response
@@ -3098,18 +3640,21 @@ fn download_image_once(
 
 fn image_request_failure(error: reqwest::Error, attempt: u8) -> ImageFailure {
     let status = error.status();
-    let retryable = error.is_timeout()
+    let retryable = !error.is_redirect()
+        && (error.is_timeout()
         || error.is_connect()
         // TLS renegotiation and HTTP framing failures are classified as
         // request errors rather than connect errors by reqwest. Image GETs
         // are idempotent, so retrying this transport category is safe.
         || error.is_request()
         || error.is_body()
-        || status.is_some_and(image_http_status_retryable);
+        || status.is_some_and(image_http_status_retryable));
     let message = if error.is_timeout() {
         "连接图片服务器超时".to_owned()
     } else if error.is_connect() {
         "无法连接图片服务器".to_owned()
+    } else if error.is_redirect() {
+        "图片重定向不安全，已停止加载".to_owned()
     } else if let Some(status) = status {
         format!("图片服务器返回 HTTP {}", status.as_u16())
     } else if error.is_body() {
@@ -3155,26 +3700,104 @@ fn reqwest_error_chain(error: &reqwest::Error) -> String {
     messages.join("\n原因：")
 }
 
-/// 用系统默认浏览器打开链接。ponytail: Windows only。
-fn open_in_browser(url: &str) {
-    let mut command = std::process::Command::new("cmd");
-    command.args(["/C", "start", "", url]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // cmd.exe is only used as a launcher here. Prevent it from flashing a
-        // second console window when a link is opened from the GUI app.
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
+fn non_empty_owned(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn is_http_url(value: &str) -> bool {
+    reqwest::Url::parse(value.trim())
+        .ok()
+        .is_some_and(|url| matches!(url.scheme(), "http" | "https"))
+}
+
+fn normalized_web_url(value: &str) -> Option<String> {
+    let value = value.trim();
+    if is_http_url(value) {
+        return Some(value.to_owned());
     }
-    let _ = command.spawn();
+    if value.is_empty()
+        || value.chars().any(char::is_whitespace)
+        || value.starts_with('<')
+        || value.contains("://")
+    {
+        return None;
+    }
+    let host = value.split(['/', '?', '#']).next().unwrap_or_default();
+    if !host.contains('.') {
+        return None;
+    }
+    let candidate = format!("https://{value}");
+    is_http_url(&candidate).then_some(candidate)
+}
+
+fn resolve_http_url(value: &str, document_url: Option<&str>) -> Option<String> {
+    if let Ok(url) = reqwest::Url::parse(value.trim()) {
+        return matches!(url.scheme(), "http" | "https").then(|| url.to_string());
+    }
+    let document = reqwest::Url::parse(document_url?).ok()?;
+    let joined = document.join(value.trim()).ok()?;
+    matches!(joined.scheme(), "http" | "https").then(|| joined.to_string())
+}
+
+fn escape_html_attribute(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn with_html_base(content: &str, base: Option<&str>) -> String {
+    match base.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(base) => format!(
+            "<base href=\"{}\">\n{}",
+            escape_html_attribute(base),
+            content
+        ),
+        None => content.to_owned(),
+    }
+}
+
+fn prepare_pasted_web_clip(
+    html: &str,
+    explicit_base: Option<&str>,
+) -> std::result::Result<(Option<String>, String), String> {
+    let snapshot = text::prepare_html_snapshot(html);
+    if snapshot.content.trim().is_empty() {
+        return Err("HTML 中没有识别到可阅读正文".to_owned());
+    }
+    let base = explicit_base
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            resolve_http_url(value, None)
+                .ok_or_else(|| "基础网址必须是 http:// 或 https:// 地址".to_owned())
+        })
+        .transpose()?
+        .or_else(|| {
+            snapshot
+                .base_href
+                .as_deref()
+                .and_then(|value| resolve_http_url(value, None))
+        });
+    Ok((
+        snapshot.title,
+        with_html_base(&snapshot.content, base.as_deref()),
+    ))
+}
+
+/// 用系统默认浏览器打开链接，不经过 shell/cmd 字符串解释。
+fn open_in_browser(url: &str) {
+    let _ = open::that_detached(url);
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         IMAGE_MAX_ATTEMPTS, body_block_separator, download_image_with_retry,
-        image_http_status_retryable, is_punctuation_only, selected_quote_from_article_text,
+        image_http_status_retryable, is_punctuation_only, normalized_web_url,
+        prepare_pasted_web_clip, selected_quote_from_article_text,
     };
     use std::sync::mpsc;
     use std::time::Duration;
@@ -3195,6 +3818,32 @@ mod tests {
     #[test]
     fn article_quote_rejects_whitespace_only_ranges() {
         assert!(selected_quote_from_article_text(42, "甲 \n\n 乙", 1, 5).is_none());
+    }
+
+    #[test]
+    fn web_clip_input_accepts_http_and_common_bare_hosts() {
+        assert_eq!(
+            normalized_web_url("https://example.com/a"),
+            Some("https://example.com/a".to_owned())
+        );
+        assert_eq!(
+            normalized_web_url("example.com/a"),
+            Some("https://example.com/a".to_owned())
+        );
+        assert_eq!(normalized_web_url("<p>example.com</p>"), None);
+        assert_eq!(normalized_web_url("一段普通文字"), None);
+    }
+
+    #[test]
+    fn pasted_web_clip_keeps_local_base_without_using_it_as_identity() {
+        let (title, html) = prepare_pasted_web_clip(
+            "<title>保存页</title><article><img src='cover.webp'><p>正文</p></article>",
+            Some("https://example.com/posts/1/"),
+        )
+        .unwrap();
+        assert_eq!(title.as_deref(), Some("保存页"));
+        assert!(html.starts_with("<base href=\"https://example.com/posts/1/\">"));
+        assert!(html.contains("<p>正文</p>"));
     }
 
     #[test]

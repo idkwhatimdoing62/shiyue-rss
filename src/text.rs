@@ -27,15 +27,325 @@ pub enum Block {
 
 const BLOCK_TAGS: &[&str] = &["p", "br", "div", "li", "tr"];
 
+/// Elements that belong to the surrounding web application rather than to
+/// the article a reader wants to keep.  Filtering these here also protects
+/// ordinary RSS entries whose payload happens to contain a complete HTML
+/// document instead of an article fragment.
+const IGNORED_ELEMENTS: &[&str] = &[
+    "head", "script", "style", "noscript", "svg", "nav", "header", "footer", "aside", "form",
+    "iframe",
+];
+
+/// The useful parts extracted from a complete HTML document before it is
+/// stored as a local reading snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HtmlSnapshot {
+    /// Page title, using `og:title`, `<title>` and `<h1>` in that order.
+    pub title: Option<String>,
+    /// Article-oriented HTML, with page chrome and executable content removed.
+    pub content: String,
+    /// The document's declared `<base href>`, if present.
+    pub base_href: Option<String>,
+}
+
 struct LinkState {
     url: String,
     prefix: String,
     text: String,
 }
 
+/// Prepare a complete web page for local storage and later rendering.
+///
+/// The largest `<article>` is preferred when a page contains more than one;
+/// otherwise the largest `<main>`, then `<body>`, and finally the full input is
+/// used.  Script, style and surrounding navigation elements are removed even
+/// when the caller supplied only an HTML fragment.
+pub fn prepare_html_snapshot(html: &str) -> HtmlSnapshot {
+    let title = extract_html_title(html);
+    let base_href = extract_html_base_href(html);
+    let cleaned = strip_ignored_elements(html);
+    let readable = ["article", "main", "body"]
+        .into_iter()
+        .find_map(|name| largest_element_inner(&cleaned, name))
+        .unwrap_or(cleaned.as_str())
+        .trim()
+        .to_owned();
+
+    HtmlSnapshot {
+        title,
+        content: readable,
+        base_href,
+    }
+}
+
+/// Extract a human-facing page title without retaining any HTML markup.
+pub fn extract_html_title(html: &str) -> Option<String> {
+    let mut cursor = 0;
+    while let Some(tag) = find_tag_token(html, "meta", cursor, false) {
+        let source = &html[tag.start..tag.end];
+        let kind = attr(source, "property").or_else(|| attr(source, "name"));
+        if kind
+            .as_deref()
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("og:title"))
+        {
+            if let Some(title) = attr(source, "content").and_then(clean_title) {
+                return Some(title);
+            }
+        }
+        cursor = tag.end;
+    }
+
+    for name in ["title", "h1"] {
+        if let Some(fragment) = largest_element_inner(html, name) {
+            if let Some(title) = clean_title(fragment.to_owned()) {
+                return Some(title);
+            }
+        }
+    }
+    None
+}
+
+/// Read the first declared `<base href>` from a complete HTML document.
+pub fn extract_html_base_href(html: &str) -> Option<String> {
+    let tag = find_tag_token(html, "base", 0, false)?;
+    let href = decode_entities(&attr(&html[tag.start..tag.end], "href")?);
+    let href = href.trim();
+    (!href.is_empty()).then(|| href.to_owned())
+}
+
+#[derive(Clone, Copy)]
+struct HtmlTagToken {
+    start: usize,
+    end: usize,
+    closing: bool,
+    self_closing: bool,
+}
+
+fn clean_title(raw: String) -> Option<String> {
+    let plain = strip_all_tags(&raw);
+    let title = decode_entities(&plain)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!title.is_empty()).then_some(title)
+}
+
+fn strip_all_tags(html: &str) -> String {
+    let mut output = String::with_capacity(html.len());
+    let mut cursor = 0;
+    while let Some(relative) = html[cursor..].find('<') {
+        let start = cursor + relative;
+        output.push_str(&html[cursor..start]);
+        match tag_end(html, start) {
+            Some(end) => cursor = end,
+            None => {
+                output.push_str(&html[start..]);
+                return output;
+            }
+        }
+    }
+    output.push_str(&html[cursor..]);
+    output
+}
+
+fn strip_ignored_elements(html: &str) -> String {
+    let mut ranges = Vec::new();
+    for name in IGNORED_ELEMENTS {
+        ranges.extend(element_ranges(html, name));
+    }
+    ranges.extend(comment_ranges(html));
+    if ranges.is_empty() {
+        return html.to_owned();
+    }
+
+    ranges.sort_unstable_by_key(|range| range.0);
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        if let Some(previous) = merged.last_mut()
+            && start <= previous.1
+        {
+            previous.1 = previous.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+
+    let mut output = String::with_capacity(html.len());
+    let mut cursor = 0;
+    for (start, end) in merged {
+        if start > cursor {
+            output.push_str(&html[cursor..start]);
+        }
+        cursor = cursor.max(end);
+    }
+    output.push_str(&html[cursor..]);
+    output
+}
+
+fn element_ranges(html: &str, name: &str) -> Vec<(usize, usize)> {
+    // Script and style are raw-text elements in HTML: text such as
+    // `const sample = "<script>"` must not be mistaken for a nested element,
+    // or the filter would consume the remainder of the article.
+    if matches!(name, "script" | "style") {
+        return raw_text_element_ranges(html, name);
+    }
+    let mut ranges = Vec::new();
+    let mut stack = Vec::new();
+    let mut cursor = 0;
+    while let Some(token) = next_named_tag(html, name, cursor) {
+        cursor = token.end;
+        if token.closing {
+            if let Some(start) = stack.pop()
+                && stack.is_empty()
+            {
+                ranges.push((start, token.end));
+            }
+        } else if token.self_closing {
+            if stack.is_empty() {
+                ranges.push((token.start, token.end));
+            }
+        } else {
+            stack.push(token.start);
+        }
+    }
+    if let Some(start) = stack.first().copied() {
+        ranges.push((start, html.len()));
+    }
+    ranges
+}
+
+fn raw_text_element_ranges(html: &str, name: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut cursor = 0;
+    while let Some(open) = find_tag_token(html, name, cursor, false) {
+        if open.self_closing {
+            ranges.push((open.start, open.end));
+            cursor = open.end;
+            continue;
+        }
+        if let Some(close) = find_tag_token(html, name, open.end, true) {
+            ranges.push((open.start, close.end));
+            cursor = close.end;
+        } else {
+            ranges.push((open.start, html.len()));
+            break;
+        }
+    }
+    ranges
+}
+
+fn comment_ranges(html: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut cursor = 0;
+    while let Some(relative) = html[cursor..].find("<!--") {
+        let start = cursor + relative;
+        let end = html[start + 4..]
+            .find("-->")
+            .map(|relative| start + 4 + relative + 3)
+            .unwrap_or(html.len());
+        ranges.push((start, end));
+        cursor = end;
+    }
+    ranges
+}
+
+fn largest_element_inner<'a>(html: &'a str, name: &str) -> Option<&'a str> {
+    let mut stack = Vec::new();
+    let mut candidates = Vec::new();
+    let mut cursor = 0;
+    while let Some(token) = next_named_tag(html, name, cursor) {
+        cursor = token.end;
+        if token.closing {
+            if let Some(open_end) = stack.pop() {
+                candidates.push((open_end, token.start));
+            }
+        } else if !token.self_closing {
+            stack.push(token.end);
+        }
+    }
+    for open_end in stack {
+        candidates.push((open_end, html.len()));
+    }
+    candidates
+        .into_iter()
+        .max_by_key(|(start, end)| end.saturating_sub(*start))
+        .map(|(start, end)| &html[start..end])
+}
+
+fn find_tag_token(html: &str, name: &str, from: usize, closing: bool) -> Option<HtmlTagToken> {
+    let mut cursor = from;
+    while let Some(token) = next_named_tag(html, name, cursor) {
+        if token.closing == closing {
+            return Some(token);
+        }
+        cursor = token.end;
+    }
+    None
+}
+
+fn next_named_tag(html: &str, name: &str, from: usize) -> Option<HtmlTagToken> {
+    let bytes = html.as_bytes();
+    let mut cursor = from.min(bytes.len());
+    while cursor < bytes.len() {
+        let relative = html[cursor..].find('<')?;
+        let start = cursor + relative;
+        let mut at = start + 1;
+        let closing = bytes.get(at) == Some(&b'/');
+        if closing {
+            at += 1;
+        }
+        while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
+            at += 1;
+        }
+        let name_start = at;
+        while bytes
+            .get(at)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b':' | b'_'))
+        {
+            at += 1;
+        }
+        let end = tag_end(html, start)?;
+        if name_start < at && html[name_start..at].eq_ignore_ascii_case(name) {
+            let tail = html[at..end.saturating_sub(1)].trim_end();
+            return Some(HtmlTagToken {
+                start,
+                end,
+                closing,
+                self_closing: tail.ends_with('/'),
+            });
+        }
+        cursor = end;
+    }
+    None
+}
+
+fn tag_end(html: &str, start: usize) -> Option<usize> {
+    let mut quote = None;
+    for (relative, ch) in html[start + 1..].char_indices() {
+        match (quote, ch) {
+            (Some(expected), current) if current == expected => quote = None,
+            (None, '\'' | '"') => quote = Some(ch),
+            (None, '>') => return Some(start + 1 + relative + ch.len_utf8()),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// 把正文 HTML 拆成有序的 文字块 / 图片块，图片按它在原文里的位置穿插。
 /// `base` 是文章 URL，用来把相对 `<img src>` 补成绝对地址。
 pub fn content_blocks(html: &str, base: Option<&str>) -> Vec<Block> {
+    // Read `<base>` before removing `<head>`, and resolve a relative base
+    // against the caller-provided page URL.  This keeps full-page snapshots
+    // working while preserving the old RSS-fragment behaviour.
+    let declared_base = extract_html_base_href(html);
+    let effective_base = declared_base
+        .as_deref()
+        .and_then(|href| resolve(href, base).or_else(|| Some(href.to_owned())))
+        .or_else(|| base.map(str::to_owned));
+    let filtered_html = strip_ignored_elements(html);
+    let html = filtered_html.as_str();
+    let base = effective_base.as_deref();
     let mut blocks = Vec::new();
     let mut buf = String::new();
     let mut strong = false;
@@ -638,18 +948,63 @@ fn clean_text(raw: &str) -> String {
 }
 
 /// 从一个标签片段里取属性值（支持双/单引号）。
-fn attr(tag: &str, name: &str) -> Option<String> {
-    let lower = tag.to_ascii_lowercase();
-    let key = format!("{name}=");
-    let at = lower.find(&key)? + key.len();
-    let rest = &tag[at..];
-    let quote = rest.chars().next()?;
-    if quote == '"' || quote == '\'' {
-        let end = rest[1..].find(quote)? + 1;
-        Some(rest[1..end].to_string())
-    } else {
-        None
+fn attr(tag: &str, wanted: &str) -> Option<String> {
+    let bytes = tag.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        while at < bytes.len()
+            && (bytes[at].is_ascii_whitespace() || matches!(bytes[at], b'<' | b'/' | b'>'))
+        {
+            at += 1;
+        }
+        let name_start = at;
+        while at < bytes.len()
+            && !bytes[at].is_ascii_whitespace()
+            && !matches!(bytes[at], b'=' | b'>' | b'/')
+        {
+            at += 1;
+        }
+        if name_start == at {
+            at += 1;
+            continue;
+        }
+        let attribute_name = &tag[name_start..at];
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        if bytes.get(at) != Some(&b'=') {
+            continue;
+        }
+        at += 1;
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+
+        let (value_start, value_end) = match bytes.get(at).copied() {
+            Some(quote @ (b'"' | b'\'')) => {
+                at += 1;
+                let value_start = at;
+                while at < bytes.len() && bytes[at] != quote {
+                    at += 1;
+                }
+                let value_end = at;
+                at = (at + 1).min(bytes.len());
+                (value_start, value_end)
+            }
+            Some(_) => {
+                let value_start = at;
+                while at < bytes.len() && !bytes[at].is_ascii_whitespace() && bytes[at] != b'>' {
+                    at += 1;
+                }
+                (value_start, at)
+            }
+            None => return None,
+        };
+        if attribute_name.eq_ignore_ascii_case(wanted) {
+            return Some(tag[value_start..value_end].to_owned());
+        }
     }
+    None
 }
 
 /// 把 `<img src>` 补成绝对 http(s) 地址；纯相对路径靠文章 `base` 拼。
@@ -663,23 +1018,81 @@ fn resolve(src: &str, base: Option<&str>) -> Option<String> {
     if let Some(rest) = s.strip_prefix("//") {
         return Some(format!("https://{rest}"));
     }
-    let base = base?;
+    let base = base?.trim();
     let scheme_end = base.find("://")? + 3;
     let authority_end = base[scheme_end..]
         .find('/')
         .map(|i| scheme_end + i)
         .unwrap_or(base.len());
+    let authority_end = base[scheme_end..authority_end]
+        .find(['?', '#'])
+        .map(|i| scheme_end + i)
+        .unwrap_or(authority_end);
+    if s.starts_with('#') {
+        return Some(format!("{}{}", base.split('#').next().unwrap_or(base), s));
+    }
+    if s.starts_with('?') {
+        let page = base.split(['?', '#']).next().unwrap_or(base);
+        return Some(format!("{page}{s}"));
+    }
+    let (path, suffix) = s
+        .find(['?', '#'])
+        .map(|at| (&s[..at], &s[at..]))
+        .unwrap_or((s, ""));
     if s.starts_with('/') {
-        Some(format!("{}{}", &base[..authority_end], s)) // 根相对：scheme+host + /...
+        Some(format!(
+            "{}{}{}",
+            &base[..authority_end],
+            normalize_url_path(path),
+            suffix
+        )) // 根相对：scheme+host + /...
     } else {
         // 同目录相对：base 去掉最后一段文件名
-        let dir_end = base
+        let base_path_end = base.find(['?', '#']).unwrap_or(base.len());
+        let dir_end = base[..base_path_end]
             .rfind('/')
             .filter(|&i| i >= authority_end)
             .map(|i| i + 1)
             .unwrap_or(authority_end);
-        Some(format!("{}{}", &base[..dir_end], s))
+        let base_dir = &base[authority_end..dir_end];
+        let joined = if base_dir.is_empty() {
+            format!("/{path}")
+        } else {
+            format!("{base_dir}{path}")
+        };
+        Some(format!(
+            "{}{}{}",
+            &base[..authority_end],
+            normalize_url_path(&joined),
+            suffix
+        ))
     }
+}
+
+fn normalize_url_path(path: &str) -> String {
+    let leading_slash = path.starts_with('/');
+    let trailing_slash = path.ends_with('/');
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    let mut normalized = parts.join("/");
+    if leading_slash {
+        normalized.insert(0, '/');
+    }
+    if trailing_slash && !normalized.ends_with('/') {
+        normalized.push('/');
+    }
+    if normalized.is_empty() && leading_slash {
+        normalized.push('/');
+    }
+    normalized
 }
 
 /// 解码常见 HTML 实体（命名 + 十进制/十六进制数字），认不出的原样保留。
@@ -740,7 +1153,10 @@ pub fn fmt_ts(ts: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Block, content_blocks, is_numbered_heading, is_numbered_marker_only};
+    use super::{
+        Block, content_blocks, extract_html_base_href, extract_html_title, is_numbered_heading,
+        is_numbered_marker_only, prepare_html_snapshot,
+    };
 
     fn texts(blocks: &[Block]) -> String {
         blocks
@@ -762,6 +1178,130 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn all_visible_text(blocks: &[Block]) -> String {
+        blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Text(text)
+                | Block::Strong(text)
+                | Block::Heading(text)
+                | Block::Quote(text)
+                | Block::Code(text)
+                | Block::Link { text, .. } => Some(text.as_str()),
+                Block::Image(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    #[test]
+    fn prepares_readable_snapshot_from_complete_page() {
+        let html = r#"
+            <!doctype html><html><head>
+              <base href="https://cdn.example.com/articles/">
+              <meta property = "og:title" content = "  Saved &amp; readable  ">
+              <title>Fallback title</title><style>.ad { display: none }</style>
+              <script>window.secret = "must not render"</script>
+            </head><body>
+              <header>site masthead</header><nav>many links</nav>
+              <article class="story"><h1>Article heading</h1>
+                <p>First paragraph.</p><img src="../hero.webp">
+                <aside>related stories</aside><p>Last paragraph.</p>
+              </article>
+              <footer>copyright</footer>
+            </body></html>
+        "#;
+
+        let snapshot = prepare_html_snapshot(html);
+        assert_eq!(snapshot.title.as_deref(), Some("Saved & readable"));
+        assert_eq!(
+            snapshot.base_href.as_deref(),
+            Some("https://cdn.example.com/articles/")
+        );
+        assert!(snapshot.content.contains("Article heading"));
+        assert!(snapshot.content.contains("First paragraph."));
+        assert!(!snapshot.content.contains("site masthead"));
+        assert!(!snapshot.content.contains("related stories"));
+        assert!(!snapshot.content.contains("window.secret"));
+
+        let blocks = content_blocks(&snapshot.content, snapshot.base_href.as_deref());
+        assert_eq!(images(&blocks), vec!["https://cdn.example.com/hero.webp"]);
+    }
+
+    #[test]
+    fn title_falls_back_from_og_to_title_then_h1() {
+        assert_eq!(
+            extract_html_title("<title>  Page <em>title</em> &amp; more </title>"),
+            Some("Page title & more".to_owned())
+        );
+        assert_eq!(
+            extract_html_title("<main><h1>First <strong>heading</strong></h1></main>"),
+            Some("First heading".to_owned())
+        );
+        assert_eq!(extract_html_title("<p>No title</p>"), None);
+    }
+
+    #[test]
+    fn finds_base_href_with_spacing_and_unquoted_value() {
+        assert_eq!(
+            extract_html_base_href("<head><BASE HREF = https://example.com/a/b/></head>"),
+            Some("https://example.com/a/b/".to_owned())
+        );
+    }
+
+    #[test]
+    fn complete_html_never_renders_page_chrome_or_executable_content() {
+        let html = concat!(
+            "<html><head><title>Do not render title</title></head><body>",
+            "<header>Header text</header><nav>Navigation</nav>",
+            "<main><p>Readable body</p><script>evil()</script>",
+            "<style>body { color: red }</style><noscript>Turn JS on</noscript>",
+            "<svg><text>SVG label</text></svg><form>Form label</form>",
+            "<iframe>Frame fallback</iframe><aside>Related</aside></main>",
+            "<footer>Footer text</footer></body></html>"
+        );
+        let visible = all_visible_text(&content_blocks(html, None));
+        assert_eq!(visible, "Readable body");
+    }
+
+    #[test]
+    fn script_source_that_mentions_script_tag_does_not_hide_following_article() {
+        let html = r#"
+            <body><script>const sample = "<script>nested-looking text";</script>
+            <article><p>Still readable after script.</p></article></body>
+        "#;
+        let visible = all_visible_text(&content_blocks(html, None));
+        assert_eq!(visible, "Still readable after script.");
+    }
+
+    #[test]
+    fn largest_article_is_selected_and_nested_markup_is_balanced() {
+        let html = concat!(
+            "<article><p>teaser</p></article>",
+            "<article><div><p>long article paragraph</p></div><p>ending</p></article>",
+            "<main><p>main fallback should not win</p></main>"
+        );
+        let snapshot = prepare_html_snapshot(html);
+        let visible = all_visible_text(&content_blocks(&snapshot.content, None));
+        assert!(visible.contains("long article paragraph"));
+        assert!(visible.contains("ending"));
+        assert!(!visible.contains("teaser"));
+        assert!(!visible.contains("main fallback"));
+    }
+
+    #[test]
+    fn document_base_overrides_page_url_and_normalizes_parent_segments() {
+        let blocks = content_blocks(
+            r#"<html><head><base href="/assets/posts/"></head><body><img src="../hero.jpg"><a href="./source">source</a></body></html>"#,
+            Some("https://example.com/news/page.html"),
+        );
+        assert_eq!(images(&blocks), vec!["https://example.com/assets/hero.jpg"]);
+        assert!(blocks.iter().any(|block| matches!(
+            block,
+            Block::Link { url, .. } if url == "https://example.com/assets/posts/source"
+        )));
     }
 
     #[test]

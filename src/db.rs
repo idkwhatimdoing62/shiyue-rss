@@ -6,6 +6,11 @@ use rusqlite::{Connection, Row, params};
 use crate::config::Config;
 use crate::model::{Article, ArticleSelection, Feed, NewArticle};
 
+/// Hidden, non-network feed used to reuse the normal article reader and its
+/// annotations for locally saved web pages.
+pub const WEB_CLIPPINGS_FEED_URL: &str = "shiyue://web-clippings";
+const WEB_CLIPPINGS_FEED_TITLE: &str = "网页收藏";
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS feeds (
   id            INTEGER PRIMARY KEY,
@@ -154,11 +159,15 @@ impl Db {
     /// 按 id 或 url 删除，返回删除行数。
     pub fn remove_feed(&self, target: &str) -> Result<usize> {
         let n = if let Ok(id) = target.parse::<i64>() {
-            self.conn
-                .execute("DELETE FROM feeds WHERE id = ?1", params![id])?
+            self.conn.execute(
+                "DELETE FROM feeds WHERE id = ?1 AND url <> ?2",
+                params![id, WEB_CLIPPINGS_FEED_URL],
+            )?
         } else {
-            self.conn
-                .execute("DELETE FROM feeds WHERE url = ?1", params![target])?
+            self.conn.execute(
+                "DELETE FROM feeds WHERE url = ?1 AND url <> ?2",
+                params![target, WEB_CLIPPINGS_FEED_URL],
+            )?
         };
         Ok(n)
     }
@@ -178,21 +187,24 @@ impl Db {
     /// 到期且未禁用的源（daemon 用）。
     pub fn due_feeds(&self, now: i64) -> Result<Vec<Feed>> {
         self.query_feeds(
-            "WHERE disabled = 0 AND next_fetch <= ?1 ORDER BY id",
-            params![now],
+            "WHERE disabled = 0 AND url <> ?2 AND next_fetch <= ?1 ORDER BY id",
+            params![now, WEB_CLIPPINGS_FEED_URL],
         )
     }
 
     /// 所有未禁用的源（update 用）。
     pub fn enabled_feeds(&self) -> Result<Vec<Feed>> {
-        self.query_feeds("WHERE disabled = 0 ORDER BY id", &[])
+        self.query_feeds(
+            "WHERE disabled = 0 AND url <> ?1 ORDER BY id",
+            params![WEB_CLIPPINGS_FEED_URL],
+        )
     }
 
     /// 最近一个到期时间（daemon 决定 sleep 多久）。
     pub fn earliest_next_fetch(&self) -> Result<Option<i64>> {
         let v: Option<i64> = self.conn.query_row(
-            "SELECT MIN(next_fetch) FROM feeds WHERE disabled = 0",
-            [],
+            "SELECT MIN(next_fetch) FROM feeds WHERE disabled = 0 AND url <> ?1",
+            params![WEB_CLIPPINGS_FEED_URL],
             |r| r.get(0),
         )?;
         Ok(v)
@@ -204,11 +216,130 @@ impl Db {
             "SELECT {FEED_COLS}, \
              (SELECT COUNT(*) FROM articles a \
               WHERE a.feed_id = feeds.id AND a.is_read = 0 AND a.archived = 0) \
-             FROM feeds ORDER BY id"
+             FROM feeds WHERE feeds.url <> ?1 ORDER BY id"
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| Ok((map_feed(row)?, row.get::<_, i64>(9)?)))?;
+        let rows = stmt.query_map(params![WEB_CLIPPINGS_FEED_URL], |row| {
+            Ok((map_feed(row)?, row.get::<_, i64>(9)?))
+        })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    // ---- Locally saved web pages ----
+
+    /// Creates the hidden storage feed if necessary and returns its stable id.
+    ///
+    /// The row is always forced back to `disabled = 1`. Network scheduling
+    /// queries also exclude it by URL as a second line of defence.
+    pub fn ensure_web_clippings_feed(&self, now: i64) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO feeds (url, title, next_fetch, disabled) \
+             VALUES (?1, ?2, ?3, 1) \
+             ON CONFLICT(url) DO UPDATE SET \
+               title = excluded.title, disabled = 1, last_error = NULL, fail_count = 0",
+            params![WEB_CLIPPINGS_FEED_URL, WEB_CLIPPINGS_FEED_TITLE, now],
+        )?;
+        Ok(self.conn.query_row(
+            "SELECT id FROM feeds WHERE url = ?1",
+            params![WEB_CLIPPINGS_FEED_URL],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Saves an immutable local HTML snapshot and returns its article id.
+    ///
+    /// Every save receives a fresh random entry id, including repeated saves
+    /// of the same source URL. The original URL is retained as article
+    /// metadata, while the captured body is never overwritten; annotations
+    /// can therefore keep referring to the exact snapshot they were made on.
+    pub fn save_web_clipping(
+        &self,
+        source_url: Option<&str>,
+        title: Option<&str>,
+        html: &str,
+        now: i64,
+    ) -> Result<i64> {
+        if html.trim().is_empty() {
+            bail!("网页内容不能为空");
+        }
+
+        let source_url = source_url.map(str::trim).filter(|value| !value.is_empty());
+        let title = title.map(str::trim).filter(|value| !value.is_empty());
+        let feed_id = self.ensure_web_clippings_feed(now)?;
+
+        self.conn.execute(
+            "INSERT INTO articles \
+             (feed_id, entry_id, url, title, author, published, content, \
+              is_read, starred, archived, fetched_at) \
+             VALUES (?1, 'clip:' || lower(hex(randomblob(16))), ?2, ?3, ?4, ?5, ?6, \
+                     1, 1, 0, ?5)",
+            params![
+                feed_id,
+                source_url,
+                title,
+                WEB_CLIPPINGS_FEED_TITLE,
+                now,
+                html
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn web_clippings(&self) -> Result<Vec<Article>> {
+        let sql = format!(
+            "SELECT {ARTICLE_COLS} FROM articles \
+             WHERE feed_id = (SELECT id FROM feeds WHERE url = ?1) \
+             ORDER BY COALESCE(published, fetched_at) DESC, id DESC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![WEB_CLIPPINGS_FEED_URL], map_article)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn is_web_clipping(&self, article_id: i64) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM articles a \
+             JOIN feeds f ON f.id = a.feed_id WHERE a.id = ?1 AND f.url = ?2",
+            params![article_id, WEB_CLIPPINGS_FEED_URL],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Permanently deletes only articles belonging to the hidden clipping
+    /// feed. Passing a normal RSS article id is intentionally a no-op.
+    pub fn delete_web_clipping(&self, article_id: i64) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM articles \
+             WHERE id = ?1 AND feed_id = \
+               (SELECT id FROM feeds WHERE url = ?2)",
+            params![article_id, WEB_CLIPPINGS_FEED_URL],
+        )?)
+    }
+
+    /// Unified article-level saved view: regular starred RSS articles and all
+    /// locally saved web pages, newest first.
+    pub fn saved_articles(&self) -> Result<Vec<Article>> {
+        let sql = format!(
+            "SELECT {ARTICLE_COLS} FROM articles \
+             WHERE archived = 0 AND (starred = 1 \
+                OR feed_id = (SELECT id FROM feeds WHERE url = ?1)) \
+             ORDER BY COALESCE(published, fetched_at) DESC, id DESC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![WEB_CLIPPINGS_FEED_URL], map_article)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn saved_article_count(&self) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM articles a \
+             JOIN feeds f ON f.id = a.feed_id \
+             WHERE a.archived = 0 AND (a.starred = 1 OR f.url = ?1)",
+            params![WEB_CLIPPINGS_FEED_URL],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as usize)
     }
 
     pub fn set_interval(&self, id: i64, secs: i64) -> Result<usize> {
@@ -645,6 +776,162 @@ mod tests {
         assert_eq!(restored[0].id, article_id);
         assert!(!restored[0].archived);
         assert_eq!(db.feeds_with_unread().unwrap()[0].1, 1);
+    }
+
+    #[test]
+    fn internal_clippings_feed_is_hidden_and_never_scheduled() {
+        let db = mem();
+        let normal_id = db.add_feed("https://example.com/feed.xml", 10).unwrap();
+        let internal_id = db.ensure_web_clippings_feed(0).unwrap();
+        assert_eq!(internal_id, db.ensure_web_clippings_feed(99).unwrap());
+
+        // Even accidental/manual re-enabling must not put this pseudo-feed on
+        // the network scheduler.
+        db.conn
+            .execute(
+                "UPDATE feeds SET disabled = 0, next_fetch = 0 WHERE id = ?1",
+                params![internal_id],
+            )
+            .unwrap();
+
+        let listed = db.feeds_with_unread().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].0.id, normal_id);
+        assert_eq!(db.enabled_feeds().unwrap().len(), 1);
+        assert_eq!(db.due_feeds(10).unwrap().len(), 1);
+        assert_eq!(db.earliest_next_fetch().unwrap(), Some(10));
+
+        assert_eq!(db.remove_feed(WEB_CLIPPINGS_FEED_URL).unwrap(), 0);
+        assert_eq!(db.remove_feed(&internal_id.to_string()).unwrap(), 0);
+        assert!(db.get_feed(internal_id).is_ok());
+    }
+
+    #[test]
+    fn web_clipping_saves_immutable_snapshots_for_urls_and_raw_html() {
+        let db = mem();
+        let first_id = db
+            .save_web_clipping(
+                Some(" https://example.com/story "),
+                Some(" First title "),
+                "<p>first snapshot</p>",
+                10,
+            )
+            .unwrap();
+        let second_id = db
+            .save_web_clipping(
+                Some("https://example.com/story"),
+                None,
+                "<p>second snapshot</p>",
+                20,
+            )
+            .unwrap();
+        assert_ne!(first_id, second_id);
+
+        let raw_a = db
+            .save_web_clipping(None, Some("Pasted A"), "<p>A</p>", 30)
+            .unwrap();
+        let raw_b = db
+            .save_web_clipping(None, Some("Pasted B"), "<p>B</p>", 30)
+            .unwrap();
+        assert_ne!(raw_a, raw_b);
+        assert_eq!(db.web_clippings().unwrap().len(), 4);
+
+        let clips = db.web_clippings().unwrap();
+        let first = clips.iter().find(|article| article.id == first_id).unwrap();
+        let second = clips
+            .iter()
+            .find(|article| article.id == second_id)
+            .unwrap();
+        assert_ne!(first.entry_id, second.entry_id);
+        assert!(first.entry_id.starts_with("clip:"));
+        assert!(second.entry_id.starts_with("clip:"));
+        assert_eq!(first.title.as_deref(), Some("First title"));
+        assert_eq!(first.content.as_deref(), Some("<p>first snapshot</p>"));
+        assert_eq!(second.title, None);
+        assert_eq!(second.content.as_deref(), Some("<p>second snapshot</p>"));
+        assert_eq!(first.url.as_deref(), Some("https://example.com/story"));
+        assert_eq!(second.url.as_deref(), Some("https://example.com/story"));
+        assert!(first.starred);
+        assert!(first.is_read);
+        assert!(!first.archived);
+        assert!(db.is_web_clipping(first_id).unwrap());
+        assert!(db.is_web_clipping(second_id).unwrap());
+    }
+
+    #[test]
+    fn saved_articles_unifies_stars_and_clippings_and_delete_is_scoped() {
+        let db = mem();
+        let cfg = Config::default();
+        let feed_id = db.add_feed("http://x/feed", 0).unwrap();
+        let feed = db.get_feed(feed_id).unwrap();
+        db.record_success(&feed, 1, &cfg, None, &[art("starred"), art("plain")])
+            .unwrap();
+        let normal = db.articles_for_feed(feed_id).unwrap();
+        let starred_id = normal
+            .iter()
+            .find(|article| article.entry_id == "starred")
+            .unwrap()
+            .id;
+        let plain_id = normal
+            .iter()
+            .find(|article| article.entry_id == "plain")
+            .unwrap()
+            .id;
+        db.toggle_star(starred_id).unwrap();
+
+        let clipping_id = db
+            .save_web_clipping(
+                Some("https://example.com/saved"),
+                Some("Saved page"),
+                "<main>saved</main>",
+                2,
+            )
+            .unwrap();
+
+        let saved = db.saved_articles().unwrap();
+        assert_eq!(saved.len(), 2);
+        assert_eq!(db.saved_article_count().unwrap(), 2);
+        assert!(saved.iter().any(|article| article.id == starred_id));
+        assert!(saved.iter().any(|article| article.id == clipping_id));
+        assert!(!saved.iter().any(|article| article.id == plain_id));
+
+        assert_eq!(db.delete_web_clipping(starred_id).unwrap(), 0);
+        assert!(
+            db.articles_for_feed(feed_id)
+                .unwrap()
+                .iter()
+                .any(|a| a.id == starred_id)
+        );
+        assert_eq!(db.delete_web_clipping(clipping_id).unwrap(), 1);
+        assert!(db.web_clippings().unwrap().is_empty());
+        assert!(!db.is_web_clipping(clipping_id).unwrap());
+        assert_eq!(db.saved_article_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn saved_articles_do_not_reopen_archived_items() {
+        let db = mem();
+        let cfg = Config::default();
+        let feed_id = db.add_feed("http://x/feed", 0).unwrap();
+        let feed = db.get_feed(feed_id).unwrap();
+        db.record_success(&feed, 1, &cfg, None, &[art("starred")])
+            .unwrap();
+        let article_id = db.articles_for_feed(feed_id).unwrap()[0].id;
+        db.toggle_star(article_id).unwrap();
+        db.set_article_archived(article_id, true).unwrap();
+
+        assert!(db.saved_articles().unwrap().is_empty());
+        assert_eq!(db.saved_article_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn web_clipping_rejects_empty_html() {
+        let db = mem();
+        assert!(
+            db.save_web_clipping(Some("https://example.com"), Some("Empty"), " \n\t ", 0)
+                .is_err()
+        );
+        assert!(db.web_clippings().unwrap().is_empty());
     }
 
     #[test]
