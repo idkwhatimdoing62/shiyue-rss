@@ -6,6 +6,7 @@
 # are uploaded to GitHub Releases instead of being committed to Git.
 /*.exe
 /*.png
+/dist/
 
 # Local runtime data and logs (the app normally stores these in AppData).
 *.db
