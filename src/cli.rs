@@ -1,9 +1,9 @@
-//! 命令面（见 docs/outline.md）。无子命令 → 进桌面 GUI（内置抓取+调度）。
+//! 独立命令行管理工具（见 docs/outline.md）。
 
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "shiyue", version, about = "拾阅 RSS 阅读器")]
+#[command(name = "shiyue-cli", version, about = "拾阅 RSS 命令行管理工具")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,

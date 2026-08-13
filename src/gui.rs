@@ -3157,9 +3157,17 @@ fn reqwest_error_chain(error: &reqwest::Error) -> String {
 
 /// 用系统默认浏览器打开链接。ponytail: Windows only。
 fn open_in_browser(url: &str) {
-    let _ = std::process::Command::new("cmd")
-        .args(["/C", "start", "", url])
-        .spawn();
+    let mut command = std::process::Command::new("cmd");
+    command.args(["/C", "start", "", url]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // cmd.exe is only used as a launcher here. Prevent it from flashing a
+        // second console window when a link is opened from the GUI app.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let _ = command.spawn();
 }
 
 #[cfg(test)]

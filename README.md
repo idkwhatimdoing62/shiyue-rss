@@ -15,7 +15,7 @@
 
 ## 下载
 
-前往 [Releases](https://github.com/idkwhatimdoing62/shiyue-rss/releases) 下载最新的 Windows 可执行文件。当前为便携版，下载后直接运行即可。
+前往 [Releases](https://github.com/idkwhatimdoing62/shiyue-rss/releases) 下载最新的 Windows 便携包。解压后双击 `shiyue.exe` 即可运行；`shiyue-cli.exe` 仅在需要终端管理订阅时使用。
 
 > Windows SmartScreen 可能提示“未知发布者”，这是因为当前发行文件尚未购买代码签名证书。可核对 Release 中提供的 SHA-256 后再运行。
 
@@ -39,20 +39,23 @@ cargo test
 cargo build --release
 ```
 
-构建产物位于 `target\release\shiyue.exe`。
+构建产物：
+
+- `target\release\shiyue.exe`：无命令行黑框的桌面阅读器
+- `target\release\shiyue-cli.exe`：保留终端输出的订阅管理工具
 
 ## 命令行
 
-不带参数运行会打开桌面阅读器；也可以使用以下命令管理订阅：
+双击 `shiyue.exe` 打开桌面阅读器。需要脚本或终端管理订阅时，使用同一发行包内的 `shiyue-cli.exe`：
 
 ```text
-shiyue add <url>
-shiyue rm <id|url>
-shiyue list
-shiyue update
-shiyue set-interval <id> <30s|5m|6h|2d>
-shiyue enable <id>
-shiyue disable <id>
+shiyue-cli add <url>
+shiyue-cli rm <id|url>
+shiyue-cli list
+shiyue-cli update
+shiyue-cli set-interval <id> <30s|5m|6h|2d>
+shiyue-cli enable <id>
+shiyue-cli disable <id>
 ```
 
 ## 隐私
