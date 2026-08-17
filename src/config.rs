@@ -32,9 +32,12 @@ impl Default for Config {
 }
 
 pub struct Paths {
+    pub data_dir: PathBuf,
     pub config_file: PathBuf,
     pub db_file: PathBuf,
     pub log_file: PathBuf,
+    pub image_cache_dir: PathBuf,
+    pub backup_dir: PathBuf,
 }
 
 impl Paths {
@@ -46,10 +49,17 @@ impl Paths {
         let data_dir = pd.data_local_dir().to_path_buf();
         std::fs::create_dir_all(&config_dir)?;
         std::fs::create_dir_all(&data_dir)?;
+        let image_cache_dir = data_dir.join("image-cache");
+        let backup_dir = data_dir.join("backups");
+        std::fs::create_dir_all(&image_cache_dir)?;
+        std::fs::create_dir_all(&backup_dir)?;
         Ok(Self {
+            data_dir: data_dir.clone(),
             config_file: config_dir.join("config.toml"),
             db_file: data_dir.join("rrss.db"),
             log_file: data_dir.join("rrss.log"),
+            image_cache_dir,
+            backup_dir,
         })
     }
 }

@@ -9,6 +9,7 @@ use chrono::Utc;
 use eframe::egui::{self, ViewportCommand};
 use std::collections::{HashMap, HashSet};
 use std::error::Error as _;
+use std::hash::{Hash, Hasher};
 use std::io::Read as _;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -20,9 +21,14 @@ use tokio::sync::mpsc;
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
+use crate::backup::{BackupEntry, BackupProtection, BackupStore, DEFAULT_BACKUP_KEEP};
 use crate::config::{Config, Paths};
 use crate::db::Db;
-use crate::model::{Article, Feed};
+use crate::image_store::{CacheStats, DEFAULT_LIMIT_BYTES, ImageStore};
+use crate::model::{
+    Article, ArticleBatchAction, ArticleSelection, Feed, SearchHistoryEntry, SearchHit,
+    SearchHitKind, TextAnchor, resolve_excerpt_anchor,
+};
 use crate::text::{self, Block};
 use crate::{daemon, fetch, notify};
 
@@ -102,6 +108,8 @@ struct Shared {
     busy: AtomicBool,
     /// 有新文章落库（调度线程置位）；UI 见到就重读库并清零。
     dirty: AtomicBool,
+    /// Database restore/VACUUM temporarily pauses scheduler writes.
+    maintenance: AtomicBool,
 }
 
 /// UI → 调度线程的命令。
@@ -156,6 +164,10 @@ async fn scheduler_loop(
     };
     tracing::info!("GUI 后台调度线程启动");
     loop {
+        if shared.maintenance.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        }
         let now = Utc::now().timestamp();
         match db.due_feeds(now) {
             Ok(due) if !due.is_empty() => run_round(&db, &cfg, &client, due, &ctx, &shared).await,
@@ -194,7 +206,16 @@ async fn run_round(
     ctx: &egui::Context,
     shared: &Arc<Shared>,
 ) {
-    shared.busy.store(true, Ordering::Relaxed);
+    if shared.maintenance.load(Ordering::SeqCst) {
+        return;
+    }
+    shared.busy.store(true, Ordering::SeqCst);
+    // Close the race where maintenance starts after the first check but
+    // before this round claims the writer slot.
+    if shared.maintenance.load(Ordering::SeqCst) {
+        shared.busy.store(false, Ordering::SeqCst);
+        return;
+    }
     ctx.request_repaint();
     match daemon::fetch_feeds(db, cfg, client, feeds).await {
         Ok((nf, nn)) if nn > 0 => {
@@ -208,7 +229,7 @@ async fn run_round(
         Ok(_) => {}
         Err(e) => tracing::warn!("抓取轮次出错: {e}"),
     }
-    shared.busy.store(false, Ordering::Relaxed);
+    shared.busy.store(false, Ordering::SeqCst);
     ctx.request_repaint();
 }
 
@@ -341,6 +362,9 @@ struct GuiApp {
     /// 收藏库中的本地网页快照 id。用集合缓存，避免 UI 每帧逐条查库。
     web_clipping_ids: HashSet<i64>,
     saved_article_count: usize,
+    read_later_count: usize,
+    batch_mode: bool,
+    batch_selection: HashSet<i64>,
     // 选中态存 id 而非下标，后台刷新重排后也不跳（ADR-14）。
     sel_feed_id: Option<i64>,
     sel_article_id: Option<i64>,
@@ -350,6 +374,18 @@ struct GuiApp {
     image_cache: HashMap<String, ImageState>,
     image_job_tx: std_mpsc::Sender<String>,
     image_event_rx: std_mpsc::Receiver<ImageEvent>,
+    image_store: Arc<ImageStore>,
+    backup_store: BackupStore,
+    data_dir: PathBuf,
+    log_file: PathBuf,
+    show_storage_dialog: bool,
+    storage_overview: Option<StorageOverview>,
+    storage_message: Option<String>,
+    pending_restore: Option<BackupEntry>,
+    confirm_clear_images: bool,
+    formula_cache: HashMap<String, FormulaState>,
+    formula_job_tx: std_mpsc::Sender<FormulaJob>,
+    formula_event_rx: std_mpsc::Receiver<FormulaEvent>,
     /// 正在编辑的想法窗口。
     comment_dialog: Option<CommentDialog>,
     /// 给用户的轻量操作反馈。
@@ -362,6 +398,11 @@ struct GuiApp {
     show_archive_library: bool,
     /// 已归档文章数量。
     archived_article_count: usize,
+    /// 统一搜索文章、网页快照、摘录和想法。
+    search_dialog: Option<SearchDialog>,
+    tag_dialog: Option<TagDialog>,
+    pending_selection_anchor: Option<ArticleSelection>,
+    pending_body_scroll: Option<(i64, f32)>,
     /// 快捷操作浮层中当前等待处理的选区。
     selection_popup: Option<SelectionPopup>,
     /// 每次新选区使用不同的浮层 id，避免旧浮层的点击关闭事件误伤新浮层。
@@ -380,6 +421,25 @@ struct GuiApp {
 enum ContentMode {
     Feed,
     Saved,
+    ReadLater,
+    /// 搜索中打开的归档文章不应被悄悄恢复，因此用只含该文章的临时视图。
+    Search,
+}
+
+#[derive(Debug, Default)]
+struct SearchDialog {
+    query: String,
+    searched_query: String,
+    results: Vec<SearchHit>,
+    error: Option<String>,
+    focus_input: bool,
+    history: Vec<SearchHistoryEntry>,
+}
+
+#[derive(Debug)]
+struct TagDialog {
+    article_id: i64,
+    draft: String,
 }
 
 #[derive(Debug, Default)]
@@ -413,6 +473,8 @@ struct SelectedQuote {
     text: String,
     start_offset: Option<i64>,
     end_offset: Option<i64>,
+    anchor_prefix: String,
+    anchor_suffix: String,
 }
 
 struct CommentDialog {
@@ -549,6 +611,47 @@ enum ImageState {
     Failed(ImageFailure),
 }
 
+#[derive(Debug, Clone)]
+struct StorageOverview {
+    database_bytes: u64,
+    log_bytes: u64,
+    image_cache: CacheStats,
+    backup_bytes: u64,
+    backups: Vec<BackupEntry>,
+}
+
+enum StorageAction {
+    Check,
+    Backup(BackupProtection),
+    Compact,
+    PruneImages,
+    ClearImages,
+    PruneBackups,
+    OpenFolder,
+    RequestRestore(BackupEntry),
+    ConfirmRestore(BackupEntry),
+}
+
+#[derive(Clone)]
+struct FormulaJob {
+    key: String,
+    source: String,
+    display: bool,
+}
+
+enum FormulaEvent {
+    Complete {
+        key: String,
+        result: Result<Arc<[u8]>, String>,
+    },
+}
+
+enum FormulaState {
+    Loading,
+    Ready(Arc<[u8]>),
+    Failed(String),
+}
+
 impl GuiApp {
     fn new(cc: &eframe::CreationContext, paths: &Paths, cfg: Config) -> Result<Self> {
         let db = Db::open(&paths.db_file)?;
@@ -556,6 +659,7 @@ impl GuiApp {
             focused: AtomicBool::new(true),
             busy: AtomicBool::new(false),
             dirty: AtomicBool::new(false),
+            maintenance: AtomicBool::new(false),
         });
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         spawn_scheduler(
@@ -569,6 +673,8 @@ impl GuiApp {
         let (tray, tray_toggle, tray_fetch, tray_quit) = build_tray()?;
         let (image_job_tx, image_job_rx) = std_mpsc::channel();
         let (image_event_tx, image_event_rx) = std_mpsc::channel();
+        let (formula_job_tx, formula_job_rx) = std_mpsc::channel();
+        let (formula_event_tx, formula_event_rx) = std_mpsc::channel();
         let (web_clip_event_tx, web_clip_event_rx) = std_mpsc::channel();
         let image_client = reqwest::blocking::Client::builder()
             // A single article can expose many CDN images at once. HTTP/1.1
@@ -590,7 +696,16 @@ impl GuiApp {
             }))
             .user_agent(concat!("Shiyue/", env!("CARGO_PKG_VERSION")))
             .build()?;
-        spawn_image_workers(image_client, image_job_rx, image_event_tx);
+        let image_store = Arc::new(ImageStore::open(&paths.image_cache_dir)?);
+        let _ = image_store.prune_to(DEFAULT_LIMIT_BYTES);
+        let backup_store = BackupStore::open(&paths.backup_dir)?;
+        spawn_image_workers(
+            image_client,
+            image_job_rx,
+            image_event_tx,
+            image_store.clone(),
+        );
+        spawn_formula_worker(formula_job_rx, formula_event_tx);
         let mut app = GuiApp {
             db,
             shared,
@@ -604,6 +719,9 @@ impl GuiApp {
             content_mode: ContentMode::Feed,
             web_clipping_ids: HashSet::new(),
             saved_article_count: 0,
+            read_later_count: 0,
+            batch_mode: false,
+            batch_selection: HashSet::new(),
             sel_feed_id: None,
             sel_article_id: None,
             hidden: false,
@@ -612,12 +730,28 @@ impl GuiApp {
             image_cache: HashMap::new(),
             image_job_tx,
             image_event_rx,
+            image_store,
+            backup_store,
+            data_dir: paths.data_dir.clone(),
+            log_file: paths.log_file.clone(),
+            show_storage_dialog: false,
+            storage_overview: None,
+            storage_message: None,
+            pending_restore: None,
+            confirm_clear_images: false,
+            formula_cache: HashMap::new(),
+            formula_job_tx,
+            formula_event_rx,
             comment_dialog: None,
             selection_notice: None,
             show_saved_library: false,
             saved_selection_count: 0,
             show_archive_library: false,
             archived_article_count: 0,
+            search_dialog: None,
+            tag_dialog: None,
+            pending_selection_anchor: None,
+            pending_body_scroll: None,
             selection_popup: None,
             selection_popup_generation: 0,
             article_selection_drag: None,
@@ -631,6 +765,7 @@ impl GuiApp {
         app.refresh_saved_selection_count();
         app.refresh_archived_article_count();
         app.refresh_saved_article_count();
+        app.refresh_read_later_count();
         Ok(app)
     }
 
@@ -644,6 +779,257 @@ impl GuiApp {
 
     fn refresh_saved_article_count(&mut self) {
         self.saved_article_count = self.db.saved_article_count().unwrap_or_default();
+    }
+
+    fn refresh_read_later_count(&mut self) {
+        self.read_later_count = self.db.read_later_count().unwrap_or_default();
+    }
+
+    fn refresh_storage_overview(&mut self) {
+        let result = (|| -> Result<StorageOverview> {
+            let backups = self.backup_store.list()?;
+            Ok(StorageOverview {
+                database_bytes: self.db.disk_bytes(),
+                log_bytes: std::fs::metadata(&self.log_file)
+                    .map(|meta| meta.len())
+                    .unwrap_or_default(),
+                image_cache: self.image_store.stats()?,
+                backup_bytes: backups.iter().map(|entry| entry.size).sum(),
+                backups,
+            })
+        })();
+        match result {
+            Ok(overview) => self.storage_overview = Some(overview),
+            Err(error) => self.storage_message = Some(format!("读取资料库占用失败：{error:#}")),
+        }
+    }
+
+    fn run_database_maintenance<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Db) -> Result<T>,
+    ) -> Result<T> {
+        if self.shared.busy.load(Ordering::SeqCst) {
+            return Err(anyhow::anyhow!("正在更新订阅，请完成后重试"));
+        }
+        self.shared.maintenance.store(true, Ordering::SeqCst);
+        if self.shared.busy.load(Ordering::SeqCst) {
+            self.shared.maintenance.store(false, Ordering::SeqCst);
+            return Err(anyhow::anyhow!("订阅更新刚刚开始，请完成后重试"));
+        }
+        let result = operation(&mut self.db);
+        self.shared.maintenance.store(false, Ordering::SeqCst);
+        result
+    }
+
+    fn execute_storage_action(&mut self, action: StorageAction) {
+        let result: Result<String> = match action {
+            StorageAction::Check => self.db.integrity_check().map(|check| check.details),
+            StorageAction::Backup(protection) => self
+                .backup_store
+                .create(&self.db, protection)
+                .map(|entry| format!("备份已创建：{}", entry.path.display())),
+            StorageAction::Compact => {
+                self.run_database_maintenance(|db| db.compact())
+                    .map(|report| {
+                        format!(
+                            "数据库压缩完成：{} → {}",
+                            format_bytes(report.before_bytes),
+                            format_bytes(report.after_bytes)
+                        )
+                    })
+            }
+            StorageAction::PruneImages => self
+                .image_store
+                .prune_to(512 * 1024 * 1024)
+                .map(|bytes| format!("图片缓存已释放 {}", format_bytes(bytes))),
+            StorageAction::ClearImages => self
+                .image_store
+                .clear()
+                .map(|bytes| format!("图片缓存已清空，释放 {}", format_bytes(bytes))),
+            StorageAction::PruneBackups => self
+                .backup_store
+                .prune_keep(DEFAULT_BACKUP_KEEP)
+                .map(|bytes| format!("旧备份已清理，释放 {}", format_bytes(bytes))),
+            StorageAction::OpenFolder => open::that(&self.data_dir)
+                .map(|_| "已打开资料库目录".to_owned())
+                .map_err(Into::into),
+            StorageAction::RequestRestore(entry) => {
+                self.pending_restore = Some(entry);
+                return;
+            }
+            StorageAction::ConfirmRestore(entry) => {
+                let store = self.backup_store.clone();
+                let result = self.run_database_maintenance(|db| store.restore(db, &entry));
+                if result.is_ok() {
+                    self.reload();
+                    self.refresh_saved_selection_count();
+                    self.refresh_archived_article_count();
+                    self.refresh_saved_article_count();
+                    self.refresh_read_later_count();
+                }
+                result.map(|safety| format!("恢复完成；恢复前安全副本：{}", safety.path.display()))
+            }
+        };
+        self.storage_message = Some(match result {
+            Ok(message) => message,
+            Err(error) => format!("操作失败：{error:#}"),
+        });
+        self.refresh_storage_overview();
+    }
+
+    fn show_storage_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_storage_dialog {
+            return;
+        }
+        if self.storage_overview.is_none() {
+            self.refresh_storage_overview();
+        }
+        let overview = self.storage_overview.clone();
+        let mut open = true;
+        let mut action = None;
+        egui::Window::new("资料库与离线缓存")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(620.0)
+            .show(ctx, |ui| {
+                ui.label("资料默认保存在本机；图片缓存和备份均可独立清理。所有恢复都会先创建安全副本。");
+                ui.add_space(8.0);
+                if let Some(overview) = &overview {
+                    egui::Grid::new("storage-usage").num_columns(2).show(ui, |ui| {
+                        ui.label("数据库（含 WAL）");
+                        ui.label(format_bytes(overview.database_bytes));
+                        ui.end_row();
+                        ui.label("图片内容寻址缓存");
+                        ui.label(format!(
+                            "{} · {} 个对象 / {} 个网址",
+                            format_bytes(overview.image_cache.bytes),
+                            overview.image_cache.objects,
+                            overview.image_cache.references
+                        ));
+                        ui.end_row();
+                        ui.label("数据库备份");
+                        ui.label(format!(
+                            "{} · {} 份",
+                            format_bytes(overview.backup_bytes),
+                            overview.backups.len()
+                        ));
+                        ui.end_row();
+                        ui.label("日志");
+                        ui.label(format_bytes(overview.log_bytes));
+                        ui.end_row();
+                    });
+                }
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("检查数据库").clicked() {
+                        action = Some(StorageAction::Check);
+                    }
+                    if ui.button("压缩数据库").clicked() {
+                        action = Some(StorageAction::Compact);
+                    }
+                    if ui.button("普通备份").clicked() {
+                        action = Some(StorageAction::Backup(BackupProtection::Plain));
+                    }
+                    if ui
+                        .add_enabled(cfg!(windows), egui::Button::new("Windows 用户加密备份"))
+                        .on_hover_text("只能由当前 Windows 用户账户解密；适合保存到移动盘或云盘")
+                        .clicked()
+                    {
+                        action = Some(StorageAction::Backup(BackupProtection::WindowsUser));
+                    }
+                    if ui.button("打开资料目录").clicked() {
+                        action = Some(StorageAction::OpenFolder);
+                    }
+                });
+                ui.separator();
+                ui.label(egui::RichText::new("清理策略").strong());
+                ui.label("图片按内容 SHA-256 去重，使用时更新最近访问时间；超过 1 GB 自动淘汰。备份自动保留最近 10 份。数据库只在手动操作时 VACUUM。");
+                ui.horizontal(|ui| {
+                    if ui.button("图片缓存收缩到 512 MB").clicked() {
+                        action = Some(StorageAction::PruneImages);
+                    }
+                    if ui.button("清空图片缓存…").clicked() {
+                        self.confirm_clear_images = true;
+                    }
+                    if ui.button("清理第 10 份之前的备份").clicked() {
+                        action = Some(StorageAction::PruneBackups);
+                    }
+                });
+                if let Some(message) = &self.storage_message {
+                    ui.add_space(8.0);
+                    ui.label(message);
+                }
+                ui.separator();
+                ui.label(egui::RichText::new("可恢复备份").strong());
+                egui::ScrollArea::vertical().max_height(210.0).show(ui, |ui| {
+                    if let Some(overview) = &overview {
+                        for entry in &overview.backups {
+                            ui.horizontal(|ui| {
+                                let modified: chrono::DateTime<chrono::Local> = entry.modified.into();
+                                ui.label(format!(
+                                    "{}  {}  {}",
+                                    modified.format("%Y-%m-%d %H:%M:%S"),
+                                    format_bytes(entry.size),
+                                    if entry.protected { "Windows 加密" } else { "普通" }
+                                ));
+                                if ui.button("恢复…").clicked() {
+                                    action = Some(StorageAction::RequestRestore(entry.clone()));
+                                }
+                            });
+                        }
+                    }
+                });
+            });
+        self.show_storage_dialog = open;
+
+        if self.confirm_clear_images {
+            let mut confirm_open = true;
+            egui::Window::new("清空图片缓存？")
+                .open(&mut confirm_open)
+                .collapsible(false)
+                .show(ctx, |ui| {
+                    ui.label("只删除可重新下载的图片，不删除文章、摘录或想法。离线图片将在下次阅读时重新下载。");
+                    ui.horizontal(|ui| {
+                        if ui.button("确认清空").clicked() {
+                            action = Some(StorageAction::ClearImages);
+                            self.confirm_clear_images = false;
+                        }
+                        if ui.button("取消").clicked() {
+                            self.confirm_clear_images = false;
+                        }
+                    });
+                });
+            if !confirm_open {
+                self.confirm_clear_images = false;
+            }
+        }
+
+        if let Some(entry) = self.pending_restore.clone() {
+            let mut confirm_open = true;
+            egui::Window::new("恢复数据库备份？")
+                .open(&mut confirm_open)
+                .collapsible(false)
+                .show(ctx, |ui| {
+                    ui.label("当前资料库会先生成安全副本，再恢复所选备份。恢复期间请勿关闭程序。");
+                    ui.label(entry.path.display().to_string());
+                    ui.horizontal(|ui| {
+                        if ui.button("确认恢复").clicked() {
+                            action = Some(StorageAction::ConfirmRestore(entry.clone()));
+                            self.pending_restore = None;
+                        }
+                        if ui.button("取消").clicked() {
+                            self.pending_restore = None;
+                        }
+                    });
+                });
+            if !confirm_open {
+                self.pending_restore = None;
+            }
+        }
+        if let Some(action) = action {
+            self.execute_storage_action(action);
+        }
     }
 
     fn reload(&mut self) {
@@ -660,6 +1046,12 @@ impl GuiApp {
     fn load_articles(&mut self) {
         self.articles = match self.content_mode {
             ContentMode::Saved => self.db.saved_articles().unwrap_or_default(),
+            ContentMode::ReadLater => self.db.read_later_articles().unwrap_or_default(),
+            ContentMode::Search => self
+                .sel_article_id
+                .and_then(|id| self.db.get_article(id).ok())
+                .into_iter()
+                .collect(),
             ContentMode::Feed => match self.sel_feed_id {
                 Some(id) => self.db.articles_for_feed(id).unwrap_or_default(),
                 None => Vec::new(),
@@ -704,6 +1096,86 @@ impl GuiApp {
         }
         self.load_articles();
         self.refresh_saved_article_count();
+    }
+
+    fn select_read_later(&mut self) {
+        if self.content_mode != ContentMode::ReadLater {
+            self.content_mode = ContentMode::ReadLater;
+            self.sel_article_id = None;
+            self.body_article_id = None;
+            self.comment_dialog = None;
+            self.selection_popup = None;
+            self.article_selection_drag = None;
+        }
+        self.load_articles();
+        self.refresh_read_later_count();
+    }
+
+    fn open_search(&mut self) {
+        let dialog = self.search_dialog.get_or_insert_with(SearchDialog::default);
+        dialog.focus_input = true;
+        dialog.history = self.db.search_history(12).unwrap_or_default();
+        self.selection_popup = None;
+    }
+
+    fn run_search(&mut self) {
+        let Some(dialog) = self.search_dialog.as_mut() else {
+            return;
+        };
+        let query = dialog.query.trim().to_owned();
+        dialog.searched_query = query.clone();
+        dialog.error = None;
+        dialog.results.clear();
+        if query.is_empty() {
+            return;
+        }
+        match self.db.search_library(&query, 200) {
+            Ok(results) => dialog.results = results,
+            Err(error) => dialog.error = Some(format!("搜索失败：{error}")),
+        }
+    }
+
+    fn open_search_result(&mut self, hit: &SearchHit) {
+        let anchored_selection = hit
+            .selection_id
+            .and_then(|selection_id| self.db.get_selection(selection_id).ok());
+        if hit.archived {
+            match self.db.get_article(hit.article_id) {
+                Ok(article) => {
+                    self.content_mode = ContentMode::Search;
+                    self.sel_feed_id = Some(article.feed_id);
+                    self.sel_article_id = Some(article.id);
+                    self.articles = vec![article];
+                    self.body_article_id = None;
+                    self.comment_dialog = None;
+                    self.selection_popup = None;
+                    self.article_selection_drag = None;
+                    self.pending_selection_anchor = anchored_selection;
+                    self.search_dialog = None;
+                    self.selection_notice =
+                        Some(("正在查看已归档文章（未恢复）".to_owned(), Instant::now()));
+                }
+                Err(error) => {
+                    self.selection_notice =
+                        Some((format!("打开搜索结果失败：{error}"), Instant::now()));
+                }
+            }
+            return;
+        }
+
+        if matches!(hit.kind, SearchHitKind::WebClipping)
+            || self.db.is_web_clipping(hit.article_id).unwrap_or(false)
+        {
+            self.select_saved_articles();
+        } else {
+            self.select_feed(hit.feed_id);
+        }
+        self.select_article(hit.article_id);
+        self.pending_selection_anchor = anchored_selection;
+        self.search_dialog = None;
+        self.show_saved_library = false;
+        self.show_archive_library = false;
+        self.selection_notice = Some(("已打开搜索结果".to_owned(), Instant::now()));
     }
 
     /// 点开即已读（ADR-16），未读数同步减一。
@@ -793,6 +1265,140 @@ impl GuiApp {
                 };
                 self.selection_notice = Some((format!("{action}失败：{error}"), Instant::now()));
             }
+        }
+    }
+
+    fn toggle_read_later(&mut self, id: i64) {
+        let current = self
+            .articles
+            .iter()
+            .find(|article| article.id == id)
+            .map(|article| article.read_later)
+            .or_else(|| {
+                self.db
+                    .get_article(id)
+                    .ok()
+                    .map(|article| article.read_later)
+            });
+        let Some(current) = current else {
+            return;
+        };
+        match self.db.set_article_read_later(id, !current) {
+            Ok(changed) if changed > 0 => {
+                if self.content_mode == ContentMode::ReadLater && current {
+                    self.load_articles();
+                } else if let Some(article) =
+                    self.articles.iter_mut().find(|article| article.id == id)
+                {
+                    article.read_later = !current;
+                }
+                self.refresh_read_later_count();
+                self.selection_notice = Some((
+                    if current {
+                        "已移出稍后读".to_owned()
+                    } else {
+                        "已加入稍后读".to_owned()
+                    },
+                    Instant::now(),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) => {
+                self.selection_notice = Some((format!("更新稍后读失败：{error}"), Instant::now()));
+            }
+        }
+    }
+
+    fn apply_batch_action(&mut self, action: ArticleBatchAction) {
+        let ids = self.batch_selection.iter().copied().collect::<Vec<_>>();
+        if ids.is_empty() {
+            self.selection_notice = Some(("请先勾选文章".to_owned(), Instant::now()));
+            return;
+        }
+        match self.db.apply_article_batch(&ids, action) {
+            Ok(changed) => {
+                self.batch_selection.clear();
+                self.reload();
+                self.refresh_saved_article_count();
+                self.refresh_archived_article_count();
+                self.refresh_read_later_count();
+                let action_name = match action {
+                    ArticleBatchAction::Archive => "归档",
+                    ArticleBatchAction::Bookmark => "收藏",
+                    ArticleBatchAction::ReadLater => "加入稍后读",
+                };
+                self.selection_notice = Some((
+                    format!("已批量{action_name} {changed} 篇文章"),
+                    Instant::now(),
+                ));
+            }
+            Err(error) => {
+                self.selection_notice = Some((format!("批量操作失败：{error}"), Instant::now()));
+            }
+        }
+    }
+
+    fn open_tag_dialog(&mut self, article_id: i64) {
+        let draft = self
+            .db
+            .tags_for_article(article_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tag| tag.name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.tag_dialog = Some(TagDialog { article_id, draft });
+    }
+
+    fn show_tag_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.tag_dialog.as_mut() else {
+            return;
+        };
+        let mut open = true;
+        let mut save = false;
+        egui::Window::new("文章标签")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(430.0)
+            .show(ctx, |ui| {
+                ui.label("用逗号或换行分隔多个标签：");
+                ui.add_space(6.0);
+                ui.add_sized(
+                    egui::vec2(ui.available_width(), 88.0),
+                    egui::TextEdit::multiline(&mut dialog.draft).hint_text("架构, Rust, 稍后整理"),
+                );
+                ui.add_space(8.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("保存").clicked() {
+                        save = true;
+                    }
+                });
+            });
+        if save {
+            let article_id = dialog.article_id;
+            let names = dialog
+                .draft
+                .split([',', '，', '\n'])
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            match self
+                .db
+                .replace_article_tags(article_id, &names, Utc::now().timestamp())
+            {
+                Ok(()) => {
+                    self.tag_dialog = None;
+                    self.selection_notice = Some(("标签已保存".to_owned(), Instant::now()));
+                }
+                Err(error) => {
+                    self.selection_notice =
+                        Some((format!("保存标签失败：{error}"), Instant::now()));
+                }
+            }
+        } else if !open {
+            self.tag_dialog = None;
         }
     }
 
@@ -988,11 +1594,16 @@ impl GuiApp {
     }
 
     fn save_favorite_quote(&mut self, quote: SelectedQuote) {
-        let result = self.db.add_favorite_selection(
+        let anchor = TextAnchor {
+            start_offset: quote.start_offset,
+            end_offset: quote.end_offset,
+            prefix: quote.anchor_prefix.clone(),
+            suffix: quote.anchor_suffix.clone(),
+        };
+        let result = self.db.add_favorite_selection_with_anchor(
             quote.article_id,
             &quote.text,
-            quote.start_offset,
-            quote.end_offset,
+            &anchor,
             Utc::now().timestamp(),
         );
         match result {
@@ -1026,11 +1637,16 @@ impl GuiApp {
             return;
         }
         let quote = dialog.quote;
-        let result = self.db.add_comment(
+        let anchor = TextAnchor {
+            start_offset: quote.start_offset,
+            end_offset: quote.end_offset,
+            prefix: quote.anchor_prefix.clone(),
+            suffix: quote.anchor_suffix.clone(),
+        };
+        let result = self.db.add_comment_with_anchor(
             quote.article_id,
             &quote.text,
-            quote.start_offset,
-            quote.end_offset,
+            &anchor,
             &dialog.draft,
             Utc::now().timestamp(),
         );
@@ -1436,8 +2052,11 @@ impl GuiApp {
                                                     )
                                                     .clicked()
                                                 {
-                                                    open_article =
-                                                        Some((*feed_id, selection.article_id));
+                                                    open_article = Some((
+                                                        *feed_id,
+                                                        selection.article_id,
+                                                        selection.clone(),
+                                                    ));
                                                 }
                                             },
                                         );
@@ -1460,7 +2079,7 @@ impl GuiApp {
                 }
             }
         }
-        if let Some((feed_id, article_id)) = open_article {
+        if let Some((feed_id, article_id, selection)) = open_article {
             if self.web_clipping_ids.contains(&article_id)
                 || self.db.is_web_clipping(article_id).unwrap_or(false)
             {
@@ -1469,8 +2088,9 @@ impl GuiApp {
                 self.select_feed(feed_id);
             }
             self.select_article(article_id);
+            self.pending_selection_anchor = Some(selection);
             self.show_saved_library = false;
-            self.selection_notice = Some(("已打开原文章".to_owned(), Instant::now()));
+            self.selection_notice = Some(("已打开原文章，正在定位摘录".to_owned(), Instant::now()));
         }
     }
 
@@ -1624,6 +2244,283 @@ impl GuiApp {
                     self.selection_notice = Some((format!("恢复失败：{error}"), Instant::now()));
                 }
             }
+        }
+    }
+
+    fn show_search_window(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.search_dialog.as_mut() else {
+            return;
+        };
+        let theme = ReaderTheme::sspai();
+        let mut open = true;
+        let mut submit = false;
+        let mut selected_hit = None;
+        let mut clear_history = false;
+
+        egui::Window::new("全文搜索")
+            .id(egui::Id::new("library-full-text-search"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size(egui::vec2(760.0, 640.0))
+            .min_size(egui::vec2(520.0, 420.0))
+            .frame(
+                egui::Frame::new()
+                    .fill(theme.canvas)
+                    .stroke(egui::Stroke::new(1.0, theme.border))
+                    .corner_radius(egui::CornerRadius::same(9))
+                    .inner_margin(egui::Margin::same(14))
+                    .shadow(egui::Shadow {
+                        offset: [0, 5],
+                        blur: 18,
+                        spread: 0,
+                        color: egui::Color32::from_black_alpha(45),
+                    }),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let input = ui.add_sized(
+                        egui::vec2((ui.available_width() - 76.0).max(180.0), 34.0),
+                        egui::TextEdit::singleline(&mut dialog.query)
+                            .hint_text("搜索文章、网页快照、摘录和想法…")
+                            .font(egui::TextStyle::Body),
+                    );
+                    if dialog.focus_input {
+                        input.request_focus();
+                        dialog.focus_input = false;
+                    }
+                    if input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        submit = true;
+                    }
+                    if ui
+                        .add_sized(
+                            egui::vec2(68.0, 34.0),
+                            egui::Button::new(
+                                egui::RichText::new("搜索").size(13.0).color(theme.text),
+                            )
+                            .fill(theme.selected_bg)
+                            .stroke(egui::Stroke::new(1.0, theme.border)),
+                        )
+                        .clicked()
+                    {
+                        submit = true;
+                    }
+                });
+                ui.add_space(7.0);
+                ui.label(
+                    egui::RichText::new(
+                        "支持标题、作者、正文、网址、摘录原文和想法内容；最多显示 200 条。",
+                    )
+                    .size(12.0)
+                    .color(theme.muted),
+                );
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                if let Some(error) = &dialog.error {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                    return;
+                }
+                if dialog.searched_query.is_empty() {
+                    if !dialog.history.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("最近搜索")
+                                    .size(13.0)
+                                    .color(theme.text)
+                                    .family(egui::FontFamily::Name("cjk-bold".into())),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                egui::RichText::new("清空")
+                                                    .size(12.0)
+                                                    .color(theme.muted),
+                                            )
+                                            .stroke(egui::Stroke::NONE),
+                                        )
+                                        .clicked()
+                                    {
+                                        clear_history = true;
+                                    }
+                                },
+                            );
+                        });
+                        ui.add_space(5.0);
+                        let history = dialog.history.clone();
+                        ui.horizontal_wrapped(|ui| {
+                            for entry in history {
+                                if ui
+                                    .add(
+                                        egui::Button::new(format!(
+                                            "{}  · {}",
+                                            entry.query, entry.result_count
+                                        ))
+                                        .fill(theme.code_bg)
+                                        .stroke(egui::Stroke::new(1.0, theme.border)),
+                                    )
+                                    .clicked()
+                                {
+                                    dialog.query = entry.query;
+                                    submit = true;
+                                }
+                            }
+                        });
+                        ui.add_space(18.0);
+                    }
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(55.0);
+                        ui.label(
+                            egui::RichText::new("在一个入口里找回所有阅读资料")
+                                .size(18.0)
+                                .color(theme.text)
+                                .family(egui::FontFamily::Name("cjk-bold".into())),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new("快捷键 Ctrl + F")
+                                .size(13.0)
+                                .color(theme.muted),
+                        );
+                    });
+                    return;
+                }
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("找到 {} 条结果", dialog.results.len()))
+                            .size(13.0)
+                            .color(theme.text)
+                            .family(egui::FontFamily::Name("cjk-bold".into())),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("“{}”", dialog.searched_query))
+                            .size(12.0)
+                            .color(theme.muted),
+                    );
+                });
+                ui.add_space(6.0);
+                if dialog.results.is_empty() {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(75.0);
+                        ui.label(egui::RichText::new("没有匹配内容").size(16.0));
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new("换一个更短或更常见的关键词试试。")
+                                .size(12.0)
+                                .color(theme.muted),
+                        );
+                    });
+                    return;
+                }
+
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for hit in &dialog.results {
+                            let (kind, kind_color) = match hit.kind {
+                                SearchHitKind::Article => ("文章", theme.link),
+                                SearchHitKind::WebClipping => ("网页快照", theme.accent),
+                                SearchHitKind::Excerpt => ("摘录", theme.link),
+                                SearchHitKind::Thought => ("想法", theme.accent),
+                            };
+                            let response = egui::Frame::new()
+                                .fill(theme.code_bg)
+                                .stroke(egui::Stroke::new(1.0, theme.border))
+                                .corner_radius(egui::CornerRadius::same(7))
+                                .inner_margin(egui::Margin::symmetric(14, 11))
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(kind)
+                                                .size(11.0)
+                                                .color(kind_color)
+                                                .background_color(theme.selected_bg),
+                                        );
+                                        if hit.archived {
+                                            ui.label(
+                                                egui::RichText::new("已归档")
+                                                    .size(11.0)
+                                                    .color(theme.muted),
+                                            );
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(text::fmt_ts(hit.timestamp))
+                                                .size(11.0)
+                                                .color(theme.muted),
+                                        );
+                                    });
+                                    ui.add_space(5.0);
+                                    let title = hit
+                                        .article_title
+                                        .as_deref()
+                                        .filter(|title| !title.trim().is_empty())
+                                        .unwrap_or("未命名文章");
+                                    ui.add(
+                                        egui::Label::new(search_highlight_layout_job(
+                                            title,
+                                            &dialog.searched_query,
+                                            15.0,
+                                            theme.text,
+                                            egui::FontFamily::Name("cjk-bold".into()),
+                                            theme,
+                                        ))
+                                        .wrap(),
+                                    );
+                                    ui.add_space(5.0);
+                                    let preview =
+                                        search_preview(&hit.snippet, &dialog.searched_query, 180);
+                                    ui.add(
+                                        egui::Label::new(search_highlight_layout_job(
+                                            &preview,
+                                            &dialog.searched_query,
+                                            13.0,
+                                            theme.muted,
+                                            egui::FontFamily::Proportional,
+                                            theme,
+                                        ))
+                                        .wrap(),
+                                    );
+                                })
+                                .response
+                                .interact(egui::Sense::click());
+                            if response.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                ui.painter().rect_stroke(
+                                    response.rect,
+                                    egui::CornerRadius::same(7),
+                                    egui::Stroke::new(1.0, theme.accent),
+                                    egui::StrokeKind::Inside,
+                                );
+                            }
+                            if response.clicked() {
+                                selected_hit = Some(hit.clone());
+                            }
+                            ui.add_space(9.0);
+                        }
+                    });
+            });
+
+        if clear_history {
+            if let Err(error) = self.db.clear_search_history() {
+                self.selection_notice =
+                    Some((format!("清空搜索历史失败：{error}"), Instant::now()));
+            }
+            if let Some(dialog) = self.search_dialog.as_mut() {
+                dialog.history.clear();
+            }
+        }
+
+        if !open {
+            self.search_dialog = None;
+        } else if submit {
+            self.run_search();
+        } else if let Some(hit) = selected_hit {
+            self.open_search_result(&hit);
         }
     }
 
@@ -1857,6 +2754,23 @@ impl GuiApp {
         }
     }
 
+    fn receive_formulas(&mut self, ctx: &egui::Context) {
+        while let Ok(event) = self.formula_event_rx.try_recv() {
+            match event {
+                FormulaEvent::Complete { key, result } => {
+                    self.formula_cache.insert(
+                        key,
+                        match result {
+                            Ok(bytes) => FormulaState::Ready(bytes),
+                            Err(error) => FormulaState::Failed(error),
+                        },
+                    );
+                }
+            }
+            ctx.request_repaint();
+        }
+    }
+
     fn handle_tray_events(&mut self, ctx: &egui::Context) {
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
             if ev.id == self.tray_toggle {
@@ -1866,7 +2780,7 @@ impl GuiApp {
                     ctx.send_viewport_cmd(ViewportCommand::Focus);
                 }
             } else if ev.id == self.tray_fetch {
-                self.shared.busy.store(true, Ordering::Relaxed);
+                self.shared.busy.store(true, Ordering::SeqCst);
                 let _ = self.cmd_tx.send(Cmd::FetchNow);
             } else if ev.id == self.tray_quit {
                 self.quitting = true;
@@ -1880,11 +2794,20 @@ impl eframe::App for GuiApp {
     // eframe 0.35：App 入口是 ui(&mut Ui)，panel 在根 Ui 内 show。
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if ctx.input_mut(|input| {
+            input.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::CTRL,
+                egui::Key::F,
+            ))
+        }) {
+            self.open_search();
+        }
         self.shared.focused.store(
             ctx.input(|i| i.viewport().focused.unwrap_or(true)),
             Ordering::Relaxed,
         );
         self.receive_images(&ctx);
+        self.receive_formulas(&ctx);
         self.receive_web_clip_events(&ctx);
         self.handle_tray_events(&ctx);
 
@@ -1902,7 +2825,7 @@ impl eframe::App for GuiApp {
         // ponytail: 250ms 轮询够跟手；想省这点空转再上 MenuEvent::set_event_handler + proxy。
         ctx.request_repaint_after(Duration::from_millis(250));
 
-        let busy = self.shared.busy.load(Ordering::Relaxed);
+        let busy = self.shared.busy.load(Ordering::SeqCst);
         let theme = ReaderTheme::sspai();
 
         // 源栏
@@ -1944,12 +2867,33 @@ impl eframe::App for GuiApp {
                             )
                             .clicked()
                         {
-                            self.shared.busy.store(true, Ordering::Relaxed); // 即时反馈
+                            self.shared.busy.store(true, Ordering::SeqCst); // 即时反馈
                             let _ = self.cmd_tx.send(Cmd::FetchNow);
                         }
                     });
                 });
                 ui.separator();
+                ui.add_space(4.0);
+                let search_response = ui.add(
+                    egui::Button::new(egui::RichText::new("⌕ 全文搜索   Ctrl+F").size(13.0).color(
+                        if self.search_dialog.is_some() {
+                            theme.text
+                        } else {
+                            theme.muted
+                        },
+                    ))
+                    .fill(if self.search_dialog.is_some() {
+                        theme.selected_bg
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    })
+                    .stroke(egui::Stroke::NONE)
+                    .corner_radius(egui::CornerRadius::same(4))
+                    .min_size(egui::vec2(ui.available_width(), 34.0)),
+                );
+                if search_response.clicked() {
+                    self.open_search();
+                }
                 ui.add_space(4.0);
                 let saved_articles_response = ui.add(
                     egui::Button::new(
@@ -1972,6 +2916,32 @@ impl eframe::App for GuiApp {
                 );
                 if saved_articles_response.clicked() {
                     self.select_saved_articles();
+                    self.show_saved_library = false;
+                    self.show_archive_library = false;
+                    self.selection_popup = None;
+                }
+                ui.add_space(4.0);
+                let read_later_response = ui.add(
+                    egui::Button::new(
+                        egui::RichText::new(format!("◷ 稍后读  {}", self.read_later_count))
+                            .size(13.0)
+                            .color(if self.content_mode == ContentMode::ReadLater {
+                                theme.text
+                            } else {
+                                theme.muted
+                            }),
+                    )
+                    .fill(if self.content_mode == ContentMode::ReadLater {
+                        theme.selected_bg
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    })
+                    .stroke(egui::Stroke::NONE)
+                    .corner_radius(egui::CornerRadius::same(4))
+                    .min_size(egui::vec2(ui.available_width(), 34.0)),
+                );
+                if read_later_response.clicked() {
+                    self.select_read_later();
                     self.show_saved_library = false;
                     self.show_archive_library = false;
                     self.selection_popup = None;
@@ -2028,6 +2998,29 @@ impl eframe::App for GuiApp {
                     self.show_archive_library = true;
                     self.show_saved_library = false;
                     self.selection_popup = None;
+                }
+                ui.add_space(4.0);
+                let storage_response = ui.add(
+                    egui::Button::new(egui::RichText::new("⚙ 资料库管理").size(13.0).color(
+                        if self.show_storage_dialog {
+                            theme.text
+                        } else {
+                            theme.muted
+                        },
+                    ))
+                    .fill(if self.show_storage_dialog {
+                        theme.selected_bg
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    })
+                    .stroke(egui::Stroke::NONE)
+                    .corner_radius(egui::CornerRadius::same(4))
+                    .min_size(egui::vec2(ui.available_width(), 34.0)),
+                );
+                if storage_response.clicked() {
+                    self.show_storage_dialog = true;
+                    self.storage_message = None;
+                    self.refresh_storage_overview();
                 }
                 ui.add_space(4.0);
                 ui.separator();
@@ -2093,6 +3086,10 @@ impl eframe::App for GuiApp {
         let mut unread_article = None;
         let mut star_article = None;
         let mut archive_article = None;
+        let mut read_later_article = None;
+        let mut tag_article = None;
+        let mut batch_toggles = Vec::new();
+        let mut batch_action = None;
         egui::Panel::left("articles")
             .exact_size(ARTICLE_PANEL_WIDTH)
             .resizable(false)
@@ -2107,6 +3104,10 @@ impl eframe::App for GuiApp {
                     ui.label(
                         egui::RichText::new(if self.content_mode == ContentMode::Saved {
                             "文章收藏"
+                        } else if self.content_mode == ContentMode::ReadLater {
+                            "稍后读"
+                        } else if self.content_mode == ContentMode::Search {
+                            "搜索结果"
                         } else {
                             "文章"
                         })
@@ -2134,8 +3135,37 @@ impl eframe::App for GuiApp {
                             }
                         });
                     }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(if self.batch_mode { "完成" } else { "批量" })
+                                    .stroke(egui::Stroke::NONE),
+                            )
+                            .clicked()
+                        {
+                            self.batch_mode = !self.batch_mode;
+                            if !self.batch_mode {
+                                self.batch_selection.clear();
+                            }
+                        }
+                    });
                 });
                 ui.separator();
+                if self.batch_mode {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(format!("已选 {} 篇", self.batch_selection.len()));
+                        if ui.button("收藏").clicked() {
+                            batch_action = Some(ArticleBatchAction::Bookmark);
+                        }
+                        if ui.button("稍后读").clicked() {
+                            batch_action = Some(ArticleBatchAction::ReadLater);
+                        }
+                        if ui.button("归档").clicked() {
+                            batch_action = Some(ArticleBatchAction::Archive);
+                        }
+                    });
+                    ui.separator();
+                }
                 ui.add_space(4.0);
                 if self.content_mode == ContentMode::Saved && self.articles.is_empty() {
                     ui.add_space(26.0);
@@ -2176,8 +3206,7 @@ impl eframe::App for GuiApp {
                             } else {
                                 egui::Color32::TRANSPARENT
                             };
-                            let resp = ui.add(
-                                egui::Button::new(
+                            let article_button = egui::Button::new(
                                     egui::RichText::new(format!("{dot}{title}{star}"))
                                         .size(13.0)
                                         .family(if a.is_read {
@@ -2191,8 +3220,19 @@ impl eframe::App for GuiApp {
                                 .stroke(egui::Stroke::NONE)
                                 .corner_radius(egui::CornerRadius::same(4))
                                 .wrap()
-                                .min_size(egui::vec2(ui.available_width(), 42.0)),
-                            );
+                                .min_size(egui::vec2(ui.available_width(), 42.0));
+                            let resp = if self.batch_mode {
+                                ui.horizontal(|ui| {
+                                    let mut selected = self.batch_selection.contains(&a.id);
+                                    if ui.checkbox(&mut selected, "").changed() {
+                                        batch_toggles.push((a.id, selected));
+                                    }
+                                    ui.add(article_button)
+                                })
+                                .inner
+                            } else {
+                                ui.add(article_button)
+                            };
                             if sel {
                                 ui.painter().rect_filled(
                                     egui::Rect::from_min_max(
@@ -2204,7 +3244,14 @@ impl eframe::App for GuiApp {
                                 );
                             }
                             if resp.clicked() {
-                                open_article = Some(a.id);
+                                if self.batch_mode {
+                                    batch_toggles.push((
+                                        a.id,
+                                        !self.batch_selection.contains(&a.id),
+                                    ));
+                                } else {
+                                    open_article = Some(a.id);
+                                }
                             }
                             resp.context_menu(|ui| {
                                 if self.content_mode == ContentMode::Saved {
@@ -2228,6 +3275,17 @@ impl eframe::App for GuiApp {
                                     };
                                     if ui.button(star_label).clicked() {
                                         star_article = Some(a.id);
+                                    }
+                                    let read_later_label = if a.read_later {
+                                        "移出稍后读"
+                                    } else {
+                                        "加入稍后读"
+                                    };
+                                    if ui.button(read_later_label).clicked() {
+                                        read_later_article = Some(a.id);
+                                    }
+                                    if ui.button("编辑标签…").clicked() {
+                                        tag_article = Some(a.id);
                                     }
                                     ui.separator();
                                     if ui.button("归档文章").clicked() {
@@ -2256,6 +3314,16 @@ impl eframe::App for GuiApp {
                         }
                     });
             });
+        for (article_id, selected) in batch_toggles {
+            if selected {
+                self.batch_selection.insert(article_id);
+            } else {
+                self.batch_selection.remove(&article_id);
+            }
+        }
+        if let Some(action) = batch_action {
+            self.apply_batch_action(action);
+        }
         if let Some(id) = open_article {
             self.select_article(id);
         }
@@ -2271,6 +3339,12 @@ impl eframe::App for GuiApp {
         }
         if let Some(id) = archive_article {
             self.archive_article(id);
+        }
+        if let Some(id) = read_later_article {
+            self.toggle_read_later(id);
+        }
+        if let Some(id) = tag_article {
+            self.open_tag_dialog(id);
         }
 
         // 正文栏
@@ -2296,6 +3370,8 @@ impl eframe::App for GuiApp {
                 let url = a.url.clone();
                 let author = a.author.clone();
                 let article_starred = a.starred;
+                let article_read_later = a.read_later;
+                let article_tags = self.db.tags_for_article(article_id).unwrap_or_default();
                 let is_web_clipping = self.web_clipping_ids.contains(&article_id);
                 let blocks = match a.content.as_deref() {
                     Some(c) if !c.trim().is_empty() => text::content_blocks(c, a.url.as_deref()),
@@ -2307,12 +3383,20 @@ impl eframe::App for GuiApp {
                     .unwrap_or_default();
                 let mut delete_selection = None;
                 let mut toggle_article_star = false;
+                let mut toggle_article_read_later = false;
+                let mut edit_article_tags = false;
                 let mut selection_frame = ArticleSelectionFrame::default();
                 let mut body_scroll = egui::ScrollArea::vertical()
                     .id_salt(("article-body-v2", article_id))
                     .hscroll(false);
                 if reset_body_scroll {
                     body_scroll = body_scroll.scroll_offset(egui::Vec2::ZERO);
+                } else if let Some((pending_article_id, offset)) = self.pending_body_scroll.take() {
+                    if pending_article_id == article_id {
+                        body_scroll = body_scroll.scroll_offset(egui::vec2(0.0, offset.max(0.0)));
+                    } else {
+                        self.pending_body_scroll = Some((pending_article_id, offset));
+                    }
                 }
                 let body_scroll_output = body_scroll.show_viewport(ui, |ui, viewport| {
                     // Keep the scroll viewport full width while centering a
@@ -2399,6 +3483,47 @@ impl eframe::App for GuiApp {
                                         {
                                             toggle_article_star = true;
                                         }
+                                    }
+                                    let (later_label, later_color, later_fill) =
+                                        if article_read_later {
+                                            ("◷ 已在稍后读", theme.accent, theme.selected_bg)
+                                        } else {
+                                            ("◷ 稍后读", theme.muted, egui::Color32::TRANSPARENT)
+                                        };
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                egui::RichText::new(later_label)
+                                                    .size(12.0)
+                                                    .color(later_color),
+                                            )
+                                            .fill(later_fill)
+                                            .stroke(egui::Stroke::new(1.0, theme.border)),
+                                        )
+                                        .clicked()
+                                    {
+                                        toggle_article_read_later = true;
+                                    }
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                egui::RichText::new("标签")
+                                                    .size(12.0)
+                                                    .color(theme.muted),
+                                            )
+                                            .stroke(egui::Stroke::new(1.0, theme.border)),
+                                        )
+                                        .clicked()
+                                    {
+                                        edit_article_tags = true;
+                                    }
+                                    for tag in &article_tags {
+                                        ui.label(
+                                            egui::RichText::new(format!("#{}", tag.name))
+                                                .size(11.0)
+                                                .color(theme.link)
+                                                .background_color(theme.selected_bg),
+                                        );
                                     }
                                 });
                                 ui.separator();
@@ -2502,25 +3627,226 @@ impl eframe::App for GuiApp {
                                             index += 1;
                                             ui.add_space(25.0);
                                         }
+                                        Block::CodeBlock { text: code, language } => {
+                                            egui::Frame::new()
+                                                .fill(theme.code_bg)
+                                                .corner_radius(egui::CornerRadius::same(4))
+                                                .inner_margin(egui::Margin::symmetric(20, 10))
+                                                .show(ui, |ui| {
+                                                    ui.set_width(ui.available_width());
+                                                    ui.with_layout(
+                                                        egui::Layout::right_to_left(egui::Align::Center),
+                                                        |ui| {
+                                                            ui.label(
+                                                                egui::RichText::new(language.to_uppercase())
+                                                                    .monospace()
+                                                                    .size(11.0)
+                                                                    .color(theme.muted),
+                                                            );
+                                                        },
+                                                    );
+                                                    selectable_text_block_with_style(
+                                                        ui,
+                                                        article_id,
+                                                        index,
+                                                        code,
+                                                        &[],
+                                                        &[],
+                                                        ArticleTextStyle::Code,
+                                                        &mut selection_frame,
+                                                    );
+                                                });
+                                            index += 1;
+                                            ui.add_space(25.0);
+                                        }
                                         Block::Image(uri) => {
                                             article_image(
                                                 ui,
                                                 &viewport,
                                                 uri,
+                                                None,
                                                 &mut self.image_cache,
                                                 &self.image_job_tx,
                                             );
                                             index += 1;
+                                        }
+                                        Block::LinkedImage { uri, url, alt } => {
+                                            article_image(
+                                                ui,
+                                                &viewport,
+                                                uri,
+                                                Some(url),
+                                                &mut self.image_cache,
+                                                &self.image_job_tx,
+                                            );
+                                            if let Some(alt) = alt {
+                                                ui.label(
+                                                    egui::RichText::new(alt)
+                                                        .size(13.0)
+                                                        .color(theme.muted),
+                                                );
+                                                ui.add_space(8.0);
+                                            }
+                                            index += 1;
+                                        }
+                                        Block::Caption(caption) => {
+                                            ui.with_layout(
+                                                egui::Layout::top_down(egui::Align::Center),
+                                                |ui| {
+                                                    ui.add(
+                                                        egui::Label::new(
+                                                            egui::RichText::new(caption)
+                                                                .size(13.0)
+                                                                .color(theme.muted),
+                                                        )
+                                                        .selectable(true)
+                                                        .wrap(),
+                                                    );
+                                                },
+                                            );
+                                            index += 1;
+                                            ui.add_space(16.0);
+                                        }
+                                        Block::DefinitionList(items) => {
+                                            egui::Frame::new()
+                                                .fill(theme.code_bg)
+                                                .stroke(egui::Stroke::new(1.0, theme.border))
+                                                .corner_radius(egui::CornerRadius::same(5))
+                                                .inner_margin(egui::Margin::symmetric(18, 14))
+                                                .show(ui, |ui| {
+                                                    ui.set_width(ui.available_width());
+                                                    for (item_index, item) in items.iter().enumerate() {
+                                                        ui.label(
+                                                            egui::RichText::new(&item.term)
+                                                                .family(egui::FontFamily::Name("cjk-bold".into()))
+                                                                .size(16.0)
+                                                                .color(theme.text),
+                                                        );
+                                                        for definition in &item.definitions {
+                                                            ui.horizontal(|ui| {
+                                                                ui.label(
+                                                                    egui::RichText::new("—")
+                                                                        .color(theme.accent),
+                                                                );
+                                                                ui.add(
+                                                                    egui::Label::new(
+                                                                        egui::RichText::new(definition)
+                                                                            .size(15.0)
+                                                                            .color(theme.text),
+                                                                    )
+                                                                    .selectable(true)
+                                                                    .wrap(),
+                                                                );
+                                                            });
+                                                        }
+                                                        if item_index + 1 < items.len() {
+                                                            ui.add_space(10.0);
+                                                        }
+                                                    }
+                                                });
+                                            index += 1;
+                                            ui.add_space(22.0);
+                                        }
+                                        Block::Table { rows, header_rows, column_count } => {
+                                            egui::Frame::new()
+                                                .stroke(egui::Stroke::new(1.0, theme.border))
+                                                .corner_radius(egui::CornerRadius::same(4))
+                                                .inner_margin(egui::Margin::symmetric(12, 10))
+                                                .show(ui, |ui| {
+                                                    egui::ScrollArea::horizontal()
+                                                        .id_salt(("article-table", article_id, index))
+                                                        .show(ui, |ui| {
+                                                            ui.set_min_width(ui.available_width().max(420.0));
+                                                            let gap = 12.0;
+                                                            let columns = (*column_count).max(1) as f32;
+                                                            let unit = ((ui.available_width()
+                                                                - gap * (columns - 1.0))
+                                                                / columns)
+                                                                .max(90.0);
+                                                            let logical_layout = text::table_cell_columns(rows, *column_count);
+                                                            for (row_index, row) in rows.iter().enumerate() {
+                                                                let fill = if row_index % 2 == 1 {
+                                                                    theme.code_bg
+                                                                } else {
+                                                                    egui::Color32::TRANSPARENT
+                                                                };
+                                                                egui::Frame::new()
+                                                                    .fill(fill)
+                                                                    .inner_margin(egui::Margin::symmetric(8, 8))
+                                                                    .show(ui, |ui| {
+                                                                        ui.horizontal(|ui| {
+                                                                            ui.spacing_mut().item_spacing.x = gap;
+                                                                            let mut current_column = 0usize;
+                                                                            for (column, cell_index) in &logical_layout[row_index] {
+                                                                                if *column > current_column {
+                                                                                    let skipped = *column - current_column;
+                                                                                    ui.add_space(
+                                                                                        unit * skipped as f32
+                                                                                            + gap * skipped.saturating_sub(1) as f32,
+                                                                                    );
+                                                                                }
+                                                                                let cell = &row[*cell_index];
+                                                                                let width = unit * cell.col_span as f32
+                                                                                    + gap * (cell.col_span.saturating_sub(1)) as f32;
+                                                                                ui.allocate_ui_with_layout(
+                                                                                    egui::vec2(width, 0.0),
+                                                                                    egui::Layout::top_down(egui::Align::Min),
+                                                                                    |ui| {
+                                                                                        let text = egui::RichText::new(&cell.text)
+                                                                                            .size(15.0)
+                                                                                            .color(theme.text);
+                                                                                        let text = if row_index < *header_rows || cell.header {
+                                                                                            text.strong()
+                                                                                        } else {
+                                                                                            text
+                                                                                        };
+                                                                                        ui.add(egui::Label::new(text).selectable(true).wrap());
+                                                                                        if cell.row_span > 1 {
+                                                                                            ui.label(
+                                                                                                egui::RichText::new(format!("跨 {} 行", cell.row_span))
+                                                                                                    .size(10.0)
+                                                                                                    .color(theme.muted),
+                                                                                            );
+                                                                                        }
+                                                                                    },
+                                                                                );
+                                                                                current_column = column + cell.col_span;
+                                                                            }
+                                                                        });
+                                                                    });
+                                                            }
+                                                        });
+                                                });
+                                            index += 1;
+                                            ui.add_space(22.0);
+                                        }
+                                        Block::Math { source, display } => {
+                                            formula_block(
+                                                ui,
+                                                source,
+                                                *display,
+                                                &mut self.formula_cache,
+                                                &self.formula_job_tx,
+                                            );
+                                            index += 1;
+                                            ui.add_space(20.0);
                                         }
                                         Block::ListItemStart { depth } => {
                                             let start = index;
                                             let item_depth = *depth;
                                             let mut list_text = String::from("▪ ");
                                             let mut list_strong_ranges = Vec::new();
+                                            let mut list_inline_code_ranges = Vec::new();
                                             let mut list_link_ranges = Vec::new();
                                             let mut previous_was_strong = false;
                                             let mut previous_was_link = false;
+                                            let mut previous_was_inline_code = false;
                                             let mut previous_link_had_space_after = false;
+                                            let mut list_images: Vec<(
+                                                String,
+                                                Option<String>,
+                                                Option<String>,
+                                            )> = Vec::new();
                                             index += 1;
                                             while index < blocks.len() {
                                                 if matches!(
@@ -2531,9 +3857,27 @@ impl eframe::App for GuiApp {
                                                     break;
                                                 }
                                                 let block = &blocks[index];
+                                                match block {
+                                                    Block::Image(uri) => {
+                                                        list_images.push((uri.clone(), None, None));
+                                                        index += 1;
+                                                        continue;
+                                                    }
+                                                    Block::LinkedImage { uri, url, alt } => {
+                                                        list_images.push((
+                                                            uri.clone(),
+                                                            Some(url.clone()),
+                                                            alt.clone(),
+                                                        ));
+                                                        index += 1;
+                                                        continue;
+                                                    }
+                                                    _ => {}
+                                                }
                                                 let value = match block {
                                                     Block::Text(text)
                                                     | Block::Strong(text)
+                                                    | Block::InlineCode(text)
                                                     | Block::Link { text, .. } => text,
                                                     _ => break,
                                                 };
@@ -2545,13 +3889,15 @@ impl eframe::App for GuiApp {
                                                     if previous_link_had_space_after {
                                                         list_text.push(' ');
                                                     } else {
-                                                        list_text.push_str(body_block_separator(
+                                                        list_text.push_str(body_fragment_separator(
                                                             &list_text,
                                                             value,
                                                             previous_was_strong,
                                                             previous_was_link,
+                                                            previous_was_inline_code,
                                                             matches!(block, Block::Strong(_)),
                                                             matches!(block, Block::Link { .. }),
+                                                            matches!(block, Block::InlineCode(_)),
                                                             next_link_has_prefix,
                                                         ));
                                                     }
@@ -2560,6 +3906,11 @@ impl eframe::App for GuiApp {
                                                 list_text.push_str(value);
                                                 if matches!(block, Block::Strong(_)) {
                                                     list_strong_ranges.push(
+                                                        value_start..value_start + value.len(),
+                                                    );
+                                                }
+                                                if matches!(block, Block::InlineCode(_)) {
+                                                    list_inline_code_ranges.push(
                                                         value_start..value_start + value.len(),
                                                     );
                                                 }
@@ -2579,6 +3930,8 @@ impl eframe::App for GuiApp {
                                                     matches!(block, Block::Strong(_));
                                                 previous_was_link =
                                                     matches!(block, Block::Link { .. });
+                                                previous_was_inline_code =
+                                                    matches!(block, Block::InlineCode(_));
                                                 previous_link_had_space_after = matches!(
                                                     block,
                                                     Block::Link {
@@ -2590,19 +3943,41 @@ impl eframe::App for GuiApp {
                                             }
                                             ui.add_space(4.0);
                                             ui.horizontal(|ui| {
-                                                ui.add_space(22.0);
+                                                ui.add_space(
+                                                    22.0 + item_depth.saturating_sub(1) as f32 * 24.0,
+                                                );
                                                 ui.vertical(|ui| {
                                                     ui.set_width(ui.available_width());
-                                                    selectable_text_block_with_style(
-                                                        ui,
-                                                        article_id,
-                                                        start,
-                                                        &list_text,
-                                                        &list_strong_ranges,
-                                                        &list_link_ranges,
-                                                        ArticleTextStyle::List,
-                                                        &mut selection_frame,
-                                                    );
+                                                    if list_text != "▪ " {
+                                                        selectable_text_block_with_inline_style(
+                                                            ui,
+                                                            article_id,
+                                                            start,
+                                                            &list_text,
+                                                            &list_strong_ranges,
+                                                            &list_inline_code_ranges,
+                                                            &list_link_ranges,
+                                                            ArticleTextStyle::List,
+                                                            &mut selection_frame,
+                                                        );
+                                                    }
+                                                    for (uri, link_url, alt) in &list_images {
+                                                        article_image(
+                                                            ui,
+                                                            &viewport,
+                                                            uri,
+                                                            link_url.as_deref(),
+                                                            &mut self.image_cache,
+                                                            &self.image_job_tx,
+                                                        );
+                                                        if let Some(alt) = alt {
+                                                            ui.label(
+                                                                egui::RichText::new(alt)
+                                                                    .size(13.0)
+                                                                    .color(theme.muted),
+                                                            );
+                                                        }
+                                                    }
                                                 });
                                             });
                                             ui.add_space(20.0);
@@ -2614,6 +3989,28 @@ impl eframe::App for GuiApp {
                                                 index,
                                                 heading,
                                                 &[],
+                                                &[],
+                                                ArticleTextStyle::Heading,
+                                                &mut selection_frame,
+                                            );
+                                            index += 1;
+                                            ui.add_space(20.0);
+                                        }
+                                        Block::HeadingWithInlineCode {
+                                            text,
+                                            inline_code_ranges,
+                                        } => {
+                                            let inline_code_ranges = inline_code_ranges
+                                                .iter()
+                                                .map(|range| range.start..range.end)
+                                                .collect::<Vec<_>>();
+                                            selectable_text_block_with_inline_style(
+                                                ui,
+                                                article_id,
+                                                index,
+                                                text,
+                                                &[],
+                                                &inline_code_ranges,
                                                 &[],
                                                 ArticleTextStyle::Heading,
                                                 &mut selection_frame,
@@ -2668,19 +4065,28 @@ impl eframe::App for GuiApp {
                                             let start = index;
                                             let mut run = String::new();
                                             let mut strong_ranges = Vec::new();
+                                            let mut inline_code_ranges = Vec::new();
                                             let mut link_ranges = Vec::new();
                                             let mut previous_was_strong = false;
                                             let mut previous_was_link = false;
+                                            let mut previous_was_inline_code = false;
                                             let mut previous_link_had_space_after = false;
                                             while index < blocks.len() {
                                                 let block = &blocks[index];
                                                 if matches!(
                                                     block,
                                                     Block::Image(_)
+                                                        | Block::LinkedImage { .. }
                                                         | Block::Heading(_)
+                                                        | Block::HeadingWithInlineCode { .. }
                                                         | Block::HeadingLink { .. }
                                                         | Block::Quote(_)
                                                         | Block::Code(_)
+                                                        | Block::CodeBlock { .. }
+                                                        | Block::Caption(_)
+                                                        | Block::DefinitionList(_)
+                                                        | Block::Table { .. }
+                                                        | Block::Math { .. }
                                                         | Block::ListItemStart { .. }
                                                         | Block::ListItemEnd { .. }
                                                 ) || matches!(
@@ -2696,12 +4102,20 @@ impl eframe::App for GuiApp {
                                                 let value = match block {
                                                     Block::Text(text)
                                                     | Block::Strong(text)
+                                                    | Block::InlineCode(text)
                                                     | Block::Link { text, .. } => text,
                                                     Block::Image(_)
+                                                    | Block::LinkedImage { .. }
                                                     | Block::Heading(_)
+                                                    | Block::HeadingWithInlineCode { .. }
                                                     | Block::HeadingLink { .. }
                                                     | Block::Quote(_)
                                                     | Block::Code(_)
+                                                    | Block::CodeBlock { .. }
+                                                    | Block::Caption(_)
+                                                    | Block::DefinitionList(_)
+                                                    | Block::Table { .. }
+                                                    | Block::Math { .. }
                                                     | Block::ListItemStart { .. }
                                                     | Block::ListItemEnd { .. } => {
                                                         unreachable!()
@@ -2716,13 +4130,15 @@ impl eframe::App for GuiApp {
                                                     if previous_link_had_space_after {
                                                         run.push(' ');
                                                     } else {
-                                                        run.push_str(body_block_separator(
+                                                        run.push_str(body_fragment_separator(
                                                             &run,
                                                             value,
                                                             previous_was_strong,
                                                             previous_was_link,
+                                                            previous_was_inline_code,
                                                             matches!(block, Block::Strong(_)),
                                                             matches!(block, Block::Link { .. }),
+                                                            matches!(block, Block::InlineCode(_)),
                                                             next_link_has_prefix,
                                                         ));
                                                     }
@@ -2733,6 +4149,9 @@ impl eframe::App for GuiApp {
                                                 let is_link = matches!(block, Block::Link { .. });
                                                 if is_strong {
                                                     strong_ranges.push(value_start..run.len());
+                                                }
+                                                if matches!(block, Block::InlineCode(_)) {
+                                                    inline_code_ranges.push(value_start..run.len());
                                                 }
                                                 if is_link {
                                                     if let Block::Link {
@@ -2748,6 +4167,8 @@ impl eframe::App for GuiApp {
                                                 }
                                                 previous_was_strong = is_strong;
                                                 previous_was_link = is_link;
+                                                previous_was_inline_code =
+                                                    matches!(block, Block::InlineCode(_));
                                                 previous_link_had_space_after = matches!(
                                                     block,
                                                     Block::Link {
@@ -2758,12 +4179,13 @@ impl eframe::App for GuiApp {
                                                 index += 1;
                                             }
                                             if !run.trim().is_empty() {
-                                                selectable_text_block_with_style(
+                                                selectable_text_block_with_inline_style(
                                                     ui,
                                                     article_id,
                                                     start,
                                                     &run,
                                                     &strong_ranges,
+                                                    &inline_code_ranges,
                                                     &link_ranges,
                                                     ArticleTextStyle::Body,
                                                     &mut selection_frame,
@@ -2778,6 +4200,42 @@ impl eframe::App for GuiApp {
                         ui.add_space(side_margin);
                     });
                 });
+                if self
+                    .pending_selection_anchor
+                    .as_ref()
+                    .is_some_and(|selection| selection.article_id == article_id)
+                    && let Some(selection) = self.pending_selection_anchor.take()
+                {
+                    let anchor = TextAnchor {
+                        start_offset: selection.start_offset,
+                        end_offset: selection.end_offset,
+                        prefix: selection.anchor_prefix.clone(),
+                        suffix: selection.anchor_suffix.clone(),
+                    };
+                    if let Some(range) = resolve_excerpt_anchor(
+                        &selection_frame.plain_text,
+                        &selection.selected_text,
+                        &anchor,
+                    ) {
+                        if let Some(span) = selection_frame.spans.iter().find(|span| {
+                            span.chars.start <= range.start && span.chars.end >= range.start
+                        }) {
+                            let offset = body_scroll_output.state.offset.y
+                                + span.global_rect.top()
+                                - body_scroll_output.inner_rect.top()
+                                - 28.0;
+                            self.pending_body_scroll = Some((article_id, offset.max(0.0)));
+                            self.selection_notice =
+                                Some(("已定位到摘录原文".to_owned(), Instant::now()));
+                            ctx.request_repaint();
+                        }
+                    } else {
+                        self.selection_notice = Some((
+                            "正文已更新，暂时找不到这段摘录".to_owned(),
+                            Instant::now(),
+                        ));
+                    }
+                }
                 let selection_result =
                     self.update_article_selection(&ctx, article_id, &selection_frame);
                 let selection_drag_started = selection_result.drag_started;
@@ -2831,15 +4289,189 @@ impl eframe::App for GuiApp {
                 if toggle_article_star {
                     self.toggle_star(article_id);
                 }
+                if toggle_article_read_later {
+                    self.toggle_read_later(article_id);
+                }
+                if edit_article_tags {
+                    self.open_tag_dialog(article_id);
+                }
             });
         self.show_saved_library_window(&ctx);
         self.show_archive_library_window(&ctx);
+        self.show_search_window(&ctx);
+        self.show_tag_dialog(&ctx);
         self.show_web_clip_dialog(&ctx);
         self.show_delete_web_clip_dialog(&ctx);
+        self.show_storage_dialog(&ctx);
         self.show_selection_popup(&ctx);
         self.show_comment_dialog(&ctx);
         self.show_selection_notice(&ctx);
     }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn search_preview(source: &str, query: &str, max_chars: usize) -> String {
+    let text = text::content_blocks(source, None)
+        .into_iter()
+        .filter_map(|block| match block {
+            Block::Text(value)
+            | Block::Strong(value)
+            | Block::InlineCode(value)
+            | Block::Heading(value)
+            | Block::Quote(value)
+            | Block::Code(value) => Some(value),
+            Block::CodeBlock { text, .. } | Block::Math { source: text, .. } => Some(text),
+            Block::HeadingWithInlineCode { text, .. }
+            | Block::HeadingLink { text, .. }
+            | Block::Link { text, .. } => Some(text),
+            Block::Table { rows, .. } => Some(
+                rows.into_iter()
+                    .flatten()
+                    .map(|cell| cell.text)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
+            Block::Caption(value) => Some(value),
+            Block::DefinitionList(items) => Some(
+                items
+                    .into_iter()
+                    .flat_map(|item| std::iter::once(item.term).chain(item.definitions))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
+            Block::ListItemStart { .. }
+            | Block::ListItemEnd { .. }
+            | Block::Image(_)
+            | Block::LinkedImage { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let normalized = if text.trim().is_empty() {
+        source.split_whitespace().collect::<Vec<_>>().join(" ")
+    } else {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+    if normalized.is_empty() {
+        return "（无可显示的文字）".to_owned();
+    }
+
+    let chars: Vec<char> = normalized.chars().collect();
+    let lower_chars: Vec<char> = normalized.to_lowercase().chars().collect();
+    let query_chars: Vec<char> = query
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_lowercase()
+        .chars()
+        .collect();
+    let match_char = if query_chars.is_empty() {
+        0
+    } else {
+        lower_chars
+            .windows(query_chars.len())
+            .position(|window| window == query_chars)
+            .unwrap_or(0)
+    };
+    let leading = max_chars / 3;
+    let start = match_char.saturating_sub(leading);
+    let end = (start + max_chars).min(chars.len());
+    let mut preview: String = chars[start..end].iter().collect();
+    if start > 0 {
+        preview.insert(0, '…');
+    }
+    if end < chars.len() {
+        preview.push('…');
+    }
+    preview
+}
+
+fn search_match_ranges(text: &str, query: &str) -> Vec<Range<usize>> {
+    let char_starts: Vec<usize> = text.char_indices().map(|(start, _)| start).collect();
+    let folded: Vec<String> = text.chars().map(|ch| ch.to_lowercase().collect()).collect();
+    let mut ranges = Vec::new();
+    for term in query.split_whitespace() {
+        let term_chars = term
+            .chars()
+            .map(|ch| ch.to_lowercase().collect::<String>())
+            .collect::<Vec<_>>();
+        if term_chars.is_empty() || folded.len() < term_chars.len() {
+            continue;
+        }
+        let mut at = 0usize;
+        while at + term_chars.len() <= folded.len() {
+            if folded[at..at + term_chars.len()] == term_chars {
+                let start = char_starts[at];
+                let end_char = at + term_chars.len();
+                let end = char_starts.get(end_char).copied().unwrap_or(text.len());
+                ranges.push(start..end);
+                at = end_char;
+            } else {
+                at += 1;
+            }
+        }
+    }
+    ranges.sort_by_key(|range| (range.start, range.end));
+    let mut merged: Vec<Range<usize>> = Vec::new();
+    for range in ranges {
+        if let Some(previous) = merged.last_mut()
+            && range.start <= previous.end
+        {
+            previous.end = previous.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+    merged
+}
+
+fn search_highlight_layout_job(
+    text: &str,
+    query: &str,
+    font_size: f32,
+    color: egui::Color32,
+    family: egui::FontFamily,
+    theme: ReaderTheme,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    let normal = egui::text::TextFormat {
+        font_id: egui::FontId::new(font_size, family),
+        line_height: Some(font_size * 1.55),
+        color,
+        ..Default::default()
+    };
+    let highlighted = egui::text::TextFormat {
+        color: theme.text,
+        background: egui::Color32::from_rgb(255, 229, 153),
+        underline: egui::Stroke::new(1.0, theme.accent),
+        ..normal.clone()
+    };
+
+    let mut cursor = 0usize;
+    for range in search_match_ranges(text, query) {
+        if cursor < range.start {
+            job.append(&text[cursor..range.start], 0.0, normal.clone());
+        }
+        job.append(&text[range.clone()], 0.0, highlighted.clone());
+        cursor = range.end;
+    }
+    if cursor < text.len() {
+        job.append(&text[cursor..], 0.0, normal);
+    }
+    job
 }
 
 fn selection_toolbar_button(ui: &mut egui::Ui, icon: &str, label: &str) -> bool {
@@ -3043,11 +4675,14 @@ fn selected_quote_from_article_text(
         return None;
     }
 
+    let anchor = TextAnchor::capture(text, lo, hi, 64);
     Some(SelectedQuote {
         article_id,
         text: chars[lo..hi].iter().collect(),
-        start_offset: Some(lo as i64),
-        end_offset: Some(hi as i64),
+        start_offset: anchor.start_offset,
+        end_offset: anchor.end_offset,
+        anchor_prefix: anchor.prefix,
+        anchor_suffix: anchor.suffix,
     })
 }
 
@@ -3122,6 +4757,48 @@ fn body_block_separator(
     } else {
         ""
     }
+}
+
+fn body_fragment_separator(
+    previous: &str,
+    next: &str,
+    previous_was_strong: bool,
+    previous_was_link: bool,
+    previous_was_inline_code: bool,
+    next_is_strong: bool,
+    next_is_link: bool,
+    next_is_inline_code: bool,
+    next_link_has_prefix: bool,
+) -> &'static str {
+    if previous_was_inline_code || next_is_inline_code {
+        let Some(previous_char) = previous.chars().rev().find(|ch| !ch.is_whitespace()) else {
+            return "";
+        };
+        let Some(next_char) = next.chars().find(|ch| !ch.is_whitespace()) else {
+            return "";
+        };
+        if is_closing_punctuation(next_char)
+            || matches!(previous_char, '(' | '[' | '{' | '<' | '/' | '\\')
+        {
+            return "";
+        }
+        if needs_typographic_space(previous_char, next_char)
+            || (previous_was_inline_code && next_char.is_alphanumeric())
+            || (next_is_inline_code && previous_char.is_alphanumeric())
+        {
+            return " ";
+        }
+        return "";
+    }
+    body_block_separator(
+        previous,
+        next,
+        previous_was_strong,
+        previous_was_link,
+        next_is_strong,
+        next_is_link,
+        next_link_has_prefix,
+    )
 }
 
 fn is_ascii_word_char(ch: char) -> bool {
@@ -3199,6 +4876,30 @@ fn selectable_text_block_with_style(
     style: ArticleTextStyle,
     selection_frame: &mut ArticleSelectionFrame,
 ) -> egui::Response {
+    selectable_text_block_with_inline_style(
+        ui,
+        article_id,
+        block_index,
+        text,
+        strong_ranges,
+        &[],
+        link_ranges,
+        style,
+        selection_frame,
+    )
+}
+
+fn selectable_text_block_with_inline_style(
+    ui: &mut egui::Ui,
+    article_id: i64,
+    block_index: usize,
+    text: &str,
+    strong_ranges: &[Range<usize>],
+    inline_code_ranges: &[Range<usize>],
+    link_ranges: &[ArticleLinkRange],
+    style: ArticleTextStyle,
+    selection_frame: &mut ArticleSelectionFrame,
+) -> egui::Response {
     let heading_inset = if matches!(style, ArticleTextStyle::Heading) {
         15.0
     } else {
@@ -3209,6 +4910,7 @@ fn selectable_text_block_with_style(
         style,
         text,
         strong_ranges,
+        inline_code_ranges,
         link_ranges,
         (available_width - heading_inset).max(1.0),
     );
@@ -3333,6 +5035,7 @@ fn article_layout_job(
     style: ArticleTextStyle,
     text: &str,
     strong_ranges: &[Range<usize>],
+    inline_code_ranges: &[Range<usize>],
     link_ranges: &[ArticleLinkRange],
     wrap_width: f32,
 ) -> egui::text::LayoutJob {
@@ -3372,6 +5075,7 @@ fn article_layout_job(
             &mut job,
             text,
             strong_ranges,
+            inline_code_ranges,
             link_ranges,
             &normal,
             &heading,
@@ -3379,12 +5083,21 @@ fn article_layout_job(
     } else if matches!(style, ArticleTextStyle::Title) {
         job.append(text, 0.0, heading);
     } else if matches!(style, ArticleTextStyle::Heading) {
-        append_body_layout(&mut job, text, &[], link_ranges, &heading, &heading);
+        append_body_layout(
+            &mut job,
+            text,
+            &[],
+            inline_code_ranges,
+            link_ranges,
+            &heading,
+            &heading,
+        );
     } else {
         append_body_layout(
             &mut job,
             text,
             strong_ranges,
+            inline_code_ranges,
             link_ranges,
             &normal,
             &heading,
@@ -3399,6 +5112,7 @@ fn append_body_layout(
     job: &mut egui::text::LayoutJob,
     text: &str,
     strong_ranges: &[Range<usize>],
+    inline_code_ranges: &[Range<usize>],
     link_ranges: &[ArticleLinkRange],
     normal: &egui::text::TextFormat,
     strong: &egui::text::TextFormat,
@@ -3406,6 +5120,11 @@ fn append_body_layout(
     let mut boundaries = vec![0, text.len()];
     boundaries.extend(
         strong_ranges
+            .iter()
+            .flat_map(|range| [range.start, range.end]),
+    );
+    boundaries.extend(
+        inline_code_ranges
             .iter()
             .flat_map(|range| [range.start, range.end]),
     );
@@ -3420,6 +5139,12 @@ fn append_body_layout(
     let mut link_format = normal.clone();
     link_format.color = ReaderTheme::sspai().link;
     link_format.underline = egui::Stroke::NONE;
+    let mut inline_code_format = normal.clone();
+    inline_code_format.font_id = egui::FontId::new(
+        (normal.font_id.size * 0.92).max(12.0),
+        egui::FontFamily::Monospace,
+    );
+    inline_code_format.background = ReaderTheme::sspai().code_bg;
 
     for pair in boundaries.windows(2) {
         let start = pair[0].min(text.len());
@@ -3432,6 +5157,11 @@ fn append_body_layout(
             .any(|link| link.range.start <= start && end <= link.range.end)
         {
             link_format.clone()
+        } else if inline_code_ranges
+            .iter()
+            .any(|range| range.start <= start && end <= range.end)
+        {
+            inline_code_format.clone()
         } else if strong_ranges
             .iter()
             .any(|range| range.start <= start && end <= range.end)
@@ -3448,6 +5178,7 @@ fn append_list_layout(
     job: &mut egui::text::LayoutJob,
     text: &str,
     explicit_strong_ranges: &[Range<usize>],
+    inline_code_ranges: &[Range<usize>],
     link_ranges: &[ArticleLinkRange],
     normal: &egui::text::TextFormat,
     strong: &egui::text::TextFormat,
@@ -3467,13 +5198,97 @@ fn append_list_layout(
         }
         offset += line.len() + 1;
     }
-    append_body_layout(job, text, &strong_ranges, link_ranges, normal, strong);
+    append_body_layout(
+        job,
+        text,
+        &strong_ranges,
+        inline_code_ranges,
+        link_ranges,
+        normal,
+        strong,
+    );
+}
+
+fn formula_block(
+    ui: &mut egui::Ui,
+    source: &str,
+    display: bool,
+    cache: &mut HashMap<String, FormulaState>,
+    jobs: &std_mpsc::Sender<FormulaJob>,
+) {
+    let theme = ReaderTheme::sspai();
+    let key = format!("{}\n{source}", if display { "display" } else { "inline" });
+    if !cache.contains_key(&key) {
+        let job = FormulaJob {
+            key: key.clone(),
+            source: source.to_owned(),
+            display,
+        };
+        if jobs.send(job).is_ok() {
+            cache.insert(key.clone(), FormulaState::Loading);
+        } else {
+            cache.insert(
+                key.clone(),
+                FormulaState::Failed("公式排版服务没有响应".to_owned()),
+            );
+        }
+    }
+
+    egui::Frame::new()
+        .fill(theme.code_bg)
+        .corner_radius(egui::CornerRadius::same(4))
+        .inner_margin(egui::Margin::symmetric(18, 12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            match cache.get(&key) {
+                Some(FormulaState::Ready(bytes)) => {
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    key.hash(&mut hasher);
+                    let image = egui::Image::from_bytes(
+                        format!("bytes://formula/{:016x}.svg", hasher.finish()),
+                        bytes.clone(),
+                    )
+                    .max_width(ui.available_width())
+                    .max_height(if display { 180.0 } else { 72.0 })
+                    .maintain_aspect_ratio(true)
+                    .show_loading_spinner(false);
+                    if display {
+                        ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                            ui.add(image).on_hover_text(format!("TeX：{source}"));
+                        });
+                    } else {
+                        ui.add(image).on_hover_text(format!("TeX：{source}"));
+                    }
+                }
+                Some(FormulaState::Loading) => {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().size(16.0));
+                        ui.label(
+                            egui::RichText::new("正在排版公式…")
+                                .size(13.0)
+                                .color(theme.muted),
+                        );
+                    });
+                }
+                Some(FormulaState::Failed(error)) => {
+                    ui.label(
+                        egui::RichText::new(source)
+                            .monospace()
+                            .size(if display { 17.0 } else { 15.0 })
+                            .color(theme.text),
+                    )
+                    .on_hover_text(format!("公式排版失败，已保留 TeX 源文本：{error}"));
+                }
+                None => {}
+            }
+        });
 }
 
 fn article_image(
     ui: &mut egui::Ui,
     viewport: &egui::Rect,
     uri: &str,
+    link_url: Option<&str>,
     cache: &mut HashMap<String, ImageState>,
     job_tx: &std_mpsc::Sender<String>,
 ) {
@@ -3588,8 +5403,12 @@ fn article_image(
     }
 
     let mut retry = false;
-    if matches!(cache.get(uri), Some(ImageState::Failed(_))) && response.clicked() {
-        retry = true;
+    if response.clicked() {
+        if matches!(cache.get(uri), Some(ImageState::Failed(_))) {
+            retry = true;
+        } else if let Some(url) = link_url {
+            open_in_browser(url);
+        }
     }
     response.context_menu(|ui| {
         if ui.button("重新加载图片").clicked() {
@@ -3598,6 +5417,12 @@ fn article_image(
         }
         if ui.button("在浏览器中打开图片").clicked() {
             open_in_browser(uri);
+            ui.close();
+        }
+        if let Some(url) = link_url
+            && ui.button("打开图片链接").clicked()
+        {
+            open_in_browser(url);
             ui.close();
         }
     });
@@ -3633,16 +5458,58 @@ fn queue_image_download(uri: &str, job_tx: &std_mpsc::Sender<String>) -> Result<
     })
 }
 
+fn spawn_formula_worker(
+    jobs: std_mpsc::Receiver<FormulaJob>,
+    events: std_mpsc::Sender<FormulaEvent>,
+) {
+    std::thread::Builder::new()
+        .name("shiyue-mathjax".to_owned())
+        .spawn(move || {
+            let renderer = match std::panic::catch_unwind(mathjax_svg_rs::MathJax::new) {
+                Ok(renderer) => renderer,
+                Err(_) => {
+                    while let Ok(job) = jobs.recv() {
+                        let _ = events.send(FormulaEvent::Complete {
+                            key: job.key,
+                            result: Err("MathJax 初始化失败".to_owned()),
+                        });
+                    }
+                    return;
+                }
+            };
+            while let Ok(job) = jobs.recv() {
+                let options = mathjax_svg_rs::Options {
+                    font_size: if job.display { 19.0 } else { 16.0 },
+                    horizontal_align: if job.display {
+                        mathjax_svg_rs::HorizontalAlign::Center
+                    } else {
+                        mathjax_svg_rs::HorizontalAlign::Left
+                    },
+                };
+                let result = renderer
+                    .render_tex(&job.source, &options)
+                    .map(|svg| Arc::<[u8]>::from(svg.into_bytes()));
+                let _ = events.send(FormulaEvent::Complete {
+                    key: job.key,
+                    result,
+                });
+            }
+        })
+        .expect("公式排版线程创建失败");
+}
+
 fn spawn_image_workers(
     client: reqwest::blocking::Client,
     job_rx: std_mpsc::Receiver<String>,
     event_tx: std_mpsc::Sender<ImageEvent>,
+    store: Arc<ImageStore>,
 ) {
     let job_rx = Arc::new(Mutex::new(job_rx));
     for worker in 0..IMAGE_WORKER_COUNT {
         let client = client.clone();
         let job_rx = job_rx.clone();
         let event_tx = event_tx.clone();
+        let store = store.clone();
         std::thread::Builder::new()
             .name(format!("shiyue-image-{worker}"))
             .spawn(move || {
@@ -3659,7 +5526,7 @@ fn spawn_image_workers(
                         };
                         uri
                     };
-                    let result = download_image_with_retry(&client, &uri, &event_tx);
+                    let result = load_cached_or_download_image(&client, &store, &uri, &event_tx);
                     if event_tx.send(ImageEvent::Complete { uri, result }).is_err() {
                         return;
                     }
@@ -3667,6 +5534,35 @@ fn spawn_image_workers(
             })
             .expect("failed to spawn image worker");
     }
+}
+
+fn load_cached_or_download_image(
+    client: &reqwest::blocking::Client,
+    store: &ImageStore,
+    uri: &str,
+    event_tx: &std_mpsc::Sender<ImageEvent>,
+) -> Result<Arc<[u8]>, ImageFailure> {
+    match store.get(uri) {
+        Ok(Some(bytes)) if image::load_from_memory(&bytes).is_ok() => {
+            return Ok(Arc::from(bytes));
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!("读取图片缓存失败：{error:#}"),
+    }
+
+    let bytes = download_image_with_retry(client, uri, event_tx)?;
+    image::load_from_memory(bytes.as_ref()).map_err(|error| ImageFailure {
+        message: "图片格式无法解码".to_owned(),
+        detail: error.to_string(),
+        attempts: 1,
+        retryable: false,
+    })?;
+    if let Err(error) = store.put(uri, bytes.as_ref()) {
+        tracing::warn!("写入图片缓存失败：{error:#}");
+    } else if let Err(error) = store.prune_to(DEFAULT_LIMIT_BYTES) {
+        tracing::warn!("清理图片缓存失败：{error:#}");
+    }
+    Ok(bytes)
 }
 
 fn download_image_with_retry(
@@ -3951,10 +5847,14 @@ fn open_in_browser(url: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        IMAGE_MAX_ATTEMPTS, body_block_separator, download_image_with_retry,
-        image_http_status_retryable, is_punctuation_only, normalized_web_url,
-        prepare_pasted_web_clip, selected_quote_from_article_text,
+        ArticleTextStyle, IMAGE_MAX_ATTEMPTS, article_layout_job, body_block_separator,
+        body_fragment_separator, download_image_with_retry, image_http_status_retryable,
+        is_punctuation_only, load_cached_or_download_image, normalized_web_url,
+        prepare_pasted_web_clip, search_match_ranges, search_preview,
+        selected_quote_from_article_text,
     };
+    use crate::image_store::ImageStore;
+    use eframe::egui;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -4000,6 +5900,43 @@ mod tests {
         assert_eq!(title.as_deref(), Some("保存页"));
         assert!(html.starts_with("<base href=\"https://example.com/posts/1/\">"));
         assert!(html.contains("<p>正文</p>"));
+    }
+
+    #[test]
+    fn search_preview_strips_html_and_centers_unicode_matches() {
+        let source = "<p>开头是一段说明。</p><p>这里包含关键架构决策，后面还有补充内容。</p>";
+        let preview = search_preview(source, "架构", 12);
+        assert!(preview.contains("关键架构决策"));
+        assert!(!preview.contains('<'));
+
+        let plain = search_preview("摘录中提到状态机", "状态机", 40);
+        assert_eq!(plain, "摘录中提到状态机");
+    }
+
+    #[test]
+    fn search_highlight_ranges_cover_all_unicode_and_case_insensitive_matches() {
+        let text = "乡音让内容有乡音，也支持 CloudFlare 与 cloudflare。";
+        let chinese = search_match_ranges(text, "乡音");
+        assert_eq!(
+            chinese
+                .iter()
+                .map(|range| &text[range.clone()])
+                .collect::<Vec<_>>(),
+            ["乡音", "乡音"]
+        );
+
+        let english = search_match_ranges(text, "CLOUDFLARE");
+        assert_eq!(
+            english
+                .iter()
+                .map(|range| &text[range.clone()])
+                .collect::<Vec<_>>(),
+            ["CloudFlare", "cloudflare"]
+        );
+        let multiple = search_match_ranges(text, "乡音 cloudflare");
+        assert_eq!(multiple.len(), 4);
+        assert!(search_match_ranges(text, "不存在").is_empty());
+        assert!(search_match_ranges(text, "   ").is_empty());
     }
 
     #[test]
@@ -4065,6 +6002,62 @@ mod tests {
     }
 
     #[test]
+    fn inline_code_layout_stays_in_the_sentence_and_uses_monospace() {
+        let text = "Installed via rustup, then update.";
+        let start = text.find("rustup").unwrap();
+        let end = start + "rustup".len();
+        let job = article_layout_job(
+            ArticleTextStyle::Body,
+            text,
+            &[],
+            &[start..end],
+            &[],
+            1200.0,
+        );
+
+        assert_eq!(job.text, text);
+        assert!(!job.text.contains('\n'));
+        assert!(job.sections.iter().any(|section| {
+            usize::from(section.byte_range.start) == start
+                && usize::from(section.byte_range.end) == end
+                && section.format.font_id.family == egui::FontFamily::Monospace
+                && section.format.background != egui::Color32::TRANSPARENT
+        }));
+    }
+
+    #[test]
+    fn inline_code_fragments_do_not_create_paragraph_breaks() {
+        assert_eq!(
+            body_fragment_separator(
+                "If Rust is installed via",
+                "rustup",
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+            ),
+            " "
+        );
+        assert_eq!(
+            body_fragment_separator(
+                "rustup",
+                ", you can update it",
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+            ),
+            ""
+        );
+    }
+
+    #[test]
     fn list_continuation_accepts_only_punctuation() {
         assert!(is_punctuation_only("。"));
         assert!(is_punctuation_only("。）"));
@@ -4124,6 +6117,31 @@ mod tests {
         assert!(!image_http_status_retryable(reqwest::StatusCode::NOT_FOUND));
         assert!(!image_http_status_retryable(reqwest::StatusCode::FORBIDDEN));
         assert_eq!(IMAGE_MAX_ATTEMPTS, 3);
+    }
+
+    #[test]
+    fn persistent_image_cache_serves_a_valid_image_without_network() {
+        let root = std::env::temp_dir().join(format!(
+            "shiyue-gui-offline-image-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let store = ImageStore::open(&root).unwrap();
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let uri = "https://offline-cache.invalid/image.png";
+        store.put(uri, encoded.get_ref()).unwrap();
+
+        let client = reqwest::blocking::Client::builder().build().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let bytes = load_cached_or_download_image(&client, &store, uri, &tx).unwrap();
+        assert!(image::load_from_memory(bytes.as_ref()).is_ok());
+        assert!(rx.try_recv().is_err(), "缓存命中不应进入网络重试流程");
+
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

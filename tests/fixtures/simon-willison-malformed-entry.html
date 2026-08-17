@@ -1,0 +1,32 @@
+<!doctype html>
+<!-- Reduced from the entry layout used by https://simonwillison.net/ -->
+<html lang=en>
+<head>
+  <base href=https://simonwillison.net/2026/Aug/13/dom-notes/>
+  <title>DOM notes &amp; resilient readers</title>
+  <style>.promo { display:none }</style>
+</head>
+<body>
+  <nav>Archive Tags Colophon</nav>
+  <main id=main>
+    <div class=entry>
+      <h1><a href="./">DOM notes &amp; resilient readers</a></h1>
+      <p>A browser DOM repairs paragraphs that were never explicitly closed.
+      <div class=entrybody>
+        <p>The repaired entry keeps inline <code>markup</code> and its following block.
+        <figure>
+          <picture>
+            <source srcset="/static/dom-640.webp 640w, /static/dom-1280.webp 1280w">
+            <img src="/static/dom-fallback.png" alt="A repaired DOM tree">
+          </picture>
+          <figcaption>A responsive image after malformed paragraph markup.</figcaption>
+        </figure>
+        <script type="math/tex; mode=display">\sum_{i=1}^{n} i</script>
+        <dl><dt>Repair<dd>Let HTML5 build the tree.<dt>Projection<dd>Keep semantic blocks stable.</dl>
+      </div>
+    </div>
+  </main>
+  <script>throw new Error("must not reach the reader")</script>
+  <footer>Site footer</footer>
+</body>
+</html>

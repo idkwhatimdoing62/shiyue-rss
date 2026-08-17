@@ -2,9 +2,13 @@
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, Row, params};
+use std::path::{Path, PathBuf};
 
 use crate::config::Config;
-use crate::model::{Article, ArticleSelection, Feed, NewArticle};
+use crate::model::{
+    Article, ArticleBatchAction, ArticleSelection, Feed, NewArticle, SearchHistoryEntry, SearchHit,
+    SearchHitKind, Tag, TextAnchor,
+};
 
 /// Hidden, non-network feed used to reuse the normal article reader and its
 /// annotations for locally saved web pages.
@@ -34,6 +38,7 @@ CREATE TABLE IF NOT EXISTS articles (
   content    TEXT,
   is_read    INTEGER NOT NULL DEFAULT 0,
   starred    INTEGER NOT NULL DEFAULT 0,
+  read_later INTEGER NOT NULL DEFAULT 0,
   archived   INTEGER NOT NULL DEFAULT 0,
   fetched_at INTEGER NOT NULL,
   UNIQUE(feed_id, entry_id)
@@ -44,6 +49,8 @@ CREATE TABLE IF NOT EXISTS article_selections (
   selected_text TEXT NOT NULL CHECK (length(trim(selected_text)) > 0),
   start_offset  INTEGER,
   end_offset    INTEGER,
+  anchor_prefix TEXT NOT NULL DEFAULT '',
+  anchor_suffix TEXT NOT NULL DEFAULT '',
   comment       TEXT,
   is_favorite   INTEGER NOT NULL DEFAULT 0 CHECK (is_favorite IN (0, 1)),
   created_at    INTEGER NOT NULL,
@@ -53,17 +60,119 @@ CREATE INDEX IF NOT EXISTS idx_article_selections_article
   ON article_selections(article_id, created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_article_selections_favorite
   ON article_selections(is_favorite, created_at DESC, id DESC);
+CREATE TABLE IF NOT EXISTS tags (
+  id         INTEGER PRIMARY KEY,
+  name       TEXT NOT NULL COLLATE NOCASE UNIQUE,
+  created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS article_tags (
+  article_id INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+  tag_id     INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY(article_id, tag_id)
+);
+CREATE INDEX IF NOT EXISTS idx_article_tags_tag ON article_tags(tag_id, article_id);
+CREATE TABLE IF NOT EXISTS search_history (
+  query         TEXT PRIMARY KEY COLLATE NOCASE,
+  last_used_at  INTEGER NOT NULL,
+  use_count     INTEGER NOT NULL DEFAULT 1,
+  result_count  INTEGER NOT NULL DEFAULT 0
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS library_fts USING fts5(
+  kind UNINDEXED,
+  source_id UNINDEXED,
+  article_id UNINDEXED,
+  body,
+  tokenize='trigram'
+);
+CREATE TRIGGER IF NOT EXISTS articles_fts_insert AFTER INSERT ON articles BEGIN
+  INSERT INTO library_fts(kind, source_id, article_id, body)
+  VALUES (
+    CASE WHEN (SELECT url FROM feeds WHERE id = new.feed_id) = 'shiyue://web-clippings' THEN 1 ELSE 0 END,
+    new.id,
+    new.id,
+    trim(COALESCE(new.title, '') || char(10) || COALESCE(new.author, '') || char(10) ||
+         COALESCE(new.content, '') || char(10) || COALESCE(new.url, ''))
+  );
+END;
+CREATE TRIGGER IF NOT EXISTS articles_fts_update AFTER UPDATE OF title, author, content, url, feed_id ON articles BEGIN
+  DELETE FROM library_fts WHERE kind IN (0, 1) AND source_id = old.id;
+  INSERT INTO library_fts(kind, source_id, article_id, body)
+  VALUES (
+    CASE WHEN (SELECT url FROM feeds WHERE id = new.feed_id) = 'shiyue://web-clippings' THEN 1 ELSE 0 END,
+    new.id,
+    new.id,
+    trim(COALESCE(new.title, '') || char(10) || COALESCE(new.author, '') || char(10) ||
+         COALESCE(new.content, '') || char(10) || COALESCE(new.url, '') || char(10) ||
+         COALESCE((SELECT group_concat(t.name, ' ') FROM article_tags at
+                   JOIN tags t ON t.id = at.tag_id WHERE at.article_id = new.id), ''))
+  );
+END;
+CREATE TRIGGER IF NOT EXISTS articles_fts_delete AFTER DELETE ON articles BEGIN
+  DELETE FROM library_fts WHERE article_id = old.id;
+END;
+CREATE TRIGGER IF NOT EXISTS selections_fts_insert AFTER INSERT ON article_selections BEGIN
+  INSERT INTO library_fts(kind, source_id, article_id, body)
+    SELECT 2, new.id, new.article_id, new.selected_text WHERE new.is_favorite = 1;
+  INSERT INTO library_fts(kind, source_id, article_id, body)
+    SELECT 3, new.id, new.article_id, new.comment
+    WHERE new.comment IS NOT NULL AND length(trim(new.comment)) > 0;
+END;
+CREATE TRIGGER IF NOT EXISTS selections_fts_update AFTER UPDATE ON article_selections BEGIN
+  DELETE FROM library_fts WHERE kind IN (2, 3) AND source_id = old.id;
+  INSERT INTO library_fts(kind, source_id, article_id, body)
+    SELECT 2, new.id, new.article_id, new.selected_text WHERE new.is_favorite = 1;
+  INSERT INTO library_fts(kind, source_id, article_id, body)
+    SELECT 3, new.id, new.article_id, new.comment
+    WHERE new.comment IS NOT NULL AND length(trim(new.comment)) > 0;
+END;
+CREATE TRIGGER IF NOT EXISTS selections_fts_delete AFTER DELETE ON article_selections BEGIN
+  DELETE FROM library_fts WHERE kind IN (2, 3) AND source_id = old.id;
+END;
+CREATE TRIGGER IF NOT EXISTS article_tags_fts_insert AFTER INSERT ON article_tags BEGIN
+  DELETE FROM library_fts WHERE kind IN (0, 1) AND source_id = new.article_id;
+  INSERT INTO library_fts(kind, source_id, article_id, body)
+    SELECT CASE WHEN f.url = 'shiyue://web-clippings' THEN 1 ELSE 0 END, a.id, a.id,
+           trim(COALESCE(a.title, '') || char(10) || COALESCE(a.author, '') || char(10) ||
+                COALESCE(a.content, '') || char(10) || COALESCE(a.url, '') || char(10) ||
+                COALESCE((SELECT group_concat(t.name, ' ') FROM article_tags at
+                          JOIN tags t ON t.id = at.tag_id WHERE at.article_id = a.id), ''))
+    FROM articles a JOIN feeds f ON f.id = a.feed_id WHERE a.id = new.article_id;
+END;
+CREATE TRIGGER IF NOT EXISTS article_tags_fts_delete AFTER DELETE ON article_tags BEGIN
+  DELETE FROM library_fts WHERE kind IN (0, 1) AND source_id = old.article_id;
+  INSERT INTO library_fts(kind, source_id, article_id, body)
+    SELECT CASE WHEN f.url = 'shiyue://web-clippings' THEN 1 ELSE 0 END, a.id, a.id,
+           trim(COALESCE(a.title, '') || char(10) || COALESCE(a.author, '') || char(10) ||
+                COALESCE(a.content, '') || char(10) || COALESCE(a.url, '') || char(10) ||
+                COALESCE((SELECT group_concat(t.name, ' ') FROM article_tags at
+                          JOIN tags t ON t.id = at.tag_id WHERE at.article_id = a.id), ''))
+    FROM articles a JOIN feeds f ON f.id = a.feed_id WHERE a.id = old.article_id;
+END;
 "#;
 
 const FEED_COLS: &str =
     "id, url, title, interval_secs, last_fetch, next_fetch, last_error, fail_count, disabled";
 const ARTICLE_COLS: &str = "id, feed_id, entry_id, url, title, author, published, content, \
-                            is_read, starred, archived, fetched_at";
+                            is_read, starred, read_later, archived, fetched_at";
 const SELECTION_COLS: &str = "id, article_id, selected_text, start_offset, end_offset, \
-                              comment, is_favorite, created_at, updated_at";
+                              anchor_prefix, anchor_suffix, comment, is_favorite, created_at, updated_at";
 
 pub struct Db {
     conn: Connection,
+    path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseCheck {
+    pub ok: bool,
+    pub details: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionReport {
+    pub before_bytes: u64,
+    pub after_bytes: u64,
 }
 
 fn map_feed(row: &Row) -> rusqlite::Result<Feed> {
@@ -92,23 +201,71 @@ fn map_article(row: &Row) -> rusqlite::Result<Article> {
         content: row.get(7)?,
         is_read: row.get(8)?,
         starred: row.get(9)?,
-        archived: row.get(10)?,
-        fetched_at: row.get(11)?,
+        read_later: row.get(10)?,
+        archived: row.get(11)?,
+        fetched_at: row.get(12)?,
     })
 }
 
-fn migrate(conn: &Connection) -> Result<()> {
-    let has_archived = {
-        let mut stmt = conn.prepare("PRAGMA table_info(articles)")?;
+fn has_column(conn: &Connection, table: &str, expected: &str) -> Result<bool> {
+    let has_column = {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
         let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
         columns
             .collect::<rusqlite::Result<Vec<_>>>()?
             .iter()
-            .any(|name| name == "archived")
+            .any(|name| name == expected)
     };
-    if !has_archived {
+    Ok(has_column)
+}
+
+fn migrate(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "articles", "archived")? {
         conn.execute(
             "ALTER TABLE articles ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !has_column(conn, "articles", "read_later")? {
+        conn.execute(
+            "ALTER TABLE articles ADD COLUMN read_later INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !has_column(conn, "article_selections", "anchor_prefix")? {
+        conn.execute(
+            "ALTER TABLE article_selections ADD COLUMN anchor_prefix TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    if !has_column(conn, "article_selections", "anchor_suffix")? {
+        conn.execute(
+            "ALTER TABLE article_selections ADD COLUMN anchor_suffix TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    let indexed_rows: i64 =
+        conn.query_row("SELECT COUNT(*) FROM library_fts", [], |row| row.get(0))?;
+    if indexed_rows == 0 {
+        conn.execute(
+            "INSERT INTO library_fts(kind, source_id, article_id, body)
+         SELECT CASE WHEN f.url = ?1 THEN 1 ELSE 0 END, a.id, a.id,
+                trim(COALESCE(a.title, '') || char(10) || COALESCE(a.author, '') || char(10) ||
+                     COALESCE(a.content, '') || char(10) || COALESCE(a.url, '') || char(10) ||
+                     COALESCE((SELECT group_concat(t.name, ' ') FROM article_tags at
+                               JOIN tags t ON t.id = at.tag_id WHERE at.article_id = a.id), ''))
+         FROM articles a JOIN feeds f ON f.id = a.feed_id",
+            params![WEB_CLIPPINGS_FEED_URL],
+        )?;
+        conn.execute(
+            "INSERT INTO library_fts(kind, source_id, article_id, body)
+         SELECT 2, id, article_id, selected_text FROM article_selections WHERE is_favorite = 1",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO library_fts(kind, source_id, article_id, body)
+         SELECT 3, id, article_id, comment FROM article_selections
+         WHERE comment IS NOT NULL AND length(trim(comment)) > 0",
             [],
         )?;
     }
@@ -122,10 +279,34 @@ fn map_selection(row: &Row) -> rusqlite::Result<ArticleSelection> {
         selected_text: row.get(2)?,
         start_offset: row.get(3)?,
         end_offset: row.get(4)?,
-        comment: row.get(5)?,
-        is_favorite: row.get(6)?,
-        created_at: row.get(7)?,
-        updated_at: row.get(8)?,
+        anchor_prefix: row.get(5)?,
+        anchor_suffix: row.get(6)?,
+        comment: row.get(7)?,
+        is_favorite: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    })
+}
+
+fn map_search_hit(row: &Row) -> rusqlite::Result<SearchHit> {
+    let kind = match row.get::<_, i64>(0)? {
+        0 => SearchHitKind::Article,
+        1 => SearchHitKind::WebClipping,
+        2 => SearchHitKind::Excerpt,
+        3 => SearchHitKind::Thought,
+        value => return Err(rusqlite::Error::IntegralValueOutOfRange(0, value)),
+    };
+    Ok(SearchHit {
+        kind,
+        selection_id: matches!(kind, SearchHitKind::Excerpt | SearchHitKind::Thought)
+            .then(|| row.get(1))
+            .transpose()?,
+        article_id: row.get(2)?,
+        feed_id: row.get(3)?,
+        article_title: row.get(4)?,
+        snippet: row.get(5)?,
+        timestamp: row.get(6)?,
+        archived: row.get(7)?,
     })
 }
 
@@ -137,7 +318,10 @@ impl Db {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
         migrate(&conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            path: Some(path.to_path_buf()),
+        })
     }
 
     // ---- 源的增删查改 ----
@@ -342,6 +526,109 @@ impl Db {
         Ok(count.max(0) as usize)
     }
 
+    pub fn read_later_articles(&self) -> Result<Vec<Article>> {
+        let sql = format!(
+            "SELECT {ARTICLE_COLS} FROM articles
+             WHERE archived = 0 AND read_later = 1
+             ORDER BY COALESCE(published, fetched_at) DESC, id DESC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], map_article)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn read_later_count(&self) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM articles WHERE archived = 0 AND read_later = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as usize)
+    }
+
+    pub fn set_article_read_later(&self, article_id: i64, read_later: bool) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE articles SET read_later = ?2 WHERE id = ?1",
+            params![article_id, read_later],
+        )?)
+    }
+
+    /// Applies one explicit target state to every selected article in one SQL statement.
+    pub fn apply_article_batch(
+        &self,
+        article_ids: &[i64],
+        action: ArticleBatchAction,
+    ) -> Result<usize> {
+        if article_ids.is_empty() {
+            return Ok(0);
+        }
+        let assignment = match action {
+            ArticleBatchAction::Archive => "archived = 1",
+            ArticleBatchAction::Bookmark => "starred = 1",
+            ArticleBatchAction::ReadLater => "read_later = 1",
+        };
+        let placeholders = std::iter::repeat_n("?", article_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("UPDATE articles SET {assignment} WHERE id IN ({placeholders})");
+        Ok(self
+            .conn
+            .execute(&sql, rusqlite::params_from_iter(article_ids.iter()))?)
+    }
+
+    pub fn tags_for_article(&self, article_id: i64) -> Result<Vec<Tag>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.id, t.name FROM tags t
+             JOIN article_tags at ON at.tag_id = t.id
+             WHERE at.article_id = ?1 ORDER BY t.name COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map(params![article_id], |row| {
+            Ok(Tag {
+                id: row.get(0)?,
+                name: row.get(1)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Replaces an article's complete tag set atomically. Empty and duplicate
+    /// names are normalized away inside this module.
+    pub fn replace_article_tags(&self, article_id: i64, names: &[String], now: i64) -> Result<()> {
+        let mut normalized = names
+            .iter()
+            .map(|name| name.trim())
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        normalized.sort_by_key(|name| name.to_lowercase());
+        normalized.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM article_tags WHERE article_id = ?1",
+            params![article_id],
+        )?;
+        for name in normalized {
+            tx.execute(
+                "INSERT INTO tags(name, created_at) VALUES (?1, ?2)
+                 ON CONFLICT(name) DO NOTHING",
+                params![name, now],
+            )?;
+            tx.execute(
+                "INSERT INTO article_tags(article_id, tag_id, created_at)
+                 SELECT ?1, id, ?3 FROM tags WHERE name = ?2 COLLATE NOCASE",
+                params![article_id, name, now],
+            )?;
+        }
+        tx.execute(
+            "DELETE FROM tags WHERE NOT EXISTS
+             (SELECT 1 FROM article_tags WHERE article_tags.tag_id = tags.id)",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn set_interval(&self, id: i64, secs: i64) -> Result<usize> {
         Ok(self.conn.execute(
             "UPDATE feeds SET interval_secs = ?2 WHERE id = ?1",
@@ -450,6 +737,13 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    pub fn get_article(&self, article_id: i64) -> Result<Article> {
+        let sql = format!("SELECT {ARTICLE_COLS} FROM articles WHERE id = ?1");
+        Ok(self
+            .conn
+            .query_row(&sql, params![article_id], map_article)?)
+    }
+
     pub fn archived_articles(&self) -> Result<Vec<Article>> {
         let sql = format!(
             "SELECT {ARTICLE_COLS} FROM articles \
@@ -467,6 +761,119 @@ impl Db {
             |row| row.get(0),
         )?;
         Ok(count.max(0) as usize)
+    }
+
+    /// 在文章、网页快照、摘录与想法中进行统一全文搜索。
+    ///
+    /// 三个字符以上的查询使用 FTS5 trigram 分词与 BM25 相关性排序；
+    /// 一两个字符的查询回退到精确子串匹配，避免中文短词被 trigram 丢弃。
+    /// 每次有效搜索都会去重写入搜索历史。
+    pub fn search_library(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+        let query = query.trim();
+        if query.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let use_fts = query
+            .split_whitespace()
+            .all(|term| term.chars().count() >= 3);
+        let hits = if use_fts {
+            let match_query = query
+                .split_whitespace()
+                .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            let mut stmt = self.conn.prepare(
+                "SELECT CAST(l.kind AS INTEGER), l.source_id, l.article_id, a.feed_id, a.title,
+                        snippet(library_fts, 3, '', '', ' … ', 32),
+                        CASE WHEN CAST(l.kind AS INTEGER) IN (2, 3)
+                             THEN COALESCE(s.updated_at, a.fetched_at)
+                             ELSE COALESCE(a.published, a.fetched_at) END,
+                        a.archived
+                 FROM library_fts l
+                 JOIN articles a ON a.id = l.article_id
+                 LEFT JOIN article_selections s
+                        ON s.id = l.source_id AND CAST(l.kind AS INTEGER) IN (2, 3)
+                 WHERE library_fts MATCH ?1
+                 ORDER BY bm25(library_fts), 7 DESC, l.article_id DESC
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![match_query, limit], map_search_hit)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            let mut stmt = self.conn.prepare(
+            "WITH hits AS (\
+               SELECT CASE WHEN f.url = ?2 THEN 1 ELSE 0 END AS kind, a.id AS source_id, \
+                      a.id AS article_id, a.feed_id, a.title AS article_title, \
+                      trim(COALESCE(a.title, '') || CASE \
+                        WHEN a.title IS NOT NULL AND a.content IS NOT NULL THEN char(10) ELSE '' END \
+                        || COALESCE(a.content, '') || CASE \
+                        WHEN a.url IS NOT NULL THEN char(10) || a.url ELSE '' END) AS snippet, \
+                      COALESCE(a.published, a.fetched_at) AS timestamp, a.archived \
+               FROM articles a JOIN feeds f ON f.id = a.feed_id \
+               WHERE instr(lower(COALESCE(a.title, '') || char(10) || \
+                         COALESCE(a.author, '') || char(10) || COALESCE(a.content, '') || \
+                         char(10) || COALESCE(a.url, '') || char(10) || \
+                         COALESCE((SELECT group_concat(t.name, ' ') FROM article_tags at \
+                                   JOIN tags t ON t.id = at.tag_id \
+                                   WHERE at.article_id = a.id), '')), lower(?1)) > 0 \
+               UNION ALL \
+               SELECT 2, s.id, a.id, a.feed_id, a.title, s.selected_text, \
+                      s.updated_at, a.archived \
+               FROM article_selections s JOIN articles a ON a.id = s.article_id \
+               WHERE s.is_favorite = 1 \
+                 AND instr(lower(s.selected_text), lower(?1)) > 0 \
+               UNION ALL \
+               SELECT 3, s.id, a.id, a.feed_id, a.title, s.comment, \
+                      s.updated_at, a.archived \
+               FROM article_selections s JOIN articles a ON a.id = s.article_id \
+               WHERE s.comment IS NOT NULL AND length(trim(s.comment)) > 0 \
+                 AND instr(lower(s.comment), lower(?1)) > 0 \
+             ) \
+             SELECT kind, source_id, article_id, feed_id, article_title, snippet, timestamp, archived \
+             FROM hits ORDER BY timestamp DESC, article_id DESC LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(
+                params![query, WEB_CLIPPINGS_FEED_URL, limit],
+                map_search_hit,
+            )?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        self.record_search_history(query, hits.len())?;
+        Ok(hits)
+    }
+
+    fn record_search_history(&self, query: &str, result_count: usize) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO search_history(query, last_used_at, use_count, result_count)
+             VALUES (?1, unixepoch(), 1, ?2)
+             ON CONFLICT(query) DO UPDATE SET
+               last_used_at = excluded.last_used_at,
+               use_count = search_history.use_count + 1,
+               result_count = excluded.result_count",
+            params![query, i64::try_from(result_count).unwrap_or(i64::MAX)],
+        )?;
+        Ok(())
+    }
+
+    pub fn search_history(&self, limit: usize) -> Result<Vec<SearchHistoryEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT query, last_used_at, use_count, result_count
+             FROM search_history ORDER BY last_used_at DESC, query LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+            Ok(SearchHistoryEntry {
+                query: row.get(0)?,
+                last_used_at: row.get(1)?,
+                use_count: row.get(2)?,
+                result_count: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn clear_search_history(&self) -> Result<usize> {
+        Ok(self.conn.execute("DELETE FROM search_history", [])?)
     }
 
     pub fn set_article_archived(&self, article_id: i64, archived: bool) -> Result<usize> {
@@ -519,11 +926,36 @@ impl Db {
         is_favorite: bool,
         now: i64,
     ) -> Result<i64> {
+        let anchor = TextAnchor {
+            start_offset,
+            end_offset,
+            prefix: String::new(),
+            suffix: String::new(),
+        };
+        self.add_selection_with_anchor(
+            article_id,
+            selected_text,
+            &anchor,
+            comment,
+            is_favorite,
+            now,
+        )
+    }
+
+    pub fn add_selection_with_anchor(
+        &self,
+        article_id: i64,
+        selected_text: &str,
+        anchor: &TextAnchor,
+        comment: Option<&str>,
+        is_favorite: bool,
+        now: i64,
+    ) -> Result<i64> {
         let selected_text = selected_text.trim();
         if selected_text.is_empty() {
             bail!("选中的文字不能为空");
         }
-        if let (Some(start), Some(end)) = (start_offset, end_offset) {
+        if let (Some(start), Some(end)) = (anchor.start_offset, anchor.end_offset) {
             if start < 0 || end < start {
                 bail!("选区偏移无效");
             }
@@ -534,13 +966,16 @@ impl Db {
             .map(str::to_owned);
         self.conn.execute(
             "INSERT INTO article_selections \
-             (article_id, selected_text, start_offset, end_offset, comment, is_favorite, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+             (article_id, selected_text, start_offset, end_offset, anchor_prefix, anchor_suffix, \
+              comment, is_favorite, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
             params![
                 article_id,
                 selected_text,
-                start_offset,
-                end_offset,
+                anchor.start_offset,
+                anchor.end_offset,
+                anchor.prefix,
+                anchor.suffix,
                 comment,
                 is_favorite,
                 now
@@ -573,6 +1008,20 @@ impl Db {
         )
     }
 
+    pub fn add_comment_with_anchor(
+        &self,
+        article_id: i64,
+        selected_text: &str,
+        anchor: &TextAnchor,
+        comment: &str,
+        now: i64,
+    ) -> Result<i64> {
+        if comment.trim().is_empty() {
+            bail!("评论内容不能为空");
+        }
+        self.add_selection_with_anchor(article_id, selected_text, anchor, Some(comment), false, now)
+    }
+
     /// 只收藏一段选区的便捷接口。
     pub fn add_favorite_selection(
         &self,
@@ -591,6 +1040,16 @@ impl Db {
             true,
             now,
         )
+    }
+
+    pub fn add_favorite_selection_with_anchor(
+        &self,
+        article_id: i64,
+        selected_text: &str,
+        anchor: &TextAnchor,
+        now: i64,
+    ) -> Result<i64> {
+        self.add_selection_with_anchor(article_id, selected_text, anchor, None, true, now)
     }
 
     pub fn get_selection(&self, selection_id: i64) -> Result<ArticleSelection> {
@@ -627,7 +1086,8 @@ impl Db {
     pub fn saved_selections(&self) -> Result<Vec<(ArticleSelection, i64, Option<String>)>> {
         let mut stmt = self.conn.prepare(
             "SELECT s.id, s.article_id, s.selected_text, s.start_offset, s.end_offset, \
-                    s.comment, s.is_favorite, s.created_at, s.updated_at, \
+                    s.anchor_prefix, s.anchor_suffix, s.comment, s.is_favorite, \
+                    s.created_at, s.updated_at, \
                     a.feed_id, a.title \
              FROM article_selections s \
              JOIN articles a ON a.id = s.article_id \
@@ -636,7 +1096,7 @@ impl Db {
              ORDER BY s.updated_at DESC, s.id DESC",
         )?;
         let rows = stmt.query_map([], |row| {
-            Ok((map_selection(row)?, row.get(9)?, row.get(10)?))
+            Ok((map_selection(row)?, row.get(11)?, row.get(12)?))
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
@@ -694,6 +1154,134 @@ impl Db {
             params![selection_id],
         )?)
     }
+
+    pub fn integrity_check(&self) -> Result<DatabaseCheck> {
+        check_connection(&self.conn)
+    }
+
+    pub fn backup_to(&self, path: &Path) -> Result<()> {
+        if path.exists() {
+            bail!("备份目标已存在：{}", path.display());
+        }
+        let backup = self
+            .conn
+            .backup(rusqlite::MAIN_DB, path, None)
+            .with_context(|| format!("创建数据库备份失败：{}", path.display()));
+        if let Err(error) = backup {
+            remove_database_files(path);
+            return Err(error);
+        }
+        let check = match check_database_file(path) {
+            Ok(check) => check,
+            Err(error) => {
+                remove_database_files(path);
+                return Err(error);
+            }
+        };
+        remove_database_sidecars(path);
+        if !check.ok {
+            let _ = std::fs::remove_file(path);
+            bail!("备份校验失败：{}", check.details);
+        }
+        Ok(())
+    }
+
+    pub fn restore_from(&mut self, path: &Path) -> Result<()> {
+        let check = check_database_file(path)?;
+        if !check.ok {
+            bail!("拒绝恢复损坏的备份：{}", check.details);
+        }
+        self.conn
+            .restore(
+                rusqlite::MAIN_DB,
+                path,
+                None::<fn(rusqlite::backup::Progress)>,
+            )
+            .with_context(|| format!("恢复数据库失败：{}", path.display()))?;
+        self.conn.pragma_update(None, "foreign_keys", "ON")?;
+        migrate(&self.conn)?;
+        Ok(())
+    }
+
+    pub fn compact(&self) -> Result<CompactionReport> {
+        let before_bytes = self.disk_bytes();
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")
+            .context("压缩数据库失败")?;
+        Ok(CompactionReport {
+            before_bytes,
+            after_bytes: self.disk_bytes(),
+        })
+    }
+
+    pub fn disk_bytes(&self) -> u64 {
+        let Some(path) = self.path.as_deref() else {
+            return 0;
+        };
+        database_files(path)
+            .into_iter()
+            .filter_map(|path| std::fs::metadata(path).ok().map(|meta| meta.len()))
+            .sum()
+    }
+}
+
+fn database_files(path: &Path) -> [PathBuf; 3] {
+    let display = path.as_os_str().to_string_lossy();
+    [
+        path.to_path_buf(),
+        PathBuf::from(format!("{display}-wal")),
+        PathBuf::from(format!("{display}-shm")),
+    ]
+}
+
+fn remove_database_sidecars(path: &Path) {
+    for sidecar in database_files(path).into_iter().skip(1) {
+        let _ = std::fs::remove_file(sidecar);
+    }
+}
+
+fn remove_database_files(path: &Path) {
+    for file in database_files(path) {
+        let _ = std::fs::remove_file(file);
+    }
+}
+
+fn check_database_file(path: &Path) -> Result<DatabaseCheck> {
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("打开备份校验失败：{}", path.display()))?;
+    check_connection(&conn)
+}
+
+fn check_connection(conn: &Connection) -> Result<DatabaseCheck> {
+    let integrity = {
+        let mut stmt = conn.prepare("PRAGMA integrity_check")?;
+        stmt.query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let foreign_keys = {
+        let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
+        stmt.query_map([], |row| {
+            Ok(format!(
+                "{} row {} references {}",
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let ok =
+        integrity.len() == 1 && integrity[0].eq_ignore_ascii_case("ok") && foreign_keys.is_empty();
+    let details = if ok {
+        "完整性检查通过，未发现页损坏或外键异常".to_owned()
+    } else {
+        integrity
+            .into_iter()
+            .chain(foreign_keys)
+            .collect::<Vec<_>>()
+            .join("；")
+    };
+    Ok(DatabaseCheck { ok, details })
 }
 
 #[cfg(test)]
@@ -704,7 +1292,7 @@ mod tests {
     fn mem() -> Db {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA).unwrap();
-        Db { conn }
+        Db { conn, path: None }
     }
 
     fn art(id: &str) -> NewArticle {
@@ -1059,5 +1647,178 @@ mod tests {
             db.add_selection(article_id, "text", Some(5), Some(3), None, false, 0)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn full_text_search_covers_articles_clippings_excerpts_and_thoughts() {
+        let db = mem();
+        let cfg = Config::default();
+        let feed_id = db.add_feed("https://example.com/feed.xml", 0).unwrap();
+        let feed = db.get_feed(feed_id).unwrap();
+        let mut article = art("rust-architecture");
+        article.title = Some("Rust 架构笔记".into());
+        article.author = Some("Alice".into());
+        article.content = Some("<p>正文讨论分层设计和事件驱动。</p>".into());
+        db.record_success(&feed, 100, &cfg, None, &[article])
+            .unwrap();
+        let article_id = db.articles_for_feed(feed_id).unwrap()[0].id;
+        db.add_favorite_selection(article_id, "重要的领域模型摘录", None, None, 110)
+            .unwrap();
+        db.add_comment(
+            article_id,
+            "另一段正文",
+            None,
+            None,
+            "想到用状态机梳理流程",
+            120,
+        )
+        .unwrap();
+        let clipping_id = db
+            .save_web_clipping(
+                Some("https://example.com/guide"),
+                Some("离线网页指南"),
+                "<main>网页快照包含缓存策略</main>",
+                130,
+            )
+            .unwrap();
+
+        let article_hits = db.search_library("事件驱动", 20).unwrap();
+        assert_eq!(article_hits.len(), 1);
+        assert_eq!(article_hits[0].kind, SearchHitKind::Article);
+        assert_eq!(article_hits[0].article_id, article_id);
+
+        let clip_hits = db.search_library("缓存策略", 20).unwrap();
+        assert_eq!(clip_hits.len(), 1);
+        assert_eq!(clip_hits[0].kind, SearchHitKind::WebClipping);
+        assert_eq!(clip_hits[0].article_id, clipping_id);
+
+        let excerpt_hits = db.search_library("领域模型", 20).unwrap();
+        assert_eq!(excerpt_hits.len(), 1);
+        assert_eq!(excerpt_hits[0].kind, SearchHitKind::Excerpt);
+
+        let thought_hits = db.search_library("状态机", 20).unwrap();
+        assert_eq!(thought_hits.len(), 1);
+        assert_eq!(thought_hits[0].kind, SearchHitKind::Thought);
+    }
+
+    #[test]
+    fn full_text_search_handles_empty_queries_limits_and_archived_results() {
+        let db = mem();
+        let cfg = Config::default();
+        let feed_id = db.add_feed("https://example.com/feed.xml", 0).unwrap();
+        let feed = db.get_feed(feed_id).unwrap();
+        let mut first = art("first");
+        first.content = Some("shared keyword".into());
+        let mut second = art("second");
+        second.content = Some("shared keyword".into());
+        db.record_success(&feed, 100, &cfg, None, &[first, second])
+            .unwrap();
+        let archived_id = db
+            .articles_for_feed(feed_id)
+            .unwrap()
+            .into_iter()
+            .map(|article| article.id)
+            .max()
+            .unwrap();
+        db.set_article_archived(archived_id, true).unwrap();
+
+        assert!(db.search_library("   ", 20).unwrap().is_empty());
+        assert!(db.search_library("shared", 0).unwrap().is_empty());
+        assert_eq!(db.search_library("SHARED", 1).unwrap().len(), 1);
+        let hits = db.search_library("SHARED", 20).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(
+            hits.iter()
+                .any(|hit| hit.article_id == archived_id && hit.archived)
+        );
+    }
+
+    #[test]
+    fn tags_read_later_and_batch_actions_are_persistent() {
+        let db = mem();
+        let cfg = Config::default();
+        let feed_id = db.add_feed("https://example.com/feed.xml", 0).unwrap();
+        let feed = db.get_feed(feed_id).unwrap();
+        db.record_success(&feed, 100, &cfg, None, &[art("one"), art("two")])
+            .unwrap();
+        let articles = db.articles_for_feed(feed_id).unwrap();
+        let ids = articles
+            .iter()
+            .map(|article| article.id)
+            .collect::<Vec<_>>();
+
+        db.replace_article_tags(
+            ids[0],
+            &[" 架构 ".to_owned(), "Rust".to_owned(), "rust".to_owned()],
+            101,
+        )
+        .unwrap();
+        let tags = db.tags_for_article(ids[0]).unwrap();
+        assert_eq!(tags.len(), 2);
+        assert_eq!(db.search_library("架构", 20).unwrap()[0].article_id, ids[0]);
+
+        db.apply_article_batch(&ids, ArticleBatchAction::ReadLater)
+            .unwrap();
+        assert_eq!(db.read_later_count().unwrap(), 2);
+        db.apply_article_batch(&ids[..1], ArticleBatchAction::Bookmark)
+            .unwrap();
+        assert!(db.get_article(ids[0]).unwrap().starred);
+        db.apply_article_batch(&ids[1..], ArticleBatchAction::Archive)
+            .unwrap();
+        assert_eq!(db.read_later_articles().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn anchored_selection_and_search_history_round_trip() {
+        let db = mem();
+        let cfg = Config::default();
+        let feed_id = db.add_feed("https://example.com/feed.xml", 0).unwrap();
+        let feed = db.get_feed(feed_id).unwrap();
+        db.record_success(&feed, 100, &cfg, None, &[art("anchor")])
+            .unwrap();
+        let article_id = db.articles_for_feed(feed_id).unwrap()[0].id;
+        let anchor = TextAnchor {
+            start_offset: Some(3),
+            end_offset: Some(7),
+            prefix: "前文".to_owned(),
+            suffix: "后文".to_owned(),
+        };
+        let selection_id = db
+            .add_favorite_selection_with_anchor(article_id, "稳定锚点", &anchor, 120)
+            .unwrap();
+        let selection = db.get_selection(selection_id).unwrap();
+        assert_eq!(selection.anchor_prefix, "前文");
+        assert_eq!(selection.anchor_suffix, "后文");
+
+        assert_eq!(db.search_library("稳定锚点", 20).unwrap().len(), 1);
+        assert_eq!(db.search_library("稳定锚点", 20).unwrap().len(), 1);
+        let history = db.search_history(10).unwrap();
+        assert_eq!(history[0].query, "稳定锚点");
+        assert_eq!(history[0].use_count, 2);
+        assert_eq!(history[0].result_count, 1);
+    }
+
+    #[test]
+    fn file_database_can_be_checked_backed_up_and_compacted() {
+        let root = std::env::temp_dir().join(format!(
+            "shiyue-db-maintenance-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let live = root.join("live.db");
+        let backup = root.join("backup.db");
+        let db = Db::open(&live).unwrap();
+        db.add_feed("https://example.com/feed.xml", 1).unwrap();
+
+        let check = db.integrity_check().unwrap();
+        assert!(check.ok, "{}", check.details);
+        db.backup_to(&backup).unwrap();
+        assert!(backup.exists());
+        let report = db.compact().unwrap();
+        assert!(report.after_bytes > 0);
+
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

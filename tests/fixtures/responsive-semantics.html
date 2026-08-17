@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><title>响应式正文语义回归</title></head>
+<body>
+<main><article>
+  <h1>复杂正文结构</h1>
+  <figure>
+    <picture>
+      <source media="(min-width: 900px)" srcset="/media/hero-wide-900.webp 900w, /media/hero-wide-1600.webp 1600w">
+      <source type="image/avif" srcset="/media/hero-640.avif 640w, /media/hero-1200.avif 1200w">
+      <img src="/media/hero-fallback.jpg" srcset="/media/hero-480.jpg 480w, /media/hero-1280.jpg 1280w" alt="湖边的阅读空间">
+    </picture>
+    <figcaption>图 1：不同屏幕共用一条说明文字。</figcaption>
+  </figure>
+
+  <dl>
+    <dt>渐进增强</dt>
+    <dd>基础内容在任何客户端都可阅读。</dd>
+    <dd>支持新能力的客户端获得更丰富的呈现。</dd>
+    <dt>容错解析</dt>
+    <dd>面对不完整 HTML 时仍保留正文顺序。</dd>
+  </dl>
+
+  <table>
+    <thead>
+      <tr><th rowspan="2">阶段</th><th colspan="2">质量门槛</th></tr>
+      <tr><th>结构</th><th>视觉</th></tr>
+    </thead>
+    <tbody>
+      <tr><td rowspan="2">解析</td><td>图片与图注</td><td>正文顺序</td></tr>
+      <tr><td colspan="2">跨行、跨列表格保持逻辑列</td></tr>
+    </tbody>
+  </table>
+</article></main>
+</body>
+</html>

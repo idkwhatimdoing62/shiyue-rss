@@ -7,6 +7,7 @@
 /*.exe
 /*.png
 /dist/
+/.codex-build/
 
 # Local runtime data and logs (the app normally stores these in AppData).
 *.db

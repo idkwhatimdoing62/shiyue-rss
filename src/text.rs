@@ -10,11 +10,41 @@ pub struct InlineLinkRange {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineTextRange {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// One semantic table cell. Spans are retained instead of flattening the
+/// source table, so the renderer can reserve the same logical columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableCell {
+    pub text: String,
+    pub row_span: usize,
+    pub col_span: usize,
+    pub header: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefinitionItem {
+    pub term: String,
+    pub definitions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Block {
     Text(String),
     Strong(String),
+    /// Inline HTML `<code>` that remains part of the surrounding sentence.
+    /// The renderer gives it a compact monospace treatment without turning it
+    /// into a separate paragraph.
+    InlineCode(String),
     /// HTML `h1`–`h6` 标题；与正文中的行内加粗分开保留。
     Heading(String),
+    HeadingWithInlineCode {
+        text: String,
+        inline_code_ranges: Vec<InlineTextRange>,
+    },
     /// A heading whose visible text is also an anchor. Keeping this separate
     /// lets index/guide pages retain both their card hierarchy and navigation.
     HeadingLink {
@@ -24,8 +54,14 @@ pub enum Block {
     /// HTML `blockquote` 引用块。块内的行内标签会被折叠为可读文本，
     /// 但引用边界会保留给渲染层。
     Quote(String),
-    /// HTML `pre` / `code` 代码块。实体会被解码，换行和行首缩进会保留。
+    /// 没有语言提示的 HTML `pre` / `code` 代码块。
     Code(String),
+    /// 带语言提示的代码块。语言来自 `class="language-rust"`、
+    /// `class="lang-js"` 或 `data-language` 等常见标记。
+    CodeBlock {
+        text: String,
+        language: String,
+    },
     /// 带有原始目标地址的 HTML 链接。
     Link {
         /// Text that appears before the anchor in the same HTML paragraph.
@@ -50,17 +86,40 @@ pub enum Block {
     },
     /// 绝对图片 URL（已按文章 base 补全）。
     Image(String),
+    /// 图片位于链接中。保留图片目标与点击地址，尤其用于专题页的图片标题卡片。
+    LinkedImage {
+        uri: String,
+        url: String,
+        alt: Option<String>,
+    },
+    /// Text attached to the image immediately before it by `<figcaption>`.
+    Caption(String),
+    /// HTML definition list, retaining the term/definition relationship.
+    DefinitionList(Vec<DefinitionItem>),
+    /// HTML 表格的可读投影。`header_rows` 表示从头开始有多少行含 `<th>`。
+    Table {
+        rows: Vec<Vec<TableCell>>,
+        header_rows: usize,
+        column_count: usize,
+    },
+    /// MathML、KaTeX/MathJax 容器或 `math/tex` script 中保留下来的公式源码。
+    Math {
+        source: String,
+        display: bool,
+    },
 }
 
 const BLOCK_TAGS: &[&str] = &["p", "br", "div", "li", "tr"];
+const HEADING_INLINE_CODE_START: char = '\u{e000}';
+const HEADING_INLINE_CODE_END: char = '\u{e001}';
 
 /// Elements that belong to the surrounding web application rather than to
 /// the article a reader wants to keep.  Filtering these here also protects
 /// ordinary RSS entries whose payload happens to contain a complete HTML
 /// document instead of an article fragment.
 const IGNORED_ELEMENTS: &[&str] = &[
-    "head", "script", "style", "noscript", "svg", "nav", "header", "footer", "aside", "form",
-    "iframe",
+    "head", "title", "base", "meta", "link", "script", "style", "noscript", "svg", "nav", "header",
+    "footer", "aside", "form", "iframe",
 ];
 
 /// The useful parts extracted from a complete HTML document before it is
@@ -81,6 +140,33 @@ struct LinkState {
     text: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletePageKind {
+    SingleArticle,
+    IndexOrDocument,
+}
+
+struct Html5ReadingScope {
+    content: String,
+    kind: CompletePageKind,
+}
+
+#[derive(Default)]
+struct SemanticProfile {
+    text_chars: usize,
+    images: usize,
+    figures: usize,
+    captions: usize,
+    definitions: usize,
+    tables: usize,
+    table_cells: usize,
+    spanning_cells: usize,
+    lists: usize,
+    links: usize,
+    code_blocks: usize,
+    math_nodes: usize,
+}
+
 /// Prepare a complete web page for local storage and later rendering.
 ///
 /// The page's `<main>`, then `<body>`, and finally the full input determines
@@ -91,18 +177,19 @@ struct LinkState {
 pub fn prepare_html_snapshot(html: &str) -> HtmlSnapshot {
     let title = extract_html_title(html);
     let base_href = extract_html_base_href(html);
-    let cleaned = strip_ignored_elements(html);
-    let broad_scope = ["main", "body"]
-        .into_iter()
-        .find_map(|name| largest_element_inner(&cleaned, name))
-        .unwrap_or(cleaned.as_str());
-    let articles = element_bounds(broad_scope, "article");
-    let readable = if let [article] = articles.as_slice() {
-        &broad_scope[article.inner_start..article.inner_end]
-    } else {
-        broad_scope
+    let scope = html5_reading_scope(html);
+    let scoped_content = strip_ignored_elements(&scope.content);
+    let readable = match scope.kind {
+        CompletePageKind::SingleArticle => {
+            guarded_readability_content(html, base_href.as_deref(), &scoped_content)
+                .unwrap_or(scoped_content)
+        }
+        // Readability is designed to pick one dominant article. An index or
+        // guide page intentionally contains several useful cards, so it must
+        // retain the HTML5 DOM scope instead of competing for a single winner.
+        CompletePageKind::IndexOrDocument => scoped_content,
     };
-    let readable = remove_duplicate_leading_h1(readable, title.as_deref());
+    let readable = remove_duplicate_leading_h1(&readable, title.as_deref());
 
     HtmlSnapshot {
         title,
@@ -111,28 +198,166 @@ pub fn prepare_html_snapshot(html: &str) -> HtmlSnapshot {
     }
 }
 
-/// Extract a human-facing page title without retaining any HTML markup.
-pub fn extract_html_title(html: &str) -> Option<String> {
-    let mut cursor = 0;
-    while let Some(tag) = find_tag_token(html, "meta", cursor, false) {
-        let source = &html[tag.start..tag.end];
-        let kind = attr(source, "property").or_else(|| attr(source, "name"));
-        if kind
-            .as_deref()
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case("og:title"))
-        {
-            if let Some(title) = attr(source, "content").and_then(clean_title) {
-                return Some(title);
-            }
-        }
-        cursor = tag.end;
+/// Select the broad reading scope with a browser-grade HTML5 parser.
+///
+/// This is deliberately only called by `prepare_html_snapshot`: RSS payloads
+/// continue to enter `content_blocks` as fragments and never pass through
+/// Readability. A single `<article>` is a safe candidate for Readability;
+/// zero or multiple articles are treated as a document/index and kept whole.
+fn html5_reading_scope(html: &str) -> Html5ReadingScope {
+    use scraper::{ElementRef, Html, Selector};
+
+    fn largest<'a>(elements: impl Iterator<Item = ElementRef<'a>>) -> Option<ElementRef<'a>> {
+        elements.max_by_key(|element| {
+            element.text().map(str::len).sum::<usize>() + element.inner_html().len() / 8
+        })
     }
 
-    for name in ["title", "h1"] {
-        if let Some(fragment) = largest_element_inner(html, name) {
-            if let Some(title) = clean_title(fragment.to_owned()) {
-                return Some(title);
-            }
+    let document = Html::parse_document(html);
+    let main = Selector::parse("main").expect("static selector is valid");
+    let body = Selector::parse("body").expect("static selector is valid");
+    let article = Selector::parse("article").expect("static selector is valid");
+    let broad = largest(document.select(&main)).or_else(|| largest(document.select(&body)));
+
+    let Some(broad) = broad else {
+        return Html5ReadingScope {
+            content: html.to_owned(),
+            kind: CompletePageKind::IndexOrDocument,
+        };
+    };
+    let mut articles = broad.select(&article);
+    let first = articles.next();
+    let second = articles.next();
+    match (first, second) {
+        (Some(article), None) => Html5ReadingScope {
+            content: article.inner_html(),
+            kind: CompletePageKind::SingleArticle,
+        },
+        _ => Html5ReadingScope {
+            content: broad.inner_html(),
+            kind: CompletePageKind::IndexOrDocument,
+        },
+    }
+}
+
+/// Readability is an optional selector behind a strict semantic gate. It is
+/// accepted only when it keeps the text and every structure that Shiyue knows
+/// how to render. Otherwise the repaired HTML5 DOM scope remains authoritative.
+fn guarded_readability_content(
+    complete_html: &str,
+    base_url: Option<&str>,
+    html5_scope: &str,
+) -> Option<String> {
+    let mut readability = dom_smoothie::Readability::new(
+        complete_html,
+        base_url,
+        Some(dom_smoothie::Config {
+            char_threshold: 0,
+            ..Default::default()
+        }),
+    )
+    .ok()?;
+    let article = readability.parse().ok()?;
+    let candidate = strip_ignored_elements(article.content.as_ref());
+    readability_candidate_is_safe(html5_scope, &candidate).then_some(candidate)
+}
+
+fn readability_candidate_is_safe(source: &str, candidate: &str) -> bool {
+    let source_text = normalized_dom_text(source);
+    let candidate_text = normalized_dom_text(candidate);
+    let source = semantic_profile(source);
+    let candidate = semantic_profile(candidate);
+    let allowed_extra_text = (source.text_chars / 10).max(8);
+    if source.text_chars == 0
+        || candidate.text_chars * 4 < source.text_chars * 3
+        || candidate.text_chars > source.text_chars + allowed_extra_text
+        || !candidate_text.contains(&source_text)
+    {
+        return false;
+    }
+
+    candidate.images >= source.images
+        && candidate.figures >= source.figures
+        && candidate.captions >= source.captions
+        && candidate.definitions >= source.definitions
+        && candidate.tables >= source.tables
+        && candidate.table_cells >= source.table_cells
+        && candidate.spanning_cells >= source.spanning_cells
+        && candidate.lists >= source.lists
+        && candidate.links >= source.links
+        && candidate.code_blocks >= source.code_blocks
+        && candidate.math_nodes >= source.math_nodes
+}
+
+fn normalized_dom_text(html: &str) -> String {
+    scraper::Html::parse_fragment(html)
+        .root_element()
+        .text()
+        .flat_map(str::chars)
+        .filter(|ch| !ch.is_whitespace())
+        .collect()
+}
+
+fn semantic_profile(html: &str) -> SemanticProfile {
+    use scraper::{Html, Selector};
+
+    fn count(document: &Html, selector: &str) -> usize {
+        document
+            .select(&Selector::parse(selector).expect("static selector is valid"))
+            .count()
+    }
+
+    let document = Html::parse_fragment(html);
+    let text_chars = normalized_dom_text(html).chars().count();
+    SemanticProfile {
+        text_chars,
+        images: count(&document, "img"),
+        figures: count(&document, "figure"),
+        captions: count(&document, "figcaption"),
+        definitions: count(&document, "dl, dt, dd"),
+        tables: count(&document, "table"),
+        table_cells: count(&document, "th, td"),
+        spanning_cells: count(
+            &document,
+            "th[rowspan], th[colspan], td[rowspan], td[colspan]",
+        ),
+        lists: count(&document, "ol, ul, li"),
+        links: count(&document, "a[href]"),
+        code_blocks: count(&document, "pre, code"),
+        math_nodes: count(&document, "math, script[type^='math/tex']"),
+    }
+}
+
+/// Extract a human-facing page title without retaining any HTML markup.
+pub fn extract_html_title(html: &str) -> Option<String> {
+    use scraper::{Html, Selector};
+
+    let document = Html::parse_document(html);
+    let metadata =
+        Selector::parse("meta[property], meta[name]").expect("static metadata selector is valid");
+    for element in document.select(&metadata) {
+        let kind = element
+            .value()
+            .attr("property")
+            .or_else(|| element.value().attr("name"));
+        if kind.is_some_and(|value| value.trim().eq_ignore_ascii_case("og:title"))
+            && let Some(title) = element
+                .value()
+                .attr("content")
+                .and_then(|value| clean_title(value.to_owned()))
+        {
+            return Some(title);
+        }
+    }
+
+    for selector in ["title", "h1"] {
+        let selector = Selector::parse(selector).expect("static title selector is valid");
+        if let Some(title) = document
+            .select(&selector)
+            .filter_map(|element| clean_title(element.text().collect::<String>()))
+            .max_by_key(String::len)
+        {
+            return Some(title);
         }
     }
     None
@@ -140,9 +365,16 @@ pub fn extract_html_title(html: &str) -> Option<String> {
 
 /// Read the first declared `<base href>` from a complete HTML document.
 pub fn extract_html_base_href(html: &str) -> Option<String> {
-    let tag = find_tag_token(html, "base", 0, false)?;
-    let href = decode_entities(&attr(&html[tag.start..tag.end], "href")?);
-    let href = href.trim();
+    use scraper::{Html, Selector};
+
+    let document = Html::parse_document(html);
+    let selector = Selector::parse("base[href]").expect("static base selector is valid");
+    let href = document
+        .select(&selector)
+        .next()?
+        .value()
+        .attr("href")?
+        .trim();
     (!href.is_empty()).then(|| href.to_owned())
 }
 
@@ -226,111 +458,171 @@ fn strip_all_tags(html: &str) -> String {
 }
 
 fn strip_ignored_elements(html: &str) -> String {
-    let mut ranges = Vec::new();
-    for name in IGNORED_ELEMENTS {
-        ranges.extend(element_ranges(html, name));
-    }
-    ranges.extend(comment_ranges(html));
-    if ranges.is_empty() {
-        return html.to_owned();
-    }
+    use scraper::{Html, Selector};
 
-    ranges.sort_unstable_by_key(|range| range.0);
-    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for (start, end) in ranges {
-        if let Some(previous) = merged.last_mut()
-            && start <= previous.1
-        {
-            previous.1 = previous.1.max(end);
-        } else {
-            merged.push((start, end));
+    let mut document = Html::parse_fragment(html);
+    let all = Selector::parse("*").expect("static universal selector is valid");
+    let removable = document
+        .select(&all)
+        .filter(|element| {
+            let name = element.value().name();
+            IGNORED_ELEMENTS.contains(&name)
+                && !(name == "script" && is_math_script_element(element.value()))
+        })
+        .map(|element| element.id())
+        .chain(
+            document
+                .tree
+                .nodes()
+                .filter(|node| node.value().is_comment())
+                .map(|node| node.id()),
+        )
+        .collect::<Vec<_>>();
+
+    for id in removable {
+        if let Some(mut node) = document.tree.get_mut(id) {
+            node.detach();
         }
     }
-
-    let mut output = String::with_capacity(html.len());
-    let mut cursor = 0;
-    for (start, end) in merged {
-        if start > cursor {
-            output.push_str(&html[cursor..start]);
-        }
-        cursor = cursor.max(end);
-    }
-    output.push_str(&html[cursor..]);
-    output
+    document.root_element().inner_html()
 }
 
-fn element_ranges(html: &str, name: &str) -> Vec<(usize, usize)> {
-    // Script and style are raw-text elements in HTML: text such as
-    // `const sample = "<script>"` must not be mistaken for a nested element,
-    // or the filter would consume the remainder of the article.
-    if matches!(name, "script" | "style") {
-        return raw_text_element_ranges(html, name);
-    }
-    let mut ranges = Vec::new();
-    let mut stack = Vec::new();
-    let mut cursor = 0;
-    while let Some(token) = next_named_tag(html, name, cursor) {
-        cursor = token.end;
-        if token.closing {
-            if let Some(start) = stack.pop()
-                && stack.is_empty()
-            {
-                ranges.push((start, token.end));
-            }
-        } else if token.self_closing {
-            if stack.is_empty() {
-                ranges.push((token.start, token.end));
-            }
-        } else {
-            stack.push(token.start);
-        }
-    }
-    if let Some(start) = stack.first().copied() {
-        ranges.push((start, html.len()));
-    }
-    ranges
-}
+fn normalize_responsive_pictures(html: &str) -> String {
+    use scraper::{ElementRef, Html, Node, Selector};
 
-fn raw_text_element_ranges(html: &str, name: &str) -> Vec<(usize, usize)> {
-    let mut ranges = Vec::new();
-    let mut cursor = 0;
-    while let Some(open) = find_tag_token(html, name, cursor, false) {
-        if open.self_closing {
-            ranges.push((open.start, open.end));
-            cursor = open.end;
+    let mut document = Html::parse_fragment(html);
+    let pictures = Selector::parse("picture").expect("static picture selector is valid");
+    let images = Selector::parse("img").expect("static image selector is valid");
+    let sources = Selector::parse("source").expect("static source selector is valid");
+    let picture_ids = document
+        .select(&pictures)
+        .map(|picture| picture.id())
+        .collect::<Vec<_>>();
+
+    for picture_id in picture_ids {
+        let Some(picture_node) = document.tree.get(picture_id) else {
             continue;
-        }
-        if let Some(close) = find_tag_token(html, name, open.end, true) {
-            ranges.push((open.start, close.end));
-            cursor = close.end;
+        };
+        let Some(picture) = ElementRef::wrap(picture_node) else {
+            continue;
+        };
+        let image_nodes = picture
+            .select(&images)
+            .filter(|image| dom_image_src(image.value()).is_some())
+            .map(|image| {
+                (
+                    image.id(),
+                    image.value().attr("srcset").is_some()
+                        || image.value().attr("data-srcset").is_some(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let source_nodes = picture
+            .select(&sources)
+            .filter_map(|source| dom_image_src(source.value()).map(|url| (source.id(), url)))
+            .collect::<Vec<_>>();
+        let responsive_image = image_nodes
+            .iter()
+            .find_map(|(id, responsive)| responsive.then_some(*id));
+        let fallback_image = image_nodes.first().map(|(id, _)| *id);
+        let selected_source = source_nodes.last().cloned();
+
+        let (kept, source_replacement) = if let Some(id) = responsive_image {
+            (Some(id), None)
+        } else if let Some((source_id, ref url)) = selected_source {
+            if let Some(image_id) = fallback_image {
+                (Some(image_id), Some((image_id, url.clone())))
+            } else {
+                (Some(source_id), None)
+            }
         } else {
-            ranges.push((open.start, html.len()));
-            break;
+            (fallback_image, None)
+        };
+
+        if let Some((image_id, url)) = source_replacement
+            && let Some(mut node) = document.tree.get_mut(image_id)
+            && let Node::Element(element) = node.value()
+        {
+            set_existing_dom_image_url(element, &url);
+        }
+        if let Some((source_id, _)) = selected_source
+            && kept == Some(source_id)
+            && let Some(mut node) = document.tree.get_mut(source_id)
+            && let Node::Element(element) = node.value()
+        {
+            element.name.local = "img".into();
+        }
+
+        for id in image_nodes
+            .into_iter()
+            .map(|(id, _)| id)
+            .chain(source_nodes.into_iter().map(|(id, _)| id))
+        {
+            if Some(id) != kept
+                && let Some(mut node) = document.tree.get_mut(id)
+            {
+                node.detach();
+            }
         }
     }
-    ranges
+
+    document.root_element().inner_html()
 }
 
-fn comment_ranges(html: &str) -> Vec<(usize, usize)> {
-    let mut ranges = Vec::new();
-    let mut cursor = 0;
-    while let Some(relative) = html[cursor..].find("<!--") {
-        let start = cursor + relative;
-        let end = html[start + 4..]
-            .find("-->")
-            .map(|relative| start + 4 + relative + 3)
-            .unwrap_or(html.len());
-        ranges.push((start, end));
-        cursor = end;
+fn is_math_script_tag(tag: &str) -> bool {
+    attr(tag, "type").is_some_and(|value| value.trim().to_ascii_lowercase().starts_with("math/tex"))
+}
+
+fn is_math_script_element(element: &scraper::node::Element) -> bool {
+    element
+        .attr("type")
+        .is_some_and(|value| value.trim().to_ascii_lowercase().starts_with("math/tex"))
+}
+
+fn dom_image_src(element: &scraper::node::Element) -> Option<String> {
+    for name in [
+        "data-original",
+        "data-lazy-src",
+        "data-src",
+        "data-url",
+        "data-image",
+    ] {
+        if let Some(value) = element.attr(name).filter(|value| usable_image_url(value)) {
+            return Some(value.to_owned());
+        }
     }
-    ranges
+    for name in ["data-srcset", "srcset"] {
+        if let Some(value) = element.attr(name)
+            && let Some(candidate) = srcset_largest(value)
+        {
+            return Some(candidate);
+        }
+    }
+    element
+        .attr("src")
+        .filter(|value| usable_image_url(value))
+        .map(str::to_owned)
 }
 
-fn largest_element_inner<'a>(html: &'a str, name: &str) -> Option<&'a str> {
-    element_bounds(html, name)
-        .into_iter()
-        .max_by_key(|bounds| bounds.inner_end.saturating_sub(bounds.inner_start))
-        .map(|bounds| &html[bounds.inner_start..bounds.inner_end])
+fn set_existing_dom_image_url(element: &mut scraper::node::Element, url: &str) -> bool {
+    for attribute in [
+        "data-original",
+        "data-lazy-src",
+        "data-src",
+        "data-url",
+        "data-image",
+        "src",
+    ] {
+        if let Some((_, value)) = element
+            .attrs
+            .iter_mut()
+            .find(|(name, _)| name.local.as_ref() == attribute)
+        {
+            *value = url.into();
+            return true;
+        }
+    }
+    false
 }
 
 fn element_bounds(html: &str, name: &str) -> Vec<HtmlElementBounds> {
@@ -362,17 +654,6 @@ fn element_bounds(html: &str, name: &str) -> Vec<HtmlElementBounds> {
     }
     candidates.sort_unstable_by_key(|bounds| bounds.outer_start);
     candidates
-}
-
-fn find_tag_token(html: &str, name: &str, from: usize, closing: bool) -> Option<HtmlTagToken> {
-    let mut cursor = from;
-    while let Some(token) = next_named_tag(html, name, cursor) {
-        if token.closing == closing {
-            return Some(token);
-        }
-        cursor = token.end;
-    }
-    None
 }
 
 fn next_named_tag(html: &str, name: &str, from: usize) -> Option<HtmlTagToken> {
@@ -436,18 +717,36 @@ pub fn content_blocks(html: &str, base: Option<&str>) -> Vec<Block> {
         .and_then(|href| resolve(href, base).or_else(|| Some(href.to_owned())))
         .or_else(|| base.map(str::to_owned));
     let filtered_html = strip_ignored_elements(html);
-    let html = filtered_html.as_str();
+    // A `<picture>` can contain several `<source>` candidates followed by an
+    // `<img>` fallback. Normalizing it to one chosen `<img>` prevents the old
+    // streaming parser from rendering every candidate as a duplicate image.
+    let responsive_html = normalize_responsive_pictures(&filtered_html);
+    let html = responsive_html.as_str();
     let base = effective_base.as_deref();
     let mut blocks = Vec::new();
     let mut buf = String::new();
     let mut strong = false;
     let mut heading = false;
     let mut heading_link_block = None;
-    let mut list_item_depth = 0usize;
+    let mut list_depth = 0usize;
+    let mut list_item_depths = Vec::new();
     let mut quote_depth = 0usize;
     let mut quote_buf = String::new();
     let mut code_depth = 0usize;
     let mut code_buf = String::new();
+    let mut code_language = None;
+    let mut inline_code_depth = 0usize;
+    let mut inline_code_buf = String::new();
+    let mut inline_code_in_heading = false;
+    let mut table_depth = 0usize;
+    let mut table_buf = String::new();
+    let mut definition_depth = 0usize;
+    let mut definition_buf = String::new();
+    let mut caption_depth = 0usize;
+    let mut caption_buf = String::new();
+    let mut math_container: Option<(String, usize, bool)> = None;
+    let mut math_buf = String::new();
+    let mut sup_depth = 0usize;
     let mut link: Option<LinkState> = None;
     let mut pending_link_boundary: Option<(usize, bool)> = None;
     let mut seen_images = std::collections::HashSet::new();
@@ -469,6 +768,124 @@ pub fn content_blocks(html: &str, base: Option<&str>) -> Vec<Block> {
                 .to_ascii_lowercase();
             let closing = tag.trim_start().starts_with('/');
 
+            if definition_depth > 0 {
+                if name == "dl" {
+                    if closing {
+                        definition_depth = definition_depth.saturating_sub(1);
+                        if definition_depth == 0 {
+                            flush_definition_list(&mut definition_buf, &mut blocks);
+                        } else {
+                            definition_buf.push_str(&format!("<{tag}>"));
+                        }
+                    } else {
+                        definition_depth += 1;
+                        definition_buf.push_str(&format!("<{tag}>"));
+                    }
+                } else {
+                    definition_buf.push_str(&format!("<{tag}>"));
+                }
+                continue;
+            }
+
+            if caption_depth > 0 {
+                if name == "figcaption" {
+                    if closing {
+                        caption_depth = caption_depth.saturating_sub(1);
+                        if caption_depth == 0 {
+                            flush_caption(&mut caption_buf, &mut blocks);
+                        } else {
+                            caption_buf.push_str(&format!("<{tag}>"));
+                        }
+                    } else {
+                        caption_depth += 1;
+                        caption_buf.push_str(&format!("<{tag}>"));
+                    }
+                } else {
+                    caption_buf.push_str(&format!("<{tag}>"));
+                }
+                continue;
+            }
+
+            if table_depth > 0 {
+                if name == "table" {
+                    if closing {
+                        table_depth = table_depth.saturating_sub(1);
+                        if table_depth == 0 {
+                            flush_table(&mut table_buf, &mut blocks);
+                        } else {
+                            table_buf.push_str(&format!("<{tag}>"));
+                        }
+                    } else {
+                        table_depth += 1;
+                        table_buf.push_str(&format!("<{tag}>"));
+                    }
+                } else {
+                    table_buf.push_str(&format!("<{tag}>"));
+                }
+                continue;
+            }
+
+            if let Some((container_name, depth, display)) = math_container.as_mut() {
+                if name == *container_name {
+                    if closing {
+                        *depth = depth.saturating_sub(1);
+                        if *depth == 0 {
+                            let display = *display;
+                            math_container = None;
+                            flush_math(&mut math_buf, &mut blocks, display);
+                        } else {
+                            math_buf.push_str(&format!("<{tag}>"));
+                        }
+                    } else {
+                        *depth += 1;
+                        math_buf.push_str(&format!("<{tag}>"));
+                    }
+                } else {
+                    math_buf.push_str(&format!("<{tag}>"));
+                }
+                continue;
+            }
+
+            if name == "table" && !closing {
+                if let Some(state) = link.take() {
+                    finish_link(state, &mut buf, &mut blocks);
+                }
+                flush_text_kind(&mut buf, &mut blocks, strong, heading);
+                table_depth = 1;
+                table_buf.clear();
+                continue;
+            }
+
+            if name == "dl" && !closing {
+                if let Some(state) = link.take() {
+                    finish_link(state, &mut buf, &mut blocks);
+                }
+                flush_text_kind(&mut buf, &mut blocks, strong, heading);
+                definition_depth = 1;
+                definition_buf.clear();
+                continue;
+            }
+
+            if name == "figcaption" && !closing {
+                if let Some(state) = link.take() {
+                    finish_link(state, &mut buf, &mut blocks);
+                }
+                flush_text_kind(&mut buf, &mut blocks, strong, heading);
+                caption_depth = 1;
+                caption_buf.clear();
+                continue;
+            }
+
+            if !closing && let Some(display) = math_tag_display(&name, &tag) {
+                if let Some(state) = link.take() {
+                    finish_link(state, &mut buf, &mut blocks);
+                }
+                flush_text_kind(&mut buf, &mut blocks, strong, heading);
+                math_container = Some((name.clone(), 1, display));
+                math_buf.clear();
+                continue;
+            }
+
             if pending_link_boundary.is_some() && inline_flow_boundary(&name) {
                 pending_link_boundary = None;
             }
@@ -482,13 +899,37 @@ pub fn content_blocks(html: &str, base: Option<&str>) -> Vec<Block> {
                     if closing {
                         code_depth = code_depth.saturating_sub(1);
                         if code_depth == 0 {
-                            flush_code(&mut code_buf, &mut blocks);
+                            flush_code(&mut code_buf, &mut code_language, &mut blocks);
                         }
                     } else {
+                        if code_language.is_none() {
+                            code_language = code_language_from_tag(&tag);
+                        }
                         code_depth += 1;
                     }
                 } else if name == "br" && !closing {
                     code_buf.push('\n');
+                }
+                continue;
+            }
+
+            if inline_code_depth > 0 {
+                if name == "code" {
+                    if closing {
+                        inline_code_depth = inline_code_depth.saturating_sub(1);
+                        if inline_code_depth == 0 {
+                            if inline_code_in_heading {
+                                append_inline_code_to_heading(&mut inline_code_buf, &mut buf);
+                                inline_code_in_heading = false;
+                            } else {
+                                flush_inline_code(&mut inline_code_buf, &mut blocks);
+                            }
+                        }
+                    } else {
+                        inline_code_depth += 1;
+                    }
+                } else if name == "br" && !closing {
+                    inline_code_buf.push(' ');
                 }
                 continue;
             }
@@ -540,18 +981,34 @@ pub fn content_blocks(html: &str, base: Option<&str>) -> Vec<Block> {
                 continue;
             }
 
-            if (name == "pre" || name == "code") && !closing {
+            if name == "pre" && !closing {
                 if let Some(state) = link.take() {
                     finish_link(state, &mut buf, &mut blocks);
                 }
                 flush_text_kind(&mut buf, &mut blocks, strong, heading);
+                code_language = code_language_from_tag(&tag);
                 code_depth = 1;
+                continue;
+            }
+
+            if name == "sup" {
+                if closing {
+                    sup_depth = sup_depth.saturating_sub(1);
+                } else {
+                    sup_depth += 1;
+                }
                 continue;
             }
 
             if name == "a" {
                 if closing {
-                    if let Some(state) = link.take() {
+                    if let Some(mut state) = link.take() {
+                        if sup_depth > 0 && is_footnote_target(&state.url) {
+                            let text = clean_text(&state.text);
+                            if !text.is_empty() && !text.starts_with('[') {
+                                state.text = format!("[{text}]");
+                            }
+                        }
                         if heading {
                             heading_link_block = finish_heading_link(
                                 state,
@@ -583,13 +1040,41 @@ pub fn content_blocks(html: &str, base: Option<&str>) -> Vec<Block> {
                 continue;
             }
             if name == "img" || name == "source" {
-                if let Some(state) = link.as_mut() {
-                    flush_link_fragment(state, &mut buf, &mut blocks);
-                }
                 if let Some(src) = image_src(&tag).and_then(|s| resolve(&s, base)) {
+                    let linked = link.as_ref().map(|state| state.url.clone());
+                    if let Some(state) = link.take() {
+                        let url = state.url.clone();
+                        if heading {
+                            heading_link_block = finish_heading_link(
+                                state,
+                                heading_link_block,
+                                &mut buf,
+                                &mut blocks,
+                            );
+                        } else {
+                            finish_link(state, &mut buf, &mut blocks);
+                        }
+                        // Keep collecting any visible text that follows the image
+                        // before the same closing anchor.
+                        link = Some(LinkState {
+                            url,
+                            prefix: String::new(),
+                            text: String::new(),
+                        });
+                    }
                     flush_text_kind(&mut buf, &mut blocks, strong, heading);
                     if seen_images.insert(src.clone()) {
-                        blocks.push(Block::Image(src));
+                        let alt = attr(&tag, "alt")
+                            .map(|value| clean_text(&value))
+                            .filter(|value| !value.is_empty());
+                        if let Some(url) = linked {
+                            blocks.push(Block::LinkedImage { uri: src, url, alt });
+                            if heading {
+                                heading_link_block = None;
+                            }
+                        } else {
+                            blocks.push(Block::Image(src));
+                        }
                     }
                 }
                 continue;
@@ -601,6 +1086,15 @@ pub fn content_blocks(html: &str, base: Option<&str>) -> Vec<Block> {
                 if name == "br" && !closing {
                     state.text.push('\n');
                 }
+                continue;
+            }
+            if name == "code" && !closing {
+                if !heading {
+                    flush_text_kind(&mut buf, &mut blocks, strong, false);
+                }
+                inline_code_depth = 1;
+                inline_code_buf.clear();
+                inline_code_in_heading = heading;
                 continue;
             }
             if is_html_heading_tag(&name) {
@@ -627,22 +1121,26 @@ pub fn content_blocks(html: &str, base: Option<&str>) -> Vec<Block> {
                 }
                 continue;
             }
+            if matches!(name.as_str(), "ul" | "ol") {
+                if closing {
+                    list_depth = list_depth.saturating_sub(1);
+                } else {
+                    list_depth += 1;
+                }
+                continue;
+            }
             if BLOCK_TAGS.contains(&name.as_str()) {
                 if name == "li" && !closing {
-                    if list_item_depth > 0 {
+                    if !list_item_depths.is_empty() {
                         flush_text_kind(&mut buf, &mut blocks, strong, heading);
                     }
-                    list_item_depth += 1;
-                    blocks.push(Block::ListItemStart {
-                        depth: list_item_depth,
-                    });
+                    let depth = list_depth.max(1);
+                    list_item_depths.push(depth);
+                    blocks.push(Block::ListItemStart { depth });
                 } else if name == "li" && closing {
                     flush_text_kind(&mut buf, &mut blocks, strong, heading);
-                    if list_item_depth > 0 {
-                        blocks.push(Block::ListItemEnd {
-                            depth: list_item_depth,
-                        });
-                        list_item_depth -= 1;
+                    if let Some(depth) = list_item_depths.pop() {
+                        blocks.push(Block::ListItemEnd { depth });
                     }
                 } else if closing {
                     flush_text_kind(&mut buf, &mut blocks, strong, heading);
@@ -651,6 +1149,26 @@ pub fn content_blocks(html: &str, base: Option<&str>) -> Vec<Block> {
                 }
             }
         } else {
+            if table_depth > 0 {
+                table_buf.push(c);
+                continue;
+            }
+            if definition_depth > 0 {
+                definition_buf.push(c);
+                continue;
+            }
+            if caption_depth > 0 {
+                caption_buf.push(c);
+                continue;
+            }
+            if math_container.is_some() {
+                math_buf.push(c);
+                continue;
+            }
+            if inline_code_depth > 0 {
+                inline_code_buf.push(c);
+                continue;
+            }
             if let Some((block_index, saw_space)) = pending_link_boundary.as_mut() {
                 if c.is_whitespace() || (c == '&' && consume_whitespace_entity(&mut chars)) {
                     *saw_space = true;
@@ -670,7 +1188,7 @@ pub fn content_blocks(html: &str, base: Option<&str>) -> Vec<Block> {
             } else if let Some(state) = link.as_mut() {
                 state.text.push(c);
             } else {
-                if list_item_depth > 0 && c.is_whitespace() {
+                if !list_item_depths.is_empty() && c.is_whitespace() {
                     if !buf.is_empty() && !buf.ends_with(char::is_whitespace) {
                         buf.push(' ');
                     }
@@ -687,14 +1205,30 @@ pub fn content_blocks(html: &str, base: Option<&str>) -> Vec<Block> {
         flush_quote(&mut quote_buf, &mut blocks);
     }
     if code_depth > 0 {
-        flush_code(&mut code_buf, &mut blocks);
+        flush_code(&mut code_buf, &mut code_language, &mut blocks);
+    }
+    if inline_code_depth > 0 {
+        if inline_code_in_heading {
+            append_inline_code_to_heading(&mut inline_code_buf, &mut buf);
+        } else {
+            flush_inline_code(&mut inline_code_buf, &mut blocks);
+        }
+    }
+    if table_depth > 0 {
+        flush_table(&mut table_buf, &mut blocks);
+    }
+    if definition_depth > 0 {
+        flush_definition_list(&mut definition_buf, &mut blocks);
+    }
+    if caption_depth > 0 {
+        flush_caption(&mut caption_buf, &mut blocks);
+    }
+    if let Some((_, _, display)) = math_container.take() {
+        flush_math(&mut math_buf, &mut blocks, display);
     }
     flush_text_kind(&mut buf, &mut blocks, strong, heading);
-    while list_item_depth > 0 {
-        blocks.push(Block::ListItemEnd {
-            depth: list_item_depth,
-        });
-        list_item_depth -= 1;
+    while let Some(depth) = list_item_depths.pop() {
+        blocks.push(Block::ListItemEnd { depth });
     }
     merge_bare_number_markers(&mut blocks);
     blocks
@@ -714,7 +1248,41 @@ fn flush_quote(buf: &mut String, blocks: &mut Vec<Block>) {
     buf.clear();
 }
 
-fn flush_code(buf: &mut String, blocks: &mut Vec<Block>) {
+fn flush_caption(buf: &mut String, blocks: &mut Vec<Block>) {
+    if let Some(caption) = clean_title(std::mem::take(buf)) {
+        blocks.push(Block::Caption(caption));
+    }
+}
+
+fn flush_definition_list(buf: &mut String, blocks: &mut Vec<Block>) {
+    let mut entries: Vec<(usize, bool, String)> = Vec::new();
+    for (name, is_term) in [("dt", true), ("dd", false)] {
+        for bounds in element_bounds(buf, name) {
+            if let Some(text) = clean_title(buf[bounds.inner_start..bounds.inner_end].to_owned()) {
+                entries.push((bounds.outer_start, is_term, text));
+            }
+        }
+    }
+    entries.sort_unstable_by_key(|entry| entry.0);
+    let mut items: Vec<DefinitionItem> = Vec::new();
+    for (_, is_term, text) in entries {
+        if is_term {
+            items.push(DefinitionItem {
+                term: text,
+                definitions: Vec::new(),
+            });
+        } else if let Some(item) = items.last_mut() {
+            item.definitions.push(text);
+        }
+    }
+    items.retain(|item| !item.term.is_empty() && !item.definitions.is_empty());
+    if !items.is_empty() {
+        blocks.push(Block::DefinitionList(items));
+    }
+    buf.clear();
+}
+
+fn flush_code(buf: &mut String, language: &mut Option<String>, blocks: &mut Vec<Block>) {
     let decoded = decode_entities(buf)
         .replace("\r\n", "\n")
         .replace('\r', "\n");
@@ -723,9 +1291,217 @@ fn flush_code(buf: &mut String, blocks: &mut Vec<Block>) {
     // and whitespace inside every code line remain untouched.
     let cleaned = decoded.trim_matches('\n');
     if !cleaned.is_empty() {
-        blocks.push(Block::Code(cleaned.to_owned()));
+        if let Some(language) = language.take().filter(|value| !value.is_empty()) {
+            blocks.push(Block::CodeBlock {
+                text: cleaned.to_owned(),
+                language,
+            });
+        } else {
+            blocks.push(Block::Code(cleaned.to_owned()));
+        }
     }
     buf.clear();
+    *language = None;
+}
+
+fn flush_inline_code(buf: &mut String, blocks: &mut Vec<Block>) {
+    let cleaned = clean_text(buf);
+    if !cleaned.is_empty() {
+        blocks.push(Block::InlineCode(cleaned));
+    }
+    buf.clear();
+}
+
+fn append_inline_code_to_heading(code_buf: &mut String, heading_buf: &mut String) {
+    let cleaned = clean_text(code_buf);
+    heading_buf.push(HEADING_INLINE_CODE_START);
+    heading_buf.push_str(&cleaned);
+    heading_buf.push(HEADING_INLINE_CODE_END);
+    code_buf.clear();
+}
+
+fn code_language_from_tag(tag: &str) -> Option<String> {
+    for name in ["data-language", "data-lang", "lang"] {
+        if let Some(value) = attr(tag, name) {
+            let value = value.trim().to_ascii_lowercase();
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    let class = attr(tag, "class")?;
+    for token in class.split_whitespace() {
+        let lower = token.trim().to_ascii_lowercase();
+        for prefix in ["language-", "lang-", "highlight-source-"] {
+            if let Some(language) = lower.strip_prefix(prefix)
+                && !language.is_empty()
+            {
+                return Some(language.to_owned());
+            }
+        }
+        if let Some(language) = lower.strip_prefix("brush:") {
+            let language = language.trim_end_matches(';');
+            if !language.is_empty() {
+                return Some(language.to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn flush_table(buf: &mut String, blocks: &mut Vec<Block>) {
+    let mut rows = Vec::new();
+    let mut header_rows = 0usize;
+    let mut column_count = 0usize;
+    for row in element_bounds(buf, "tr") {
+        let row_html = &buf[row.inner_start..row.inner_end];
+        let mut cells: Vec<(usize, TableCell)> = Vec::new();
+        for (tag_name, header) in [("th", true), ("td", false)] {
+            for cell in element_bounds(row_html, tag_name) {
+                if let Some(text) =
+                    clean_title(row_html[cell.inner_start..cell.inner_end].to_owned())
+                {
+                    let opening = &row_html[cell.outer_start..cell.inner_start];
+                    let row_span = positive_span_attr(opening, "rowspan");
+                    let col_span = positive_span_attr(opening, "colspan");
+                    cells.push((
+                        cell.outer_start,
+                        TableCell {
+                            text,
+                            row_span,
+                            col_span,
+                            header,
+                        },
+                    ));
+                }
+            }
+        }
+        cells.sort_unstable_by_key(|cell| cell.0);
+        if !cells.is_empty() {
+            if header_rows == rows.len() && cells.iter().any(|cell| cell.1.header) {
+                header_rows += 1;
+            }
+            column_count = column_count.max(cells.iter().map(|cell| cell.1.col_span).sum());
+            rows.push(cells.into_iter().map(|cell| cell.1).collect());
+        }
+    }
+    if !rows.is_empty() {
+        blocks.push(Block::Table {
+            rows,
+            header_rows,
+            column_count: column_count.max(1),
+        });
+    }
+    buf.clear();
+}
+
+fn positive_span_attr(tag: &str, name: &str) -> usize {
+    attr(tag, name)
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(1)
+        .clamp(1, 64)
+}
+
+/// Resolve each source cell to its first logical column while respecting
+/// row-spans from previous rows. Both the egui renderer and visual snapshots
+/// use this function, so regression tests exercise the same placement rules.
+pub fn table_cell_columns(
+    rows: &[Vec<TableCell>],
+    column_count: usize,
+) -> Vec<Vec<(usize, usize)>> {
+    let column_count = column_count.max(1);
+    let mut active_row_spans = vec![0usize; column_count];
+    let mut layout = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        let mut placements = Vec::with_capacity(row.len());
+        let mut cursor = 0usize;
+        for (cell_index, cell) in row.iter().enumerate() {
+            let width = cell.col_span.min(column_count);
+            while cursor < column_count {
+                while cursor < column_count && active_row_spans[cursor] > 0 {
+                    cursor += 1;
+                }
+                if cursor + width <= column_count
+                    && active_row_spans[cursor..cursor + width]
+                        .iter()
+                        .all(|span| *span == 0)
+                {
+                    break;
+                }
+                cursor += 1;
+            }
+            let start = cursor.min(column_count.saturating_sub(1));
+            placements.push((start, cell_index));
+            if cell.row_span > 1 {
+                for span in active_row_spans
+                    .iter_mut()
+                    .take((start + width).min(column_count))
+                    .skip(start)
+                {
+                    *span = (*span).max(cell.row_span);
+                }
+            }
+            cursor = (start + width).min(column_count);
+        }
+        layout.push(placements);
+        for span in &mut active_row_spans {
+            *span = span.saturating_sub(1);
+        }
+    }
+    layout
+}
+
+fn math_tag_display(name: &str, tag: &str) -> Option<bool> {
+    if name == "script" && is_math_script_tag(tag) {
+        let kind = attr(tag, "type").unwrap_or_default().to_ascii_lowercase();
+        return Some(kind.contains("mode=display"));
+    }
+    if name == "math" {
+        let display = attr(tag, "display").is_some_and(|value| value.eq_ignore_ascii_case("block"));
+        return Some(display);
+    }
+    let class = attr(tag, "class")?.to_ascii_lowercase();
+    let is_math = class.split_whitespace().any(|token| {
+        token.contains("mathjax")
+            || token.contains("katex")
+            || token == "math"
+            || token.contains("equation")
+    });
+    is_math.then(|| {
+        class.contains("display") || class.contains("equation") || matches!(name, "div" | "figure")
+    })
+}
+
+fn flush_math(buf: &mut String, blocks: &mut Vec<Block>, display: bool) {
+    let annotation = element_bounds(buf, "annotation")
+        .into_iter()
+        .find_map(|bounds| {
+            let opening = &buf[bounds.outer_start..bounds.inner_start];
+            let encoding = attr(opening, "encoding")?.to_ascii_lowercase();
+            (encoding.contains("tex") || encoding.contains("latex"))
+                .then(|| buf[bounds.inner_start..bounds.inner_end].to_owned())
+        });
+    let raw = annotation.unwrap_or_else(|| strip_all_tags(buf));
+    let source = decode_entities(&raw)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !source.is_empty() {
+        blocks.push(Block::Math { source, display });
+    }
+    buf.clear();
+}
+
+fn is_footnote_target(url: &str) -> bool {
+    let fragment = url
+        .rsplit_once('#')
+        .map(|(_, fragment)| fragment)
+        .unwrap_or(url)
+        .to_ascii_lowercase();
+    fragment.starts_with("fn")
+        || fragment.starts_with("footnote")
+        || fragment.starts_with("cite_note")
 }
 
 fn is_html_heading_tag(name: &str) -> bool {
@@ -885,22 +1661,6 @@ fn consume_whitespace_entity(chars: &mut std::iter::Peekable<std::str::Chars<'_>
     true
 }
 
-fn flush_link_fragment(state: &mut LinkState, buf: &mut String, blocks: &mut Vec<Block>) {
-    if state.text.is_empty() {
-        return;
-    }
-    let text = std::mem::take(&mut state.text);
-    finish_link(
-        LinkState {
-            url: state.url.clone(),
-            prefix: String::new(),
-            text,
-        },
-        buf,
-        blocks,
-    );
-}
-
 fn link_href(tag: &str, base: Option<&str>) -> Option<String> {
     let href = decode_entities(&attr(tag, "href")?);
     let href = href.trim();
@@ -974,8 +1734,32 @@ fn srcset_largest(value: &str) -> Option<String> {
 }
 
 /// 清洗累积的文字（解码实体、折叠空行），按当前 HTML 语义推入块并清空缓冲。
+fn extract_heading_inline_code_ranges(marked: &str) -> (String, Vec<InlineTextRange>) {
+    let mut text = String::with_capacity(marked.len());
+    let mut ranges = Vec::new();
+    let mut start = None;
+    for ch in marked.chars() {
+        if ch == HEADING_INLINE_CODE_START {
+            start = Some(text.len());
+        } else if ch == HEADING_INLINE_CODE_END {
+            if let Some(start) = start.take()
+                && start < text.len()
+            {
+                ranges.push(InlineTextRange {
+                    start,
+                    end: text.len(),
+                });
+            }
+        } else {
+            text.push(ch);
+        }
+    }
+    (text, ranges)
+}
+
 fn flush_text_kind(buf: &mut String, blocks: &mut Vec<Block>, strong: bool, heading: bool) {
-    let mut cleaned = join_numbered_marker_linebreak(clean_text(buf));
+    let marked = join_numbered_marker_linebreak(clean_text(buf));
+    let (mut cleaned, inline_code_ranges) = extract_heading_inline_code_ranges(&marked);
     // Some feeds put the sentence-final punctuation in a separate HTML node,
     // e.g. `<p>（5）解决方法</p><p>。研究人员提出...</p>`. Keep that
     // punctuation attached to the preceding numbered heading instead of
@@ -994,7 +1778,14 @@ fn flush_text_kind(buf: &mut String, blocks: &mut Vec<Block>, strong: bool, head
     }
     if !cleaned.is_empty() {
         if heading {
-            blocks.push(Block::Heading(cleaned));
+            if inline_code_ranges.is_empty() {
+                blocks.push(Block::Heading(cleaned));
+            } else {
+                blocks.push(Block::HeadingWithInlineCode {
+                    text: cleaned,
+                    inline_code_ranges,
+                });
+            }
             buf.clear();
             return;
         }
@@ -1140,13 +1931,21 @@ fn merge_bare_number_markers(blocks: &mut Vec<Block>) {
         let following = match &blocks[i + 1] {
             Block::Text(text) | Block::Strong(text) => text.trim().to_owned(),
             Block::Heading(_)
+            | Block::HeadingWithInlineCode { .. }
             | Block::HeadingLink { .. }
             | Block::Quote(_)
+            | Block::InlineCode(_)
             | Block::Code(_)
+            | Block::CodeBlock { .. }
+            | Block::Caption(_)
+            | Block::DefinitionList(_)
             | Block::Link { .. }
             | Block::ListItemStart { .. }
             | Block::ListItemEnd { .. }
-            | Block::Image(_) => {
+            | Block::Image(_)
+            | Block::LinkedImage { .. }
+            | Block::Table { .. }
+            | Block::Math { .. } => {
                 i += 1;
                 continue;
             }
@@ -1437,9 +2236,18 @@ pub fn fmt_ts(ts: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Block, content_blocks, extract_html_base_href, extract_html_title, is_numbered_heading,
-        is_numbered_marker_only, prepare_html_snapshot,
+        Block, CompletePageKind, content_blocks, extract_html_base_href, extract_html_title,
+        guarded_readability_content, html5_reading_scope, is_numbered_heading,
+        is_numbered_marker_only, prepare_html_snapshot, strip_ignored_elements, table_cell_columns,
     };
+
+    fn escape_html_attribute(value: &str) -> String {
+        value
+            .replace('&', "&amp;")
+            .replace('"', "&quot;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    }
 
     fn texts(blocks: &[Block]) -> String {
         blocks
@@ -1458,6 +2266,7 @@ mod tests {
             .iter()
             .filter_map(|b| match b {
                 Block::Image(u) => Some(u.as_str()),
+                Block::LinkedImage { uri, .. } => Some(uri.as_str()),
                 _ => None,
             })
             .collect()
@@ -1469,12 +2278,23 @@ mod tests {
             .filter_map(|block| match block {
                 Block::Text(text)
                 | Block::Strong(text)
+                | Block::InlineCode(text)
                 | Block::Heading(text)
+                | Block::HeadingWithInlineCode { text, .. }
                 | Block::HeadingLink { text, .. }
                 | Block::Quote(text)
                 | Block::Code(text)
+                | Block::Caption(text)
                 | Block::Link { text, .. } => Some(text.as_str()),
-                Block::ListItemStart { .. } | Block::ListItemEnd { .. } | Block::Image(_) => None,
+                Block::CodeBlock { text, .. } | Block::Math { source: text, .. } => {
+                    Some(text.as_str())
+                }
+                Block::ListItemStart { .. }
+                | Block::ListItemEnd { .. }
+                | Block::Image(_)
+                | Block::LinkedImage { .. }
+                | Block::DefinitionList(_)
+                | Block::Table { .. } => None,
             })
             .collect::<Vec<_>>()
             .join("|")
@@ -1587,6 +2407,121 @@ mod tests {
         assert!(visible.contains("ending"));
         assert!(!visible.contains("section chrome"));
         assert!(!visible.contains("related footer"));
+    }
+
+    #[test]
+    fn html5_dom_repairs_malformed_article_before_block_parsing() {
+        let snapshot = prepare_html_snapshot(concat!(
+            "<!doctype html><html><body><main><article>",
+            "<h1>Broken but readable</h1><p>First paragraph<div>Second block",
+            "</article><p>outside article</p></main></body></html>"
+        ));
+
+        assert!(
+            snapshot.content.contains("<p>First paragraph</p>"),
+            "{}",
+            snapshot.content
+        );
+        assert!(
+            snapshot.content.contains("<div>Second block</div>"),
+            "{}",
+            snapshot.content
+        );
+        assert!(!snapshot.content.contains("outside article"));
+        let visible = all_visible_text(&content_blocks(&snapshot.content, None));
+        assert!(visible.contains("First paragraph"));
+        assert!(visible.contains("Second block"));
+    }
+
+    #[test]
+    fn rust_blog_full_page_without_article_keeps_the_main_post() {
+        let html = include_str!("../tests/fixtures/rust-blog-full-page-no-article.html");
+        let scope = html5_reading_scope(html);
+        assert_eq!(scope.kind, CompletePageKind::IndexOrDocument);
+
+        let snapshot = prepare_html_snapshot(html);
+        assert_eq!(snapshot.title.as_deref(), Some("Announcing Rust 1.97.0"));
+        assert_eq!(
+            snapshot.base_href.as_deref(),
+            Some("https://blog.rust-lang.org/2026/07/09/")
+        );
+        assert!(!snapshot.content.contains("siteNavigation"));
+        assert!(!snapshot.content.contains("Related releases"));
+
+        let blocks = content_blocks(&snapshot.content, snapshot.base_href.as_deref());
+        let visible = all_visible_text(&blocks);
+        for expected in [
+            "The Rust team is happy",
+            "What is in 1.97.0 stable",
+            "One repaired list item",
+            "A second item with release details",
+        ] {
+            assert!(
+                visible.contains(expected),
+                "missing {expected:?}: {visible:?}"
+            );
+        }
+        assert!(blocks.iter().any(|block| matches!(
+            block,
+            Block::CodeBlock { text, language }
+                if text == "$ rustup update stable" && language == "shellsession"
+        )));
+    }
+
+    #[test]
+    fn malformed_no_article_fixture_keeps_dom_semantics_and_math() {
+        let html = include_str!("../tests/fixtures/simon-willison-malformed-entry.html");
+        let snapshot = prepare_html_snapshot(html);
+        assert_eq!(
+            snapshot.title.as_deref(),
+            Some("DOM notes & resilient readers")
+        );
+        assert_eq!(
+            snapshot.base_href.as_deref(),
+            Some("https://simonwillison.net/2026/Aug/13/dom-notes/")
+        );
+        assert!(snapshot.content.contains("<p>A browser DOM repairs"));
+        assert!(!snapshot.content.contains("must not reach the reader"));
+
+        let blocks = content_blocks(&snapshot.content, snapshot.base_href.as_deref());
+        assert_eq!(
+            images(&blocks),
+            ["https://simonwillison.net/static/dom-1280.webp"]
+        );
+        assert!(blocks.iter().any(|block| matches!(
+            block,
+            Block::Caption(text)
+                if text == "A responsive image after malformed paragraph markup."
+        )));
+        assert!(blocks.iter().any(|block| matches!(
+            block,
+            Block::Math { source, display: true } if source == "\\sum_{i=1}^{n} i"
+        )));
+        assert!(blocks.iter().any(|block| matches!(
+            block,
+            Block::DefinitionList(items)
+                if items.len() == 2
+                    && items[0].term == "Repair"
+                    && items[1].term == "Projection"
+        )));
+    }
+
+    #[test]
+    fn rss_fragment_articles_never_compete_for_readability() {
+        let blocks = content_blocks(
+            concat!(
+                "<article><h2>First entry</h2><p>Alpha</p></article>",
+                "<article><h2>Second entry</h2><p>Beta</p></article>"
+            ),
+            None,
+        );
+        let visible = all_visible_text(&blocks);
+        for expected in ["First entry", "Alpha", "Second entry", "Beta"] {
+            assert!(
+                visible.contains(expected),
+                "missing {expected:?}: {visible:?}"
+            );
+        }
     }
 
     #[test]
@@ -1935,12 +2870,30 @@ mod tests {
         let blocks = content_blocks(html, Some("https://s.com/posts/1"));
         assert_eq!(
             images(&blocks),
-            vec![
-                "https://s.com/hero.jpg",
-                "https://s.com/large.webp",
-                "https://s.com/fallback.jpg"
-            ]
+            vec!["https://s.com/hero.jpg", "https://s.com/large.webp"]
         );
+    }
+
+    #[test]
+    fn linked_picture_becomes_one_high_resolution_image_with_alt_text() {
+        let blocks = content_blocks(
+            concat!(
+                "<a href='/story'><picture>",
+                "<source srcset='/cover-640.webp 640w, /cover-1600.webp 1600w'>",
+                "<img src='/cover-fallback.jpg' alt='Story cover'>",
+                "</picture></a>"
+            ),
+            Some("https://example.com/index.html"),
+        );
+
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(
+            &blocks[0],
+            Block::LinkedImage { uri, url, alt }
+                if uri == "https://example.com/cover-1600.webp"
+                    && url == "https://example.com/story"
+                    && alt.as_deref() == Some("Story cover")
+        ));
     }
 
     #[test]
@@ -2009,7 +2962,8 @@ mod tests {
         );
         assert!(matches!(
             &blocks[0],
-            Block::Image(url) if url == "https://site.com/cover.png"
+            Block::LinkedImage { uri, url, .. }
+                if uri == "https://site.com/cover.png" && url == "https://site.com/cover"
         ));
         assert!(matches!(
             &blocks[1],
@@ -2034,6 +2988,7 @@ mod tests {
                 Block::Text(t) => format!("T:{t}"),
                 Block::Strong(t) => format!("S:{t}"),
                 Block::Heading(t) => format!("H:{t}"),
+                Block::HeadingWithInlineCode { text, .. } => format!("HC:{text}"),
                 Block::HeadingLink { text, links } => format!(
                     "HL:{text}@{}",
                     links
@@ -2043,7 +2998,9 @@ mod tests {
                         .join(",")
                 ),
                 Block::Quote(t) => format!("Q:{t}"),
+                Block::InlineCode(t) => format!("IC:{t}"),
                 Block::Code(t) => format!("C:{t}"),
+                Block::CodeBlock { text, language } => format!("C:{language}:{text}"),
                 Block::Link {
                     text,
                     url,
@@ -2053,6 +3010,11 @@ mod tests {
                 Block::ListItemStart { depth } => format!("LS:{depth}"),
                 Block::ListItemEnd { depth } => format!("LE:{depth}"),
                 Block::Image(t) => format!("I:{t}"),
+                Block::LinkedImage { uri, url, .. } => format!("LI:{uri}@{url}"),
+                Block::Caption(text) => format!("CAP:{text}"),
+                Block::DefinitionList(items) => format!("DL:{}", items.len()),
+                Block::Table { rows, .. } => format!("TB:{}", rows.len()),
+                Block::Math { source, .. } => format!("M:{source}"),
             })
             .collect();
         assert!(rendered.iter().any(|s| s == "S:（1）工作职责范围扩大。"));
@@ -2215,8 +3177,89 @@ mod tests {
 
         assert_eq!(blocks.len(), 3);
         assert!(matches!(&blocks[0], Block::Text(t) if t == "Run"));
-        assert!(matches!(&blocks[1], Block::Code(t) if t == "cargo test --all"));
+        assert!(matches!(&blocks[1], Block::InlineCode(t) if t == "cargo test --all"));
         assert!(matches!(&blocks[2], Block::Text(t) if t == "now."));
+    }
+
+    #[test]
+    fn keeps_inline_code_inside_the_surrounding_sentence() {
+        let blocks = content_blocks(
+            "<p>If you have Rust installed via <code>rustup</code>, you can update it:</p>\
+             <pre><code>$ rustup update stable</code></pre>\
+             <p>Use the beta channel (<code>rustup default beta</code>) when testing.</p>",
+            None,
+        );
+
+        assert!(
+            !blocks.iter().any(
+                |block| matches!(block, Block::Code(text) if text == "rustup" || text == "rustup default beta")
+            ),
+            "inline <code> must not become a standalone code block: {blocks:#?}"
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|block| matches!(block, Block::InlineCode(text) if text == "rustup"))
+        );
+        assert!(blocks.iter().any(
+            |block| matches!(block, Block::InlineCode(text) if text == "rustup default beta")
+        ));
+        assert!(
+            blocks.iter().any(
+                |block| matches!(block, Block::Code(text) if text == "$ rustup update stable")
+            ),
+            "<pre><code> must remain a standalone code block: {blocks:#?}"
+        );
+    }
+
+    #[test]
+    fn rust_blog_fixture_separates_inline_and_preformatted_code() {
+        let blocks = content_blocks(
+            include_str!("../tests/fixtures/rust-blog-inline-code.html"),
+            Some("https://blog.rust-lang.org/2026/07/09/Rust-1.97.0/"),
+        );
+
+        assert!(blocks.iter().any(
+            |block| matches!(block, Block::InlineCode(text) if text == "rustup default beta")
+        ));
+        assert!(
+            blocks.iter().any(
+                |block| matches!(block, Block::Code(text) if text == "$ rustup update stable")
+            )
+        );
+        assert!(blocks.iter().any(|block| matches!(
+            block,
+            Block::Link { text, url, .. }
+                if text.contains("rustup") && url == "https://rustup.rs/"
+        )));
+        assert!(
+            blocks
+                .iter()
+                .any(|block| matches!(block, Block::HeadingWithInlineCode { text, .. } if text == "New Range* types"))
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|block| matches!(block, Block::InlineCode(text) if text == "core::ops"))
+        );
+        assert!(
+            !blocks
+                .iter()
+                .any(|block| matches!(block, Block::Code(text) if !text.starts_with('$')))
+        );
+    }
+
+    #[test]
+    fn heading_with_inline_code_remains_one_heading() {
+        let blocks = content_blocks("<h2>New <code>Range*</code> types</h2>", None);
+
+        assert!(matches!(
+            blocks.as_slice(),
+            [Block::HeadingWithInlineCode { text, inline_code_ranges }]
+                if text == "New Range* types"
+                    && inline_code_ranges.len() == 1
+                    && &text[inline_code_ranges[0].start..inline_code_ranges[0].end] == "Range*"
+        ));
     }
 
     #[test]
@@ -2254,5 +3297,296 @@ mod tests {
             &complete_heading[0],
             Block::Strong(t) if t == "（1）完整标题"
         ));
+    }
+
+    #[test]
+    fn martin_fowler_fixture_keeps_linked_heading_image_and_nested_lists() {
+        let blocks = content_blocks(
+            include_str!("../tests/fixtures/martinfowler-architecture-card.html"),
+            Some("https://martinfowler.com/architecture/"),
+        );
+
+        assert!(blocks.iter().any(|block| matches!(
+            block,
+            Block::LinkedImage { uri, url, alt }
+                if uri == "https://martinfowler.com/articles/modularizing-react-apps/card.png"
+                    && url == "https://martinfowler.com/articles/modularizing-react-apps.html"
+                    && alt.as_deref() == Some("Modularizing React Applications")
+        )));
+        assert!(blocks.iter().any(|block| matches!(
+            block,
+            Block::HeadingLink { text, links }
+                if text == "Modularizing React Applications"
+                    && links.first().is_some_and(|link| link.url == "https://martinfowler.com/articles/modularizing-react-apps.html")
+        )));
+        assert!(
+            blocks
+                .iter()
+                .any(|block| matches!(block, Block::ListItemStart { depth: 2 }))
+        );
+        assert!(blocks.iter().any(|block| matches!(
+            block,
+            Block::Image(uri) if uri == "https://martinfowler.com/images/sketch.png"
+        )));
+    }
+
+    #[test]
+    fn beekka_fixture_keeps_table_code_language_and_list_media() {
+        let blocks = content_blocks(
+            include_str!("../tests/fixtures/beekka-weekly-rich-content.html"),
+            Some("https://www.ruanyifeng.com/blog/2026/08/weekly-issue-407.html"),
+        );
+
+        assert!(blocks.iter().any(|block| matches!(
+            block,
+            Block::Table { rows, header_rows, .. }
+                if *header_rows == 1
+                    && rows.len() == 3
+                    && rows[1].iter().map(|cell| cell.text.as_str()).collect::<Vec<_>>()
+                        == ["RTX 5090", "104.8 TFLOPS"]
+        )));
+        assert!(blocks.iter().any(|block| matches!(
+            block,
+            Block::CodeBlock { text, language }
+                if language == "bash" && text.contains("rg --files")
+        )));
+        assert!(blocks.iter().any(|block| matches!(
+            block,
+            Block::LinkedImage { uri, url, .. }
+                if uri.ends_with("/asset/demo.webp") && url == "https://example.com/original"
+        )));
+        assert!(
+            blocks
+                .iter()
+                .any(|block| matches!(block, Block::ListItemStart { depth: 2 }))
+        );
+    }
+
+    #[test]
+    fn wikipedia_fixture_keeps_math_table_and_clickable_footnotes() {
+        let blocks = content_blocks(
+            include_str!("../tests/fixtures/wikipedia-math-footnotes-table.html"),
+            Some("https://zh.wikipedia.org/wiki/欧拉恒等式"),
+        );
+
+        assert!(blocks.iter().any(|block| matches!(
+            block,
+            Block::Math { source, display: true } if source == "e^{i\\pi}+1=0"
+        )));
+        assert!(blocks.iter().any(|block| matches!(
+            block,
+            Block::Math { source, display: true } if source.contains("\\int_0^1")
+        )));
+        assert!(blocks.iter().any(|block| matches!(
+            block,
+            Block::Link { text, url, link_start, .. }
+                if text.ends_with("[1]")
+                    && &text[*link_start..] == "[1]"
+                    && url.ends_with("#cite_note-1")
+        )));
+        assert!(blocks.iter().any(|block| matches!(
+            block,
+            Block::Table { rows, header_rows, .. }
+                if *header_rows == 1 && rows.len() == 2 && rows[1][0].text == "π"
+        )));
+    }
+
+    #[test]
+    fn responsive_fixture_keeps_picture_caption_definitions_and_spans() {
+        let snapshot =
+            prepare_html_snapshot(include_str!("../tests/fixtures/responsive-semantics.html"));
+        let blocks = content_blocks(
+            &snapshot.content,
+            Some("https://fixture.example/articles/semantic.html"),
+        );
+
+        assert_eq!(
+            images(&blocks),
+            ["https://fixture.example/media/hero-1280.jpg"]
+        );
+        assert!(matches!(
+            blocks.iter().find(|block| matches!(block, Block::Caption(_))),
+            Some(Block::Caption(text)) if text == "图 1：不同屏幕共用一条说明文字。"
+        ));
+        assert!(matches!(
+            blocks.iter().find(|block| matches!(block, Block::DefinitionList(_))),
+            Some(Block::DefinitionList(items))
+                if items.len() == 2
+                    && items[0].term == "渐进增强"
+                    && items[0].definitions.len() == 2
+        ));
+        assert!(matches!(
+            blocks.iter().find(|block| matches!(block, Block::Table { .. })),
+            Some(Block::Table { rows, column_count, .. })
+                if *column_count == 3
+                    && rows[0][0].row_span == 2
+                    && rows[0][1].col_span == 2
+                    && rows[3][0].col_span == 2
+        ));
+    }
+
+    #[test]
+    fn readability_falls_back_when_math_semantics_would_be_lost() {
+        let snapshot = prepare_html_snapshot(concat!(
+            "<!doctype html><html><head><title>Math note</title></head><body>",
+            "<main><article><h1>Math note</h1><p>Equation follows.</p>",
+            "<script type='math/tex; mode=display'>x^2 + y^2</script>",
+            "<p>Explanation remains.</p></article></main></body></html>"
+        ));
+        let blocks = content_blocks(&snapshot.content, None);
+        assert!(blocks.iter().any(|block| matches!(
+            block,
+            Block::Math { source, display: true } if source == "x^2 + y^2"
+        )));
+        assert!(all_visible_text(&blocks).contains("Explanation remains."));
+    }
+
+    #[test]
+    fn html5_dom_and_readability_candidates_are_fixture_gated() {
+        let html = include_str!("../tests/fixtures/responsive-semantics.html");
+
+        // scraper is backed by html5ever. This proves a browser-grade DOM can
+        // recover the nested semantics we currently preserve by hand.
+        let document = scraper::Html::parse_document(html);
+        let selector = scraper::Selector::parse(
+            "picture source, figure figcaption, dl dt, dl dd, td[rowspan], th[colspan]",
+        )
+        .expect("valid fixture selector");
+        assert_eq!(document.select(&selector).count(), 10);
+
+        // Readability is evaluated as a *content selection* stage. Feed
+        // fragments and guide/index pages still bypass it because selecting
+        // one dominant article would discard useful cards and list entries.
+        let scope = html5_reading_scope(html);
+        assert_eq!(scope.kind, CompletePageKind::SingleArticle);
+        let source = strip_ignored_elements(&scope.content);
+        let gated = guarded_readability_content(
+            html,
+            Some("https://fixture.example/articles/semantic.html"),
+            &source,
+        )
+        .expect("semantic fixture should pass the production Readability gate");
+        assert!(gated.contains("rowspan=\"2\""));
+
+        let mut readability = dom_smoothie::Readability::new(
+            html,
+            Some("https://fixture.example/articles/semantic.html"),
+            Some(dom_smoothie::Config {
+                char_threshold: 0,
+                ..Default::default()
+            }),
+        )
+        .expect("fixture should form a valid HTML5 document");
+        let article = readability.parse().expect("fixture should be readable");
+        assert!(article.content.contains("渐进增强"));
+        assert!(article.content.contains("rowspan=\"2\""));
+    }
+
+    fn semantic_snapshot_svg(blocks: &[Block]) -> String {
+        use std::fmt::Write as _;
+
+        let mut body = String::new();
+        let mut y = 20usize;
+        for block in blocks {
+            match block {
+                Block::Heading(text) => {
+                    let _ = writeln!(
+                        body,
+                        "  <text class=\"heading\" x=\"20\" y=\"{}\">{}</text>",
+                        y + 24,
+                        escape_html_attribute(text)
+                    );
+                    y += 52;
+                }
+                Block::Image(uri) | Block::LinkedImage { uri, .. } => {
+                    let _ = writeln!(
+                        body,
+                        "  <g class=\"image\"><rect x=\"20\" y=\"{y}\" width=\"720\" height=\"100\"/><text x=\"36\" y=\"{}\">{}</text></g>",
+                        y + 56,
+                        escape_html_attribute(uri)
+                    );
+                    y += 116;
+                }
+                Block::Caption(text) => {
+                    let _ = writeln!(
+                        body,
+                        "  <text class=\"caption\" x=\"380\" y=\"{}\" text-anchor=\"middle\">{}</text>",
+                        y + 18,
+                        escape_html_attribute(text)
+                    );
+                    y += 34;
+                }
+                Block::DefinitionList(items) => {
+                    let line_count: usize =
+                        items.iter().map(|item| 1 + item.definitions.len()).sum();
+                    let height = 20 + line_count * 24;
+                    let _ = writeln!(
+                        body,
+                        "  <g class=\"definition-list\"><rect x=\"20\" y=\"{y}\" width=\"720\" height=\"{height}\"/>"
+                    );
+                    let mut line_y = y + 26;
+                    for item in items {
+                        let _ = writeln!(
+                            body,
+                            "    <text class=\"term\" x=\"36\" y=\"{line_y}\">{}</text>",
+                            escape_html_attribute(&item.term)
+                        );
+                        line_y += 24;
+                        for definition in &item.definitions {
+                            let _ = writeln!(
+                                body,
+                                "    <text class=\"definition\" x=\"58\" y=\"{line_y}\">— {}</text>",
+                                escape_html_attribute(definition)
+                            );
+                            line_y += 24;
+                        }
+                    }
+                    body.push_str("  </g>\n");
+                    y += height + 16;
+                }
+                Block::Table {
+                    rows, column_count, ..
+                } => {
+                    let unit = 720.0 / (*column_count).max(1) as f32;
+                    let layout = table_cell_columns(rows, *column_count);
+                    let _ = writeln!(body, "  <g class=\"table\">");
+                    for (row_index, row) in rows.iter().enumerate() {
+                        for (column, cell_index) in &layout[row_index] {
+                            let cell = &row[*cell_index];
+                            let x = 20.0 + *column as f32 * unit;
+                            let width = cell.col_span as f32 * unit;
+                            let cell_y = y + row_index * 44;
+                            let _ = writeln!(
+                                body,
+                                "    <g class=\"cell\" data-rowspan=\"{}\" data-colspan=\"{}\"><rect x=\"{x:.0}\" y=\"{cell_y}\" width=\"{width:.0}\" height=\"44\"/><text x=\"{:.0}\" y=\"{}\">{}</text></g>",
+                                cell.row_span,
+                                cell.col_span,
+                                x + 10.0,
+                                cell_y + 27,
+                                escape_html_attribute(&cell.text)
+                            );
+                        }
+                    }
+                    body.push_str("  </g>\n");
+                    y += rows.len() * 44 + 20;
+                }
+                _ => {}
+            }
+        }
+        format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 760 {}\">\n<style>.heading,.term{{font-weight:700}}.image rect,.definition-list rect,.cell rect{{fill:#f8f8f8;stroke:#ddd}}text{{font:15px sans-serif;fill:#333}}.caption{{fill:#888}}</style>\n{body}</svg>\n",
+            y + 20
+        )
+    }
+
+    #[test]
+    fn semantic_blocks_match_visual_svg_snapshot() {
+        let blocks = content_blocks(
+            include_str!("../tests/fixtures/responsive-semantics.html"),
+            Some("https://fixture.example/articles/semantic.html"),
+        );
+        let actual = semantic_snapshot_svg(&blocks);
+        let expected = include_str!("../tests/snapshots/semantic-blocks.svg");
+        assert_eq!(actual, expected, "semantic visual snapshot changed");
     }
 }

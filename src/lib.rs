@@ -1,9 +1,11 @@
+mod backup;
 mod cli;
 mod config;
 mod daemon;
 mod db;
 mod fetch;
 mod gui;
+mod image_store;
 mod model;
 mod notify;
 mod text;

@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 594">
+<style>.heading,.term{font-weight:700}.image rect,.definition-list rect,.cell rect{fill:#f8f8f8;stroke:#ddd}text{font:15px sans-serif;fill:#333}.caption{fill:#888}</style>
+  <text class="heading" x="20" y="44">复杂正文结构</text>
+  <g class="image"><rect x="20" y="72" width="720" height="100"/><text x="36" y="128">https://fixture.example/media/hero-1280.jpg</text></g>
+  <text class="caption" x="380" y="206" text-anchor="middle">图 1：不同屏幕共用一条说明文字。</text>
+  <g class="definition-list"><rect x="20" y="222" width="720" height="140"/>
+    <text class="term" x="36" y="248">渐进增强</text>
+    <text class="definition" x="58" y="272">— 基础内容在任何客户端都可阅读。</text>
+    <text class="definition" x="58" y="296">— 支持新能力的客户端获得更丰富的呈现。</text>
+    <text class="term" x="36" y="320">容错解析</text>
+    <text class="definition" x="58" y="344">— 面对不完整 HTML 时仍保留正文顺序。</text>
+  </g>
+  <g class="table">
+    <g class="cell" data-rowspan="2" data-colspan="1"><rect x="20" y="378" width="240" height="44"/><text x="30" y="405">阶段</text></g>
+    <g class="cell" data-rowspan="1" data-colspan="2"><rect x="260" y="378" width="480" height="44"/><text x="270" y="405">质量门槛</text></g>
+    <g class="cell" data-rowspan="1" data-colspan="1"><rect x="260" y="422" width="240" height="44"/><text x="270" y="449">结构</text></g>
+    <g class="cell" data-rowspan="1" data-colspan="1"><rect x="500" y="422" width="240" height="44"/><text x="510" y="449">视觉</text></g>
+    <g class="cell" data-rowspan="2" data-colspan="1"><rect x="20" y="466" width="240" height="44"/><text x="30" y="493">解析</text></g>
+    <g class="cell" data-rowspan="1" data-colspan="1"><rect x="260" y="466" width="240" height="44"/><text x="270" y="493">图片与图注</text></g>
+    <g class="cell" data-rowspan="1" data-colspan="1"><rect x="500" y="466" width="240" height="44"/><text x="510" y="493">正文顺序</text></g>
+    <g class="cell" data-rowspan="1" data-colspan="2"><rect x="260" y="510" width="480" height="44"/><text x="270" y="537">跨行、跨列表格保持逻辑列</text></g>
+  </g>
+</svg>
