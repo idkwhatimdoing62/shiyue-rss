@@ -17,6 +17,33 @@ pub struct Config {
     pub disable_after_failures: i64,
     /// 是否弹桌面通知（ADR-7）。
     pub notifications: bool,
+    pub resource_enrichment: ResourceEnrichmentConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ResourceEnrichmentConfig {
+    pub enabled: bool,
+    pub provider: String,
+    pub base_url: String,
+    pub model: String,
+    pub max_input_chars: usize,
+    pub prompt_version: String,
+    pub schema_version: String,
+}
+
+impl Default for ResourceEnrichmentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            provider: "openai-compatible".into(),
+            base_url: "https://api.deepseek.com".into(),
+            model: "deepseek-chat".into(),
+            max_input_chars: 60_000,
+            prompt_version: "resource-v1".into(),
+            schema_version: "1".into(),
+        }
+    }
 }
 
 impl Default for Config {
@@ -27,6 +54,7 @@ impl Default for Config {
             backoff_cap_secs: 3600,
             disable_after_failures: 10,
             notifications: true,
+            resource_enrichment: ResourceEnrichmentConfig::default(),
         }
     }
 }
@@ -42,6 +70,27 @@ pub struct Paths {
 
 impl Paths {
     pub fn resolve() -> Result<Self> {
+        if cfg!(debug_assertions)
+            && let Some(root) = std::env::var_os("SHIYUE_TEST_ROOT")
+        {
+            let root = PathBuf::from(root);
+            let config_dir = root.join("config");
+            let data_dir = root.join("data");
+            std::fs::create_dir_all(&config_dir)?;
+            std::fs::create_dir_all(&data_dir)?;
+            let image_cache_dir = data_dir.join("image-cache");
+            let backup_dir = data_dir.join("backups");
+            std::fs::create_dir_all(&image_cache_dir)?;
+            std::fs::create_dir_all(&backup_dir)?;
+            return Ok(Self {
+                data_dir: data_dir.clone(),
+                config_file: config_dir.join("config.toml"),
+                db_file: data_dir.join("rrss.db"),
+                log_file: data_dir.join("rrss.log"),
+                image_cache_dir,
+                backup_dir,
+            });
+        }
         // LEGACY COMPATIBILITY: 拾阅的早期开发版本使用 rrss 作为应用
         // 标识。继续读取这个目录，升级后用户的订阅、归档和摘录不会丢失。
         let pd = ProjectDirs::from("", "", "rrss").context("无法确定用户目录")?;

@@ -15,7 +15,7 @@ use crate::model::{
 pub const WEB_CLIPPINGS_FEED_URL: &str = "shiyue://web-clippings";
 const WEB_CLIPPINGS_FEED_TITLE: &str = "网页收藏";
 
-const SCHEMA: &str = r#"
+pub(crate) const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS feeds (
   id            INTEGER PRIMARY KEY,
   url           TEXT NOT NULL UNIQUE,
@@ -77,6 +77,91 @@ CREATE TABLE IF NOT EXISTS search_history (
   last_used_at  INTEGER NOT NULL,
   use_count     INTEGER NOT NULL DEFAULT 1,
   result_count  INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS resources (
+  id                 INTEGER PRIMARY KEY,
+  url                TEXT NOT NULL,
+  canonical_url      TEXT NOT NULL UNIQUE,
+  parent_resource_id INTEGER REFERENCES resources(id) ON DELETE SET NULL,
+  linked_article_id  INTEGER REFERENCES articles(id) ON DELETE SET NULL,
+  kind               TEXT NOT NULL CHECK (kind IN ('site', 'page', 'article')),
+  title              TEXT,
+  purpose_zh         TEXT,
+  purpose_source     TEXT CHECK (purpose_source IS NULL OR purpose_source IN ('manual','ai')),
+  use_when_zh        TEXT,
+  use_when_source    TEXT CHECK (use_when_source IS NULL OR use_when_source IN ('manual','ai')),
+  capabilities       TEXT NOT NULL DEFAULT '[]',
+  limitations        TEXT NOT NULL DEFAULT '[]',
+  pricing            TEXT CHECK (pricing IS NULL OR pricing IN ('free', 'freemium', 'paid', 'unknown')),
+  requires_login     INTEGER CHECK (requires_login IS NULL OR requires_login IN (0, 1)),
+  languages          TEXT NOT NULL DEFAULT '[]',
+  private_note       TEXT,
+  privacy            TEXT NOT NULL DEFAULT 'public' CHECK (privacy IN ('public', 'private')),
+  status             TEXT NOT NULL CHECK (status IN ('pending_review', 'enrichment_pending', 'active', 'broken', 'archived')),
+  source             TEXT NOT NULL CHECK (source IN ('gui', 'cli_agent', 'import')),
+  manual_rating      INTEGER CHECK (manual_rating IS NULL OR manual_rating BETWEEN 1 AND 5),
+  latest_snapshot_id INTEGER REFERENCES resource_snapshots(id) ON DELETE SET NULL,
+  last_checked_at    INTEGER,
+  created_at         INTEGER NOT NULL,
+  updated_at         INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_resources_status_updated ON resources(status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_resources_parent ON resources(parent_resource_id);
+CREATE INDEX IF NOT EXISTS idx_resources_article ON resources(linked_article_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_resources_import_article
+  ON resources(linked_article_id) WHERE source='import' AND linked_article_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS resource_categories (
+  resource_id INTEGER NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
+  category    TEXT NOT NULL CHECK (category IN ('tool', 'asset-library', 'docs', 'blog', 'inspiration', 'service', 'repository', 'other')),
+  PRIMARY KEY(resource_id, category)
+);
+CREATE TABLE IF NOT EXISTS resource_tags (
+  resource_id INTEGER NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
+  name        TEXT NOT NULL COLLATE NOCASE,
+  language    TEXT NOT NULL CHECK (language IN ('zh', 'en', 'other')),
+  source      TEXT NOT NULL CHECK (source IN ('manual', 'ai')),
+  created_at  INTEGER NOT NULL,
+  PRIMARY KEY(resource_id, name)
+);
+CREATE TABLE IF NOT EXISTS resource_snapshots (
+  id              INTEGER PRIMARY KEY,
+  resource_id     INTEGER NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
+  content_hash    TEXT,
+  fetched_url     TEXT,
+  http_status     INTEGER,
+  title           TEXT,
+  cleaned_content TEXT,
+  fetched_at      INTEGER NOT NULL,
+  fetch_error     TEXT,
+  CHECK (content_hash IS NOT NULL OR fetch_error IS NOT NULL)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_resource_snapshot_success
+  ON resource_snapshots(resource_id, content_hash) WHERE content_hash IS NOT NULL;
+CREATE TABLE IF NOT EXISTS resource_enrichment_runs (
+  id            INTEGER PRIMARY KEY,
+  resource_id   INTEGER NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
+  snapshot_id   INTEGER REFERENCES resource_snapshots(id) ON DELETE SET NULL,
+  provider      TEXT NOT NULL,
+  model         TEXT NOT NULL,
+  prompt_version TEXT NOT NULL,
+  schema_version TEXT NOT NULL,
+  started_at    INTEGER NOT NULL,
+  finished_at   INTEGER,
+  status        TEXT NOT NULL CHECK (status IN ('pending', 'running', 'succeeded', 'failed')),
+  error_code    TEXT,
+  error_message TEXT
+);
+CREATE TABLE IF NOT EXISTS resource_usage_events (
+  id          INTEGER PRIMARY KEY,
+  resource_id INTEGER NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
+  event       TEXT NOT NULL CHECK (event IN ('returned', 'confirmed_used')),
+  occurred_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_resource_usage_events ON resource_usage_events(resource_id, occurred_at DESC);
+CREATE VIRTUAL TABLE IF NOT EXISTS resource_fts USING fts5(
+  source_id UNINDEXED,
+  body,
+  tokenize='trigram'
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS library_fts USING fts5(
   kind UNINDEXED,
@@ -159,8 +244,8 @@ const SELECTION_COLS: &str = "id, article_id, selected_text, start_offset, end_o
                               anchor_prefix, anchor_suffix, comment, is_favorite, created_at, updated_at";
 
 pub struct Db {
-    conn: Connection,
-    path: Option<PathBuf>,
+    pub(crate) conn: Connection,
+    pub(crate) path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,6 +305,12 @@ fn has_column(conn: &Connection, table: &str, expected: &str) -> Result<bool> {
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "resources", "purpose_source")? {
+        conn.execute("ALTER TABLE resources ADD COLUMN purpose_source TEXT CHECK (purpose_source IS NULL OR purpose_source IN ('manual','ai'))", [])?;
+    }
+    if !has_column(conn, "resources", "use_when_source")? {
+        conn.execute("ALTER TABLE resources ADD COLUMN use_when_source TEXT CHECK (use_when_source IS NULL OR use_when_source IN ('manual','ai'))", [])?;
+    }
     if !has_column(conn, "articles", "archived")? {
         conn.execute(
             "ALTER TABLE articles ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
@@ -268,6 +359,11 @@ fn migrate(conn: &Connection) -> Result<()> {
          WHERE comment IS NOT NULL AND length(trim(comment)) > 0",
             [],
         )?;
+    }
+    let resource_indexed: i64 =
+        conn.query_row("SELECT COUNT(*) FROM resource_fts", [], |r| r.get(0))?;
+    if resource_indexed == 0 {
+        conn.execute("INSERT INTO resource_fts(source_id,body) SELECT r.id,trim(COALESCE(r.title,'')||char(10)||r.url||char(10)||COALESCE(r.purpose_zh,'')||char(10)||COALESCE(r.use_when_zh,'')||char(10)||r.capabilities||char(10)||r.limitations||char(10)||r.languages||char(10)||COALESCE(r.private_note,'')||char(10)||COALESCE((SELECT group_concat(category,' ') FROM resource_categories c WHERE c.resource_id=r.id),'')||char(10)||COALESCE((SELECT group_concat(name,' ') FROM resource_tags t WHERE t.resource_id=r.id),'')||char(10)||COALESCE((SELECT cleaned_content FROM resource_snapshots s WHERE s.id=r.latest_snapshot_id),'')) FROM resources r", [])?;
     }
     Ok(())
 }

@@ -4,6 +4,9 @@
 
 ## 功能
 
+- 独立的网站资源库：收藏工具站、设计素材、具体页面，并在 GUI 中完成搜索、编辑、确认、归档和整理
+- 统一搜索网站资源与精选文章；`shiyue-cli resource` 为本机 AI 提供稳定的 JSON 查询接口
+- 可选 DeepSeek/OpenAI-compatible 自动整理用途、分类和标签；私密资源不会发送给云端模型
 - 三栏式订阅、文章列表与正文阅读界面
 - HTML/RSS 正文使用 HTML5 DOM 容错清洗并完成中文段落排版；无标准 `article` 的正文与畸形 HTML 也有 fixture 回归
 - 支持图注、定义列表、复杂表格、代码语言、脚注以及 MathJax 公式排版
@@ -71,6 +74,12 @@ shiyue-cli update
 shiyue-cli set-interval <id> <30s|5m|6h|2d>
 shiyue-cli enable <id>
 shiyue-cli disable <id>
+shiyue-cli resource search <query> --json
+shiyue-cli resource get <id> --json
+shiyue-cli resource recent --json
+shiyue-cli resource pending --json
+shiyue-cli resource add <url> --json
+shiyue-cli resource retry <id> --json
 ```
 
 ## 隐私

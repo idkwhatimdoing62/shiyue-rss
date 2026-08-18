@@ -1,0 +1,36 @@
+{
+  "resources": [
+    ["https://koboyo.com/icons?q=app+icon","Koboyo Icons","制作和查找 App icon 图标"],
+    ["https://www.svgrepo.com/","SVG Repo","下载可商用 SVG 图标资源"],
+    ["https://heroicons.com/","Heroicons","下载开源 SVG UI 图标"],
+    ["https://lucide.dev/","Lucide","开源 SVG 图标库"],
+    ["https://icones.js.org/","Icones","跨图标集合搜索 SVG"],
+    ["https://www.photopea.com/","Photopea","无需安装的在线图片编辑工具"],
+    ["https://squoosh.app/","Squoosh","本地图片压缩网页工具"],
+    ["https://excalidraw.com/","Excalidraw","绘制手绘风格架构图"],
+    ["https://mermaid.live/","Mermaid Live","在线编写 Mermaid 图表"],
+    ["https://coolors.co/","Coolors","生成设计配色方案"],
+    ["https://fonts.google.com/","Google Fonts","寻找开源网页字体"],
+    ["https://unsplash.com/","Unsplash","寻找摄影图片素材"],
+    ["https://www.pexels.com/","Pexels","寻找免费图片和视频素材"],
+    ["https://crates.io/","crates.io","查找 Rust crate"],
+    ["https://docs.rs/","docs.rs","阅读 Rust crate API 文档"],
+    ["https://www.egui.rs/","egui","Rust GUI 框架和示例"],
+    ["https://tauri.app/","Tauri","使用 Rust 构建桌面应用"],
+    ["https://github.com/","GitHub","查找开源代码仓库"],
+    ["https://developer.mozilla.org/","MDN","Web API 和前端开发文档"],
+    ["https://www.awwwards.com/","Awwwards","设计灵感网站与网页作品" ]
+  ],
+  "queries": [
+    ["App icon","https://koboyo.com/icons?q=app+icon"],
+    ["商用 SVG 图标","https://www.svgrepo.com/"],
+    ["开源 SVG 图标","https://heroicons.com/"],
+    ["在线图片编辑","https://www.photopea.com/"],
+    ["图片压缩","https://squoosh.app/"],
+    ["架构图","https://excalidraw.com/"],
+    ["设计配色","https://coolors.co/"],
+    ["Rust crate 文档","https://docs.rs/"],
+    ["Rust GUI","https://www.egui.rs/"],
+    ["设计灵感网站","https://www.awwwards.com/"]
+  ]
+}

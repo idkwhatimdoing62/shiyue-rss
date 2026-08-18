@@ -4,7 +4,7 @@
 //! 进程模型：UI 在主线程（同步，自己一个 DB 连接只读）；一个后台线程起 tokio 跑调度循环
 //! （另一个 DB 连接，按每源 next_fetch 到期抓取写库）。两边靠同一 WAL 库 + channel + repaint 协调。
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use eframe::egui::{self, ViewportCommand};
 use std::collections::{HashMap, HashSet};
@@ -415,6 +415,49 @@ struct GuiApp {
     web_clip_event_rx: std_mpsc::Receiver<WebClipEvent>,
     web_clip_request_generation: u64,
     delete_web_clip_dialog: Option<DeleteWebClipDialog>,
+    show_resource_library: bool,
+    resource_query: String,
+    resource_filter: ResourceFilter,
+    resource_add_dialog: Option<ResourceAddDialog>,
+    resource_edit_dialog: Option<ResourceEditDialog>,
+    pending_resource_delete: Option<(i64, String)>,
+    resource_enrichment_config: crate::config::ResourceEnrichmentConfig,
+    resource_import_dialog: Option<ResourceImportDialog>,
+    resource_search_results: Vec<serde_json::Value>,
+    resource_search_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResourceFilter {
+    Active,
+    PendingReview,
+    EnrichmentPending,
+    Broken,
+    Archived,
+    All,
+}
+
+#[derive(Debug, Default)]
+struct ResourceAddDialog {
+    url: String,
+    note: String,
+    private: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ResourceEditDialog {
+    id: i64,
+    title: String,
+    purpose_zh: String,
+    note: String,
+    private: bool,
+    rating: i64,
+}
+
+struct ResourceImportDialog {
+    candidates: Vec<crate::resource::ImportCandidate>,
+    selected: HashSet<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -458,6 +501,15 @@ enum WebClipEvent {
     Complete {
         request_id: u64,
         result: Result<crate::web_clip::FetchedWebClip, String>,
+    },
+    ResourceComplete {
+        resource_id: i64,
+        result: Result<crate::web_clip::FetchedWebClip, String>,
+    },
+    EnrichmentComplete {
+        resource_id: i64,
+        run_id: i64,
+        result: Result<crate::resource_enrichment::EnrichmentOutput, String>,
     },
 }
 
@@ -655,6 +707,7 @@ enum FormulaState {
 impl GuiApp {
     fn new(cc: &eframe::CreationContext, paths: &Paths, cfg: Config) -> Result<Self> {
         let db = Db::open(&paths.db_file)?;
+        let resource_enrichment_config = cfg.resource_enrichment.clone();
         let shared = Arc::new(Shared {
             focused: AtomicBool::new(true),
             busy: AtomicBool::new(false),
@@ -760,6 +813,16 @@ impl GuiApp {
             web_clip_event_rx,
             web_clip_request_generation: 0,
             delete_web_clip_dialog: None,
+            show_resource_library: false,
+            resource_query: String::new(),
+            resource_filter: ResourceFilter::Active,
+            resource_add_dialog: None,
+            resource_edit_dialog: None,
+            pending_resource_delete: None,
+            resource_enrichment_config,
+            resource_import_dialog: None,
+            resource_search_results: Vec::new(),
+            resource_search_error: None,
         };
         app.reload();
         app.refresh_saved_selection_count();
@@ -1544,9 +1607,162 @@ impl GuiApp {
                         }
                     }
                 }
+                WebClipEvent::ResourceComplete {
+                    resource_id,
+                    result,
+                } => {
+                    use crate::resource::{ResourceService, SnapshotInput};
+                    let now = Utc::now().timestamp();
+                    let service = ResourceService::new(&self.db);
+                    match result {
+                        Ok(fetched) => {
+                            let snapshot = text::prepare_html_snapshot(&fetched.html);
+                            let input = SnapshotInput {
+                                fetched_url: Some(fetched.final_url),
+                                http_status: Some(200),
+                                title: snapshot.title.clone(),
+                                cleaned_content: Some(snapshot.content),
+                                fetch_error: None,
+                            };
+                            let saved =
+                                service
+                                    .record_snapshot(resource_id, &input, now)
+                                    .and_then(|_| {
+                                        service.set_fetched_title_if_empty(
+                                            resource_id,
+                                            snapshot.title.as_deref(),
+                                            now,
+                                        )
+                                    });
+                            let should_enrich = saved.is_ok();
+                            self.selection_notice = Some((
+                                match saved {
+                                    Ok(_) => "资源快照已保存到本机".to_owned(),
+                                    Err(error) => format!("资源快照保存失败：{error}"),
+                                },
+                                Instant::now(),
+                            ));
+                            if should_enrich {
+                                self.begin_resource_enrichment(resource_id, ctx);
+                            }
+                        }
+                        Err(error) => {
+                            let input = SnapshotInput {
+                                fetched_url: None,
+                                http_status: None,
+                                title: None,
+                                cleaned_content: None,
+                                fetch_error: Some(error.clone()),
+                            };
+                            let _ = service.record_snapshot(resource_id, &input, now);
+                            self.selection_notice = Some((
+                                format!("资源已保存，抓取失败，可稍后重试：{error}"),
+                                Instant::now(),
+                            ));
+                        }
+                    }
+                }
+                WebClipEvent::EnrichmentComplete {
+                    resource_id,
+                    run_id,
+                    result,
+                } => {
+                    use crate::resource::{EnrichmentStatus, ResourceService};
+                    let service = ResourceService::new(&self.db);
+                    let now = Utc::now().timestamp();
+                    match result {
+                        Ok(output) => {
+                            let applied = service
+                                .apply_enrichment(resource_id, &output, now)
+                                .and_then(|_| {
+                                    service.finish_enrichment(
+                                        run_id,
+                                        EnrichmentStatus::Succeeded,
+                                        None,
+                                        None,
+                                        now,
+                                    )
+                                });
+                            self.selection_notice = Some((
+                                match applied {
+                                    Ok(_) => "AI 已整理资源用途、分类和标签".into(),
+                                    Err(error) => format!("AI 结果写入失败：{error}"),
+                                },
+                                Instant::now(),
+                            ));
+                        }
+                        Err(error) => {
+                            let _ = service.finish_enrichment(
+                                run_id,
+                                EnrichmentStatus::Failed,
+                                Some("ENRICHMENT_FAILED"),
+                                Some(&error),
+                                now,
+                            );
+                            self.selection_notice = Some((
+                                format!("资源快照已保留，AI 整理失败：{error}"),
+                                Instant::now(),
+                            ));
+                        }
+                    }
+                }
             }
             ctx.request_repaint();
         }
+    }
+
+    fn begin_resource_fetch(&self, resource_id: i64, url: String, ctx: &egui::Context) {
+        let event_tx = self.web_clip_event_tx.clone();
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let result = crate::web_clip::client()
+                .and_then(|client| crate::web_clip::fetch_html(&client, &url))
+                .map_err(|error| error.to_string());
+            let _ = event_tx.send(WebClipEvent::ResourceComplete {
+                resource_id,
+                result,
+            });
+            repaint.request_repaint();
+        });
+    }
+
+    fn begin_resource_enrichment(&self, resource_id: i64, ctx: &egui::Context) {
+        use crate::resource::ResourceService;
+        use crate::resource_enrichment::CredentialSource;
+        let config = self.resource_enrichment_config.clone();
+        if !config.enabled {
+            return;
+        }
+        let service = ResourceService::new(&self.db);
+        let Ok(Some(input)) = service.enrichment_input(resource_id) else {
+            return;
+        };
+        let snapshot_id = service
+            .get(resource_id)
+            .ok()
+            .and_then(|r| r.latest_snapshot_id);
+        let Ok(run_id) = service.start_enrichment(
+            resource_id,
+            snapshot_id,
+            &config.provider,
+            &config.model,
+            &config.prompt_version,
+            &config.schema_version,
+            Utc::now().timestamp(),
+        ) else {
+            return;
+        };
+        let event_tx = self.web_clip_event_tx.clone();
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let result=(||{let key=crate::resource_enrichment::SystemCredentialSource.api_key()?.context("未找到资源整理 API Key；请设置 SHIYUE_RESOURCE_API_KEY 或 Windows 凭据 rrss/resource-enrichment")?;let provider=crate::resource_enrichment::OpenAiCompatibleProvider::new(config.clone(),key)?;crate::resource_enrichment::enrich_with(&provider,&input,config.max_input_chars)})().map_err(|e:anyhow::Error|e.to_string());
+            let _ = event_tx.send(WebClipEvent::EnrichmentComplete {
+                resource_id,
+                run_id,
+                result,
+            });
+            repaint.request_repaint();
+        });
     }
 
     fn finish_web_clip_save(&mut self, source_url: Option<&str>, title: &str, content: &str) {
@@ -1873,6 +2089,553 @@ impl GuiApp {
             self.delete_web_clip_dialog = None;
         } else if cancel || !open {
             self.delete_web_clip_dialog = None;
+        }
+    }
+
+    fn show_resource_library_window(&mut self, ctx: &egui::Context) {
+        if !self.show_resource_library {
+            return;
+        }
+        use crate::resource::{ResourcePrivacy, ResourceService, ResourceStatus};
+        let resources = ResourceService::new(&self.db)
+            .recent(1000)
+            .unwrap_or_default();
+        let active_count = resources
+            .iter()
+            .filter(|r| r.status == ResourceStatus::Active)
+            .count();
+        let pending_count = resources
+            .iter()
+            .filter(|r| r.status == ResourceStatus::PendingReview)
+            .count();
+        let enrichment_count = resources
+            .iter()
+            .filter(|r| r.status == ResourceStatus::EnrichmentPending)
+            .count();
+        let query = self.resource_query.trim().to_lowercase();
+        let rows = resources
+            .into_iter()
+            .filter(|resource| {
+                let status_matches = match self.resource_filter {
+                    ResourceFilter::Active => resource.status == ResourceStatus::Active,
+                    ResourceFilter::PendingReview => {
+                        resource.status == ResourceStatus::PendingReview
+                    }
+                    ResourceFilter::EnrichmentPending => {
+                        resource.status == ResourceStatus::EnrichmentPending
+                    }
+                    ResourceFilter::Broken => resource.status == ResourceStatus::Broken,
+                    ResourceFilter::Archived => resource.status == ResourceStatus::Archived,
+                    ResourceFilter::All => true,
+                };
+                status_matches
+                    && (query.is_empty()
+                        || format!(
+                            "{} {} {} {}",
+                            resource.title.as_deref().unwrap_or(""),
+                            resource.url,
+                            resource.purpose_zh.as_deref().unwrap_or(""),
+                            resource.private_note.as_deref().unwrap_or("")
+                        )
+                        .to_lowercase()
+                        .contains(&query))
+            })
+            .collect::<Vec<_>>();
+        enum Action {
+            Open(String),
+            Edit(crate::resource::Resource),
+            Transition(i64, ResourceStatus),
+            Delete(i64),
+            Retry(i64, String),
+        }
+        let mut action = None;
+        let mut open = true;
+        egui::Window::new(format!("资源库 · {}", rows.len()))
+            .id(egui::Id::new("resource-library"))
+            .open(&mut open)
+            .resizable(true)
+            .default_size(egui::vec2(820.0, 650.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("＋ 添加网站").clicked() {
+                        self.resource_add_dialog = Some(ResourceAddDialog::default());
+                    }
+                    if ui.button("导入网页收藏").clicked() {
+                        match ResourceService::new(&self.db).preview_web_clipping_import() {
+                            Ok(candidates) => {
+                                self.resource_import_dialog = Some(ResourceImportDialog {
+                                    selected: candidates
+                                        .iter()
+                                        .filter(|item| !item.already_imported)
+                                        .map(|item| item.article_id)
+                                        .collect(),
+                                    candidates,
+                                })
+                            }
+                            Err(error) => {
+                                self.selection_notice =
+                                    Some((format!("读取网页收藏失败：{error}"), Instant::now()))
+                            }
+                        }
+                    }
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.resource_query)
+                            .hint_text("搜索标题、URL、用途或备注")
+                            .desired_width(280.0),
+                    );
+                    if ui.button("搜索资源和文章").clicked() {
+                        match ResourceService::new(&self.db).search_json(
+                            &self.resource_query,
+                            true,
+                            true,
+                            false,
+                            20,
+                        ) {
+                            Ok(results) => {
+                                self.resource_search_results = results;
+                                self.resource_search_error = None;
+                            }
+                            Err(error) => {
+                                self.resource_search_results.clear();
+                                self.resource_search_error = Some(error.to_string());
+                            }
+                        }
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    for (filter, label) in [
+                        (ResourceFilter::Active, format!("我的资源 {active_count}")),
+                        (
+                            ResourceFilter::PendingReview,
+                            format!("等待确认 {pending_count}"),
+                        ),
+                        (
+                            ResourceFilter::EnrichmentPending,
+                            format!("正在整理 {enrichment_count}"),
+                        ),
+                        (ResourceFilter::Broken, "失效".into()),
+                        (ResourceFilter::Archived, "归档".into()),
+                        (ResourceFilter::All, "全部".into()),
+                    ] {
+                        if ui
+                            .selectable_label(self.resource_filter == filter, label)
+                            .clicked()
+                        {
+                            self.resource_filter = filter;
+                        }
+                    }
+                });
+                if let Some(error) = &self.resource_search_error {
+                    ui.colored_label(egui::Color32::RED, format!("搜索失败：{error}"));
+                }
+                if !self.resource_query.trim().is_empty() {
+                    ui.weak(format!(
+                        "与 CLI 相同的统一搜索结果：{} 条",
+                        self.resource_search_results.len()
+                    ));
+                    for result in &self.resource_search_results {
+                        let kind = if result["result_type"] == "article" {
+                            "收藏文章"
+                        } else {
+                            "网站资源"
+                        };
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(format!("[{kind}]"));
+                            ui.strong(result["title"].as_str().unwrap_or("未命名"));
+                            if let Some(url) = result["url"].as_str() {
+                                ui.hyperlink_to("打开", url);
+                            }
+                            if let Some(purpose) = result["purpose_zh"].as_str() {
+                                ui.weak(purpose);
+                            }
+                        });
+                    }
+                    ui.separator();
+                }
+                ui.weak(match self.resource_filter {
+                    ResourceFilter::Active => "这些网站已经确认，AI 搜索资源时会返回它们。",
+                    ResourceFilter::PendingReview => {
+                        "通过 CLI 添加的网站先放在这里。确认收藏后，AI 才能在默认搜索中找到。"
+                    }
+                    ResourceFilter::EnrichmentPending => {
+                        "网址已经保存，正在抓取网页或等待 AI 补充用途、分类和标签。"
+                    }
+                    ResourceFilter::Broken => "抓取失败或网址失效的资源，可以重试或归档。",
+                    ResourceFilter::Archived => "暂时不用的资源，不会出现在 AI 默认搜索结果中。",
+                    ResourceFilter::All => "显示所有状态的资源。",
+                });
+                ui.separator();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for resource in &rows {
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    ui.strong(
+                                        resource.title.as_deref().unwrap_or("尚未整理的网站"),
+                                    );
+                                    ui.hyperlink_to(&resource.url, &resource.url);
+                                    if let Some(purpose) = &resource.purpose_zh {
+                                        ui.label(purpose);
+                                    }
+                                    if let Some(note) = &resource.private_note {
+                                        ui.weak(format!("备注：{note}"));
+                                    }
+                                    ui.weak(format!(
+                                        "状态：{}   隐私：{}   评分：{}",
+                                        match resource.status {
+                                            ResourceStatus::Active => "已收藏，可供 AI 搜索",
+                                            ResourceStatus::PendingReview => "等待你确认",
+                                            ResourceStatus::EnrichmentPending => "正在整理",
+                                            ResourceStatus::Broken => "抓取失败或网址失效",
+                                            ResourceStatus::Archived => "已归档",
+                                        },
+                                        if resource.privacy == ResourcePrivacy::Private {
+                                            "私密"
+                                        } else {
+                                            "公开"
+                                        },
+                                        resource
+                                            .manual_rating
+                                            .map_or("未设置".into(), |v| format!("{v}/5"))
+                                    ));
+                                });
+                            });
+                            ui.horizontal(|ui| {
+                                if ui.button("访问网站").clicked() {
+                                    action = Some(Action::Open(resource.url.clone()));
+                                }
+                                if ui.button("编辑信息").clicked() {
+                                    action = Some(Action::Edit(resource.clone()));
+                                }
+                                match resource.status {
+                                    ResourceStatus::PendingReview
+                                    | ResourceStatus::EnrichmentPending => {
+                                        if ui.button("确认收藏，让 AI 能搜到").clicked() {
+                                            action = Some(Action::Transition(
+                                                resource.id,
+                                                ResourceStatus::Active,
+                                            ));
+                                        }
+                                    }
+                                    ResourceStatus::Active | ResourceStatus::Broken => {
+                                        if ui.button("归档").clicked() {
+                                            action = Some(Action::Transition(
+                                                resource.id,
+                                                ResourceStatus::Archived,
+                                            ));
+                                        }
+                                    }
+                                    ResourceStatus::Archived => {
+                                        if ui.button("恢复").clicked() {
+                                            action = Some(Action::Transition(
+                                                resource.id,
+                                                ResourceStatus::Active,
+                                            ));
+                                        }
+                                    }
+                                }
+                                if (resource.purpose_zh.is_none()
+                                    || matches!(
+                                        resource.status,
+                                        ResourceStatus::EnrichmentPending | ResourceStatus::Broken
+                                    ))
+                                    && ui
+                                        .button(if resource.purpose_zh.is_none() {
+                                            "补全描述"
+                                        } else {
+                                            "重试"
+                                        })
+                                        .clicked()
+                                {
+                                    action = Some(Action::Retry(resource.id, resource.url.clone()));
+                                }
+                                if matches!(
+                                    resource.status,
+                                    ResourceStatus::PendingReview | ResourceStatus::Archived
+                                ) && ui.button("永久删除").clicked()
+                                {
+                                    action = Some(Action::Delete(resource.id));
+                                }
+                            });
+                        });
+                        ui.add_space(6.0);
+                    }
+                    if rows.is_empty() {
+                        ui.weak(
+                            "这里还没有资源。可以先添加常用网站，例如图标、设计素材或开发工具站。",
+                        );
+                    }
+                });
+            });
+        if !open {
+            self.show_resource_library = false;
+        }
+        match action {
+            Some(Action::Open(url)) => {
+                let _ = open::that(url);
+            }
+            Some(Action::Edit(resource)) => {
+                self.resource_edit_dialog = Some(ResourceEditDialog {
+                    id: resource.id,
+                    title: resource.title.unwrap_or_default(),
+                    purpose_zh: resource.purpose_zh.unwrap_or_default(),
+                    note: resource.private_note.unwrap_or_default(),
+                    private: resource.privacy == ResourcePrivacy::Private,
+                    rating: resource.manual_rating.unwrap_or(0),
+                })
+            }
+            Some(Action::Transition(id, status)) => {
+                match ResourceService::new(&self.db).transition(id, status, Utc::now().timestamp())
+                {
+                    Ok(_) => {
+                        self.selection_notice = Some(("资源状态已更新".into(), Instant::now()));
+                        if status == ResourceStatus::Active
+                            && let Ok(resource) = ResourceService::new(&self.db).get(id)
+                        {
+                            if resource.latest_snapshot_id.is_some()
+                                || resource.linked_article_id.is_some()
+                            {
+                                self.begin_resource_enrichment(id, ctx);
+                            } else {
+                                self.begin_resource_fetch(id, resource.url, ctx);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.selection_notice = Some((format!("操作失败：{e}"), Instant::now()))
+                    }
+                }
+            }
+            Some(Action::Delete(id)) => {
+                let title = ResourceService::new(&self.db)
+                    .get(id)
+                    .ok()
+                    .and_then(|resource| resource.title)
+                    .unwrap_or_else(|| format!("资源 #{id}"));
+                self.pending_resource_delete = Some((id, title));
+            }
+            Some(Action::Retry(id, url)) => {
+                let has_content = ResourceService::new(&self.db)
+                    .get(id)
+                    .map(|resource| {
+                        resource.latest_snapshot_id.is_some()
+                            || resource.linked_article_id.is_some()
+                    })
+                    .unwrap_or(false);
+                if has_content {
+                    self.begin_resource_enrichment(id, ctx);
+                    self.selection_notice = Some(("正在后台补全资源描述".into(), Instant::now()));
+                } else {
+                    self.begin_resource_fetch(id, url, ctx);
+                    self.selection_notice = Some(("正在后台抓取并整理资源".into(), Instant::now()));
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn show_resource_add_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.resource_add_dialog.as_mut() else {
+            return;
+        };
+        let mut open = true;
+        let mut save = false;
+        egui::Window::new("添加资源网站")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(520.0)
+            .show(ctx, |ui| {
+                ui.label("网址（唯一必填项）");
+                ui.add(
+                    egui::TextEdit::singleline(&mut dialog.url)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("https://koboyo.com/icons?q=app+icon"),
+                );
+                ui.label("私人备注（可选）");
+                ui.add(
+                    egui::TextEdit::multiline(&mut dialog.note)
+                        .desired_rows(3)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.checkbox(&mut dialog.private, "私密资源（永不发送到云端 AI）");
+                if let Some(error) = &dialog.error {
+                    ui.colored_label(egui::Color32::RED, error);
+                }
+                if ui.button("立即保存").clicked() {
+                    save = true;
+                }
+            });
+        if !open {
+            self.resource_add_dialog = None;
+            return;
+        }
+        if save {
+            use crate::resource::{
+                NewResource, ResourceKind, ResourcePrivacy, ResourceService, ResourceSource,
+            };
+            let input = NewResource {
+                url: dialog.url.clone(),
+                parent_resource_id: None,
+                linked_article_id: None,
+                kind: ResourceKind::Page,
+                title: None,
+                private_note: non_empty_owned(&dialog.note),
+                privacy: if dialog.private {
+                    ResourcePrivacy::Private
+                } else {
+                    ResourcePrivacy::Public
+                },
+                source: ResourceSource::Gui,
+                manual_rating: None,
+            };
+            match ResourceService::new(&self.db).create(&input, Utc::now().timestamp()) {
+                Ok(resource) => {
+                    let id = resource.id;
+                    let url = resource.url;
+                    self.resource_add_dialog = None;
+                    self.selection_notice =
+                        Some(("资源网址已保存；断网也不会丢失".into(), Instant::now()));
+                    self.begin_resource_fetch(id, url, ctx);
+                }
+                Err(e) => dialog.error = Some(e.to_string()),
+            }
+        }
+    }
+
+    fn show_resource_edit_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.resource_edit_dialog.as_mut() else {
+            return;
+        };
+        let mut open = true;
+        let mut save = false;
+        egui::Window::new("编辑资源")
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(520.0)
+            .show(ctx, |ui| {
+                ui.label("标题");
+                ui.text_edit_singleline(&mut dialog.title);
+                ui.label("用途");
+                ui.text_edit_multiline(&mut dialog.purpose_zh);
+                ui.label("私人备注");
+                ui.text_edit_multiline(&mut dialog.note);
+                ui.checkbox(&mut dialog.private, "私密资源");
+                ui.horizontal(|ui| {
+                    ui.label("评分");
+                    ui.add(
+                        egui::Slider::new(&mut dialog.rating, 0..=5).custom_formatter(|v, _| {
+                            if v == 0.0 {
+                                "未设置".into()
+                            } else {
+                                format!("{v:.0}/5")
+                            }
+                        }),
+                    );
+                });
+                if ui.button("保存修改").clicked() {
+                    save = true;
+                }
+            });
+        if !open {
+            self.resource_edit_dialog = None;
+            return;
+        }
+        if save {
+            use crate::resource::{ResourcePrivacy, ResourceService};
+            let result = ResourceService::new(&self.db).update_manual_fields(
+                dialog.id,
+                non_empty_owned(&dialog.title).as_deref(),
+                non_empty_owned(&dialog.purpose_zh).as_deref(),
+                non_empty_owned(&dialog.note).as_deref(),
+                if dialog.private {
+                    ResourcePrivacy::Private
+                } else {
+                    ResourcePrivacy::Public
+                },
+                (dialog.rating > 0).then_some(dialog.rating),
+                Utc::now().timestamp(),
+            );
+            match result {
+                Ok(_) => {
+                    self.resource_edit_dialog = None;
+                    self.selection_notice = Some(("资源已更新".into(), Instant::now()));
+                }
+                Err(e) => self.selection_notice = Some((format!("保存失败：{e}"), Instant::now())),
+            }
+        }
+    }
+
+    fn show_resource_delete_confirmation(&mut self, ctx: &egui::Context) {
+        let Some((id, title)) = self.pending_resource_delete.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new("永久删除资源")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(format!("确定永久删除「{title}」吗？"));
+                ui.weak("资源快照、分类、标签和整理记录会一起删除；关联的博客文章不会删除。");
+                ui.horizontal(|ui| {
+                    if ui.button("确认永久删除").clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if confirm {
+            match crate::resource::ResourceService::new(&self.db).delete(id) {
+                Ok(_) => self.selection_notice = Some(("资源已永久删除".into(), Instant::now())),
+                Err(error) => {
+                    self.selection_notice = Some((format!("删除失败：{error}"), Instant::now()))
+                }
+            }
+            self.pending_resource_delete = None;
+        } else if cancel || !open {
+            self.pending_resource_delete = None;
+        }
+    }
+
+    fn show_resource_import_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.resource_import_dialog.as_mut() else {
+            return;
+        };
+        let mut open = true;
+        let mut import = false;
+        egui::Window::new("导入已有网页收藏").open(&mut open).default_size(egui::vec2(650.0,520.0)).show(ctx,|ui|{
+            ui.label("只创建 Resource 与原 Article 的关联，不复制正文，也不改变原文章、标签或收藏状态。");ui.separator();
+            egui::ScrollArea::vertical().show(ui,|ui|{for candidate in &dialog.candidates{let mut checked=dialog.selected.contains(&candidate.article_id);ui.horizontal(|ui|{let response=ui.add_enabled(!candidate.already_imported,egui::Checkbox::new(&mut checked,""));if response.changed(){if checked{dialog.selected.insert(candidate.article_id);}else{dialog.selected.remove(&candidate.article_id);}}ui.vertical(|ui|{ui.label(candidate.title.as_deref().unwrap_or(&candidate.url));ui.weak(if candidate.already_imported{format!("{} · 已导入",candidate.url)}else{candidate.url.clone()});});});ui.separator();}});
+            if ui.add_enabled(!dialog.selected.is_empty(),egui::Button::new(format!("导入选中的 {} 项",dialog.selected.len()))).clicked(){import=true;}
+        });
+        if !open {
+            self.resource_import_dialog = None;
+            return;
+        }
+        if import {
+            let ids = dialog.selected.iter().copied().collect::<Vec<_>>();
+            match crate::resource::ResourceService::new(&self.db)
+                .import_web_clippings(&ids, Utc::now().timestamp())
+            {
+                Ok(created) => {
+                    for resource_id in &created {
+                        self.begin_resource_enrichment(*resource_id, ctx);
+                    }
+                    self.selection_notice = Some((
+                        format!("已导入 {} 个资源，正在后台补全描述", created.len()),
+                        Instant::now(),
+                    ));
+                    self.resource_import_dialog = None;
+                }
+                Err(error) => {
+                    self.selection_notice = Some((format!("导入失败：{error}"), Instant::now()))
+                }
+            }
         }
     }
 
@@ -2916,6 +3679,30 @@ impl eframe::App for GuiApp {
                 );
                 if saved_articles_response.clicked() {
                     self.select_saved_articles();
+                    self.show_saved_library = false;
+                    self.show_archive_library = false;
+                    self.selection_popup = None;
+                }
+                ui.add_space(4.0);
+                let resources_response = ui.add(
+                    egui::Button::new(egui::RichText::new("◆ 资源库").size(13.0).color(
+                        if self.show_resource_library {
+                            theme.text
+                        } else {
+                            theme.accent
+                        },
+                    ))
+                    .fill(if self.show_resource_library {
+                        theme.selected_bg
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    })
+                    .stroke(egui::Stroke::NONE)
+                    .corner_radius(egui::CornerRadius::same(4))
+                    .min_size(egui::vec2(ui.available_width(), 34.0)),
+                );
+                if resources_response.clicked() {
+                    self.show_resource_library = true;
                     self.show_saved_library = false;
                     self.show_archive_library = false;
                     self.selection_popup = None;
@@ -4297,6 +5084,11 @@ impl eframe::App for GuiApp {
                 }
             });
         self.show_saved_library_window(&ctx);
+        self.show_resource_library_window(&ctx);
+        self.show_resource_add_dialog(&ctx);
+        self.show_resource_edit_dialog(&ctx);
+        self.show_resource_delete_confirmation(&ctx);
+        self.show_resource_import_dialog(&ctx);
         self.show_archive_library_window(&ctx);
         self.show_search_window(&ctx);
         self.show_tag_dialog(&ctx);

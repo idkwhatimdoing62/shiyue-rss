@@ -1,6 +1,6 @@
 [package]
 name = "rrss"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "拾阅，一款专注阅读体验的 Windows 桌面 RSS 阅读器"
 license = "MIT"
@@ -33,10 +33,11 @@ mathjax-svg-rs = "0.4.0"
 notify-rust = "4.18.0"
 encoding_rs = "0.8.35"
 open = { version = "5.4.0", features = ["shellexecute-on-windows"] }
-reqwest = { version = "0.13.4", default-features = false, features = ["native-tls", "gzip", "brotli", "deflate", "zstd", "http2", "blocking"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["native-tls", "gzip", "brotli", "deflate", "zstd", "http2", "blocking", "json"] }
 rusqlite = { version = "0.40.1", features = ["backup", "bundled"] }
 scraper = "0.27.0"
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0"
 sha2 = "0.10.9"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time"] }
@@ -47,4 +48,4 @@ tray-icon = "0.19"
 dom_smoothie = "0.18.0"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Credentials", "Win32_Security_Cryptography"] }

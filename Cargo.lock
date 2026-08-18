@@ -4268,6 +4268,8 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "rustls-pki-types",
+ "serde",
+ "serde_json",
  "sync_wrapper",
  "tokio",
  "tokio-native-tls",
@@ -4339,7 +4341,7 @@ checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 
 [[package]]
 name = "rrss"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chardetng",
@@ -4359,6 +4361,7 @@ dependencies = [
  "rusqlite",
  "scraper",
  "serde",
+ "serde_json",
  "sha2",
  "thiserror 2.0.18",
  "tokio",
