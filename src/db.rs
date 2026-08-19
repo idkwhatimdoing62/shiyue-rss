@@ -1,7 +1,7 @@
 //! SQLite 访问层（ADR-3）。daemon 与 TUI 两进程共享同一库，WAL 模式扛并发。
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
@@ -14,6 +14,14 @@ use crate::model::{
 /// annotations for locally saved web pages.
 pub const WEB_CLIPPINGS_FEED_URL: &str = "shiyue://web-clippings";
 const WEB_CLIPPINGS_FEED_TITLE: &str = "网页收藏";
+
+#[derive(Debug, Clone)]
+pub struct ArticleAiContent {
+    pub summary_zh: String,
+    pub translation_zh: String,
+    pub model: String,
+    pub updated_at: i64,
+}
 
 pub(crate) const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS feeds (
@@ -72,6 +80,13 @@ CREATE TABLE IF NOT EXISTS article_tags (
   PRIMARY KEY(article_id, tag_id)
 );
 CREATE INDEX IF NOT EXISTS idx_article_tags_tag ON article_tags(tag_id, article_id);
+CREATE TABLE IF NOT EXISTS article_ai (
+  article_id     INTEGER PRIMARY KEY REFERENCES articles(id) ON DELETE CASCADE,
+  summary_zh     TEXT NOT NULL,
+  translation_zh TEXT NOT NULL,
+  model          TEXT NOT NULL,
+  updated_at     INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS search_history (
   query         TEXT PRIMARY KEY COLLATE NOCASE,
   last_used_at  INTEGER NOT NULL,
@@ -838,6 +853,42 @@ impl Db {
         Ok(self
             .conn
             .query_row(&sql, params![article_id], map_article)?)
+    }
+
+    pub fn article_ai(&self, article_id: i64) -> Result<Option<ArticleAiContent>> {
+        self.conn
+            .query_row(
+                "SELECT summary_zh, translation_zh, model, updated_at FROM article_ai WHERE article_id=?1",
+                [article_id],
+                |row| {
+                    Ok(ArticleAiContent {
+                        summary_zh: row.get(0)?,
+                        translation_zh: row.get(1)?,
+                        model: row.get(2)?,
+                        updated_at: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn save_article_ai(
+        &self,
+        article_id: i64,
+        summary_zh: &str,
+        translation_zh: &str,
+        model: &str,
+        now: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO article_ai(article_id,summary_zh,translation_zh,model,updated_at)
+             VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(article_id) DO UPDATE SET summary_zh=excluded.summary_zh,
+             translation_zh=excluded.translation_zh,model=excluded.model,updated_at=excluded.updated_at",
+            params![article_id, summary_zh, translation_zh, model, now],
+        )?;
+        Ok(())
     }
 
     pub fn archived_articles(&self) -> Result<Vec<Article>> {

@@ -381,6 +381,18 @@ impl<'a> ResourceService<'a> {
         })
         .collect()
     }
+    pub fn categories(&self, id: i64) -> Result<Vec<Category>> {
+        let mut stmt = self.db.conn.prepare(
+            "SELECT category FROM resource_categories WHERE resource_id=?1 ORDER BY category",
+        )?;
+        let values = stmt
+            .query_map([id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        values
+            .into_iter()
+            .map(|value| Category::parse(&value))
+            .collect()
+    }
     pub fn record_snapshot(&self, id: i64, input: &SnapshotInput, now: i64) -> Result<Option<i64>> {
         if input.fetch_error.is_some() {
             self.db.conn.execute("INSERT INTO resource_snapshots(resource_id,fetched_url,http_status,title,fetched_at,fetch_error) VALUES(?1,?2,?3,?4,?5,?6)",params![id,input.fetched_url,input.http_status,input.title,now,input.fetch_error])?;
