@@ -96,10 +96,22 @@ impl BackupStore {
 
     /// Restore only after a fresh unencrypted safety backup has completed.
     /// The returned entry is that rollback point.
+    #[allow(dead_code)]
     pub fn restore(&self, db: &mut Db, entry: &BackupEntry) -> Result<BackupEntry> {
         // Do not prune here: the selected source can itself be the oldest
         // backup. Pruning it before restore would make a valid choice vanish.
-        let safety = self.create_unpruned(db, BackupProtection::Plain)?;
+        let safety = self.create_safety(db)?;
+        self.restore_after_safety(db, entry)?;
+        Ok(safety)
+    }
+
+    pub(crate) fn create_safety(&self, db: &Db) -> Result<BackupEntry> {
+        self.create_unpruned(db, BackupProtection::Plain)
+    }
+
+    /// Restore after the caller has persisted the safety-copy path in the
+    /// maintenance coordination state.
+    pub(crate) fn restore_after_safety(&self, db: &mut Db, entry: &BackupEntry) -> Result<()> {
         let source = if entry.protected {
             let encoded = fs::read(&entry.path)?;
             let payload = encoded
@@ -117,7 +129,7 @@ impl BackupStore {
             None
         };
         let restore_path = source.as_deref().unwrap_or(&entry.path);
-        let result = db.restore_from(restore_path);
+        let result = db.restore_from_uncoordinated(restore_path);
         let cleanup = if let Some(temp) = source {
             remove_temporary_database(&temp)
         } else {
@@ -125,7 +137,7 @@ impl BackupStore {
             Ok(())
         };
         match (result, cleanup) {
-            (Ok(()), Ok(())) => Ok(safety),
+            (Ok(()), Ok(())) => Ok(()),
             (Ok(()), Err(cleanup)) => {
                 bail!("数据库已经恢复，但解密临时文件清理失败：{cleanup}")
             }
@@ -134,6 +146,24 @@ impl BackupStore {
                 Err(error.context(format!("恢复失败后，解密临时文件清理也失败：{cleanup}")))
             }
         }
+    }
+
+    /// Crash-recovery path for a database that is too damaged to open. Safety
+    /// copies are always plain SQLite files and remain untouched as the
+    /// rollback point if replacing the primary file fails.
+    pub(crate) fn restore_safety_file(&self, database: &Path, safety: &Path) -> Result<()> {
+        if !safety.exists() {
+            bail!("maintenance safety backup is missing: {}", safety.display());
+        }
+        remove_database_sidecars(database);
+        fs::copy(safety, database).with_context(|| {
+            format!(
+                "restore maintenance safety backup {} -> {}",
+                safety.display(),
+                database.display()
+            )
+        })?;
+        Ok(())
     }
 
     pub fn list(&self) -> Result<Vec<BackupEntry>> {

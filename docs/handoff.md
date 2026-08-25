@@ -15,7 +15,7 @@
 - 检查时 HEAD：`fa92106 feat: improve article favorites and web guide imports`
 - 工作区已有大量未提交修改和未跟踪文件，且 `src/db.rs`、`src/model.rs`、`src/gui.rs`、`src/lib.rs`、`src/config.rs` 等与本功能可能重叠。
 - 这些现场改动属于用户或前序 Agent。保留并理解它们，在当前设计上增量实现；不得 reset、checkout、清理或覆盖。
-- 现有 `CONTEXT.md` 定义 Article Bookmark、Read Later、Tag、Stable Excerpt Anchor、Batch Article Action 和 Search History。新增术语要与它保持一致；Resource 与 Article 是不同领域实体。
+- 现有 `CONTEXT.md` 定义 Article Bookmark、Read Later、Tag、Stable Excerpt Anchor、Batch Article Action 和 Search History。Article 的收藏、稍后读、归档、已读、标签和批量操作必须经过 [ADR-0006](adr/0006-centralize-article-library-lifecycle.md) 的 Article Library Lifecycle；Resource 与 Article 是不同领域实体。
 
 ## 接手步骤
 
@@ -55,6 +55,12 @@
 - API Key 只来自 Windows Credential Manager 或环境变量。
 - Agent 的 CLI 写能力止于 `resource add`；edit、tag、archive 和 delete 由 GUI 中的人执行。
 
+## 当前架构进展（2026-08-25）
+
+Resource 写入已由 [ADR-0007](adr/0007-centralize-resource-library-lifecycle.md) 收口到 `src/resource_library_lifecycle.rs`。GUI 与 CLI 应只调用 `project(scope)` / `apply(change, refresh_scope)`；不要恢复旧 `ResourceService`，也不要在调用方提交后再手工拼接抓取或 AI 任务。
+
+Knowledge Processing 通过 `src/knowledge_workflow/resource_target.rs` 维护抓取、健康和 enrichment 结果，并作为 post-commit handoff adapter 接收资源补全请求。schema 当前版本为 v4，新增整理状态、健康状态、分类来源和来源失败计数。后续修改必须保留事务内权威投影、人工 provenance、private 纯本地、批量导入全有或全无、处理中禁止永久删除等不变量。
+
 ## 可直接发送给 rrss Agent 的消息
 
 ```text
@@ -70,4 +76,3 @@ C:\Users\xingr\Documents\囤囤鼠\.scratch\ai-resource-memory\spec.md
 
 先提交文件级实施计划和重叠风险，然后只实施规格 Phase 1。完成 Phase 1 的迁移、测试和完整验证后停下汇报，等我确认再进入 Phase 2。若规格与当前代码冲突，用文件和行号给出证据后问我，不要静默改变已确认的产品决策。
 ```
-

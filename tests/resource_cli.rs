@@ -43,10 +43,20 @@ fn json_envelopes_keep_stdout_clean_and_use_documented_exit_codes() {
     let envelope: serde_json::Value = serde_json::from_slice(&pending.stdout).unwrap();
     assert_eq!(envelope["data"].as_array().unwrap().len(), 1);
 
+    let queued = run(&root, &["resource", "retry", "1", "--no-wait", "--json"]);
+    assert_eq!(queued.status.code(), Some(0));
+    let envelope: serde_json::Value = serde_json::from_slice(&queued.stdout).unwrap();
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["data"]["queued"], true);
+    assert_eq!(envelope["data"]["disposition"], "created");
+
     let missing = run(&root, &["resource", "get", "999", "--json"]);
     assert_eq!(missing.status.code(), Some(3));
     let envelope: serde_json::Value = serde_json::from_slice(&missing.stdout).unwrap();
     assert_eq!(envelope["error"]["code"], "RESOURCE_NOT_FOUND");
+
+    let missing_retry = run(&root, &["resource", "retry", "999", "--no-wait", "--json"]);
+    assert_eq!(missing_retry.status.code(), Some(3));
 
     std::fs::remove_dir_all(root).unwrap();
 }

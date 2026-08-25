@@ -31,6 +31,7 @@ pub struct DefinitionItem {
     pub definitions: Vec<String>,
 }
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Block {
     Text(String),
@@ -944,10 +945,10 @@ pub fn content_blocks(html: &str, base: Option<&str>) -> Vec<Block> {
                     // around the image so document order and both semantics
                     // remain available to the renderer.
                     flush_quote(&mut quote_buf, &mut blocks);
-                    if let Some(src) = image_src(&tag).and_then(|s| resolve(&s, base)) {
-                        if seen_images.insert(src.clone()) {
-                            blocks.push(Block::Image(src));
-                        }
+                    if let Some(src) = image_src(&tag).and_then(|s| resolve(&s, base))
+                        && seen_images.insert(src.clone())
+                    {
+                        blocks.push(Block::Image(src));
                     }
                 } else if name == "blockquote" {
                     if closing {
@@ -1704,10 +1705,10 @@ fn image_src(tag: &str) -> Option<String> {
         }
     }
     for name in ["data-srcset", "srcset"] {
-        if let Some(value) = attr(tag, name) {
-            if let Some(candidate) = srcset_largest(&value) {
-                return Some(candidate);
-            }
+        if let Some(value) = attr(tag, name)
+            && let Some(candidate) = srcset_largest(&value)
+        {
+            return Some(candidate);
         }
     }
     attr(tag, "src").filter(|v| usable_image_url(v))
@@ -1730,7 +1731,7 @@ fn srcset_largest(value: &str) -> Option<String> {
                 None
             }
         })
-        .last()
+        .next_back()
 }
 
 /// 清洗累积的文字（解码实体、折叠空行），按当前 HTML 语义推入块并清空缓冲。
@@ -1764,17 +1765,16 @@ fn flush_text_kind(buf: &mut String, blocks: &mut Vec<Block>, strong: bool, head
     // e.g. `<p>（5）解决方法</p><p>。研究人员提出...</p>`. Keep that
     // punctuation attached to the preceding numbered heading instead of
     // rendering it as a new paragraph.
-    if let Some(first) = cleaned.chars().next() {
-        if matches!(first, '。' | '．' | '.' | '！' | '？' | '，' | ',')
-            && blocks.last().is_some_and(
-                |block| matches!(block, Block::Strong(text) if is_numbered_heading(text)),
-            )
-        {
-            if let Some(Block::Strong(previous)) = blocks.last_mut() {
-                previous.push(first);
-            }
-            cleaned = cleaned[first.len_utf8()..].trim_start().to_owned();
+    if let Some(first) = cleaned.chars().next()
+        && matches!(first, '。' | '．' | '.' | '！' | '？' | '，' | ',')
+        && blocks
+            .last()
+            .is_some_and(|block| matches!(block, Block::Strong(text) if is_numbered_heading(text)))
+    {
+        if let Some(Block::Strong(previous)) = blocks.last_mut() {
+            previous.push(first);
         }
+        cleaned = cleaned[first.len_utf8()..].trim_start().to_owned();
     }
     if !cleaned.is_empty() {
         if heading {

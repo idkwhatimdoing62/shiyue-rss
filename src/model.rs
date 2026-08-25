@@ -148,19 +148,6 @@ pub fn resolve_excerpt_anchor(
     best.map(|(start, _, _)| start..start + quote.len())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Tag {
-    pub id: i64,
-    pub name: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ArticleBatchAction {
-    Archive,
-    Bookmark,
-    ReadLater,
-}
-
 /// 全局搜索的一条命中。文章标题、作者、正文与网址产生 `Article` 命中；
 /// 摘录原文和想法分别产生对应命中。所有结果都保留文章 id，供界面直接跳回原文。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,10 +1,10 @@
 # 拾阅（原 rrss）—— RSS 订阅器设计大纲
 
-> ⚠ 本文是 2026-07-11 的初版规划稿，形态已演进。**当前架构以 [adr.md](adr.md) 的 ADR-13～16 为准**：
-> `shiyue`（无参）进桌面 GUI（`egui`），GUI 内置后台线程做抓取+调度，`daemon`/`tui` 命令已删。
+> ⚠ 本文是 2026-07-11 的初版规划稿，形态已演进。**当前架构以 [adr.md](adr.md)、[ADR-0004](adr/0004-session-bound-rss-refresh-workflow.md)、[ADR-0005](adr/0005-centralize-feed-subscription-lifecycle.md) 和 [ADR-0006](adr/0006-centralize-article-library-lifecycle.md) 为准**：
+> `shiyue`（无参）进桌面 GUI（`egui`），RSS Refresh Workflow 统一承担 GUI/CLI 抓取与调度，`daemon`/`tui` 命令已删。
 > 下面涉及 TUI / `rrss daemon` / `tui/` 目录的段落均为历史设计，保留作背景。
 
-一句话定位（现）：**一个 Rust 桌面应用（egui），无参启动即开窗阅读；进程内后台线程定时并发抓取订阅源、发现新文章写库并弹桌面通知（关窗缩到系统托盘继续）。CLI 子命令 `add/rm/list/update/...` 仍在。**
+一句话定位（现）：**一个 Rust 桌面应用（egui），无参启动即开窗阅读；进程内 RSS Refresh Workflow 定时并发抓取订阅源、发现新文章写库并弹桌面通知（关窗缩到系统托盘继续）。CLI 子命令 `add/rm/list/update/...` 复用同一工作流。**
 
 决策理由见 [adr.md](adr.md)，术语见 [glossary.md](glossary.md)。
 
@@ -40,7 +40,9 @@ rrss/
    ├─ db.rs        // rusqlite：建表、feed/article 的增删查改
    ├─ model.rs     // Feed / Article 领域类型
    ├─ fetch.rs     // reqwest 拉取 + feed-rs 解析 → 归一 Entry
-   ├─ daemon.rs    // tokio 调度循环：到期检查、并发抓、退避、禁用、触发通知
+   ├─ feed_subscription.rs // 订阅增删、启停、间隔与首次刷新排序的唯一应用写入口
+   ├─ rss_refresh_workflow.rs // 到期调度、意图合并、并发抓取、独立提交、维护隔离
+   ├─ article_library_lifecycle.rs // 文章收藏、稍后读、归档、已读、标签与批量操作的唯一应用入口
    ├─ notify.rs    // notify-rust 封装
    └─ tui/
       ├─ mod.rs    // 事件循环（crossterm 读键）

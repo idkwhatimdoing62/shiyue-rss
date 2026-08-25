@@ -71,12 +71,16 @@ fn entry_to_article(e: feed_rs::model::Entry) -> NewArticle {
                 .flatten()
         }));
     }
-    media_images.extend(e.links.iter().filter_map(|link| {
-        link.media_type
-            .as_deref()
-            .is_some_and(|kind| kind.starts_with("image/"))
-            .then(|| link.href.clone())
-    }));
+    media_images.extend(
+        e.links
+            .iter()
+            .filter(|&link| {
+                link.media_type
+                    .as_deref()
+                    .is_some_and(|kind| kind.starts_with("image/"))
+            })
+            .map(|link| link.href.clone()),
+    );
     if !media_images.is_empty() {
         let html = content.get_or_insert_with(String::new);
         for image in media_images {

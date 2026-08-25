@@ -33,6 +33,7 @@ Product scope: personal, local-first, Windows desktop
 - `web_clip.rs` 已实施 HTTP(S) 限制、SSRF/内网阻断、重定向检查和响应体上限；Resource 抓取复用同一安全路径。
 - `text.rs` 已提供标题与正文抽取；Resource 不另写第二套 HTML 清洗器。
 - `lib.rs` 中模块当前均为私有；CLI 与 GUI 应调用同一内部 service，而不是各复制一套流程。
+- Article 的收藏、稍后读、归档、已读、标签和批量操作统一经过 Article Library Lifecycle；GUI 采用其权威投影，不直接拼接 `Db` 写操作或自行修补计数（ADR-0006）。
 
 规格中的命令使用实际二进制名 `shiyue-cli`。重命名可执行文件不属于本功能。
 
@@ -259,6 +260,8 @@ shiyue-cli resource get <id> --json
 shiyue-cli resource recent --limit 20 --json
 shiyue-cli resource pending --json
 shiyue-cli resource retry <id> --json
+shiyue-cli resource retry <id> --timeout 5m --json
+shiyue-cli resource retry <id> --no-wait --json
 shiyue-cli resource add <url> [--note <text>] [--private] --json
 ```
 
@@ -432,3 +435,9 @@ shiyue-cli resource add <url> [--note <text>] [--private] --json
 - 需要 ChatGPT 网页直接访问：单独设计远程 MCP、隧道、鉴权和 private 字段隔离。
 - 多入口采集导致 GUI/CLI service 边界吃力：评估独立本地后台服务。
 - usage event 数据足够且能区分“返回”与“采用”：再决定是否纳入排序。
+
+## 17. Resource Library Lifecycle 架构约束
+
+Resource 的创建、完整人工编辑、整理状态转换、永久删除、网页收藏导入和集合投影统一经过 [ADR-0007](adr/0007-centralize-resource-library-lifecycle.md) 的 Resource Library Lifecycle。GUI 和 CLI 不得直接组合低层 Resource 写入与 Knowledge Processing 请求。
+
+整理状态（待确认、可用、已归档）与来源健康（未知、健康、失效）必须保持正交；“失效”是与未归档集合重叠的运维视图。人工编辑以完整替换事务写入，并标记人工 provenance。后台补全只能在资源事务提交后交接；失败时保留已提交资料并提供可重试技术详情。schema v4 的迁移与生命周期回归测试是该边界的验收证据。

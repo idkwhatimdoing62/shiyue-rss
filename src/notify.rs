@@ -1,4 +1,4 @@
-//! 桌面通知（ADR-7 N1）。失败只记日志，不影响 daemon。
+//! 桌面通知（ADR-7 N1）。失败只记日志，不影响 RSS Refresh Workflow。
 //! ponytail: Windows toast 依赖系统的 AppUserModelID，个别环境不弹属正常，日志兜底。
 
 pub fn notify_new(feeds: usize, articles: usize) {

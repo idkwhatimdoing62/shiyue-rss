@@ -1,5 +1,4 @@
-//! Independent resource-library domain and persistence service (spec phase 1).
-#![allow(dead_code)] // Phase 2-4 consumers intentionally land after this boundary.
+//! Private SQLite implementation for Resource Library Lifecycle.
 
 use anyhow::{Context, Result, bail};
 use reqwest::Url;
@@ -27,6 +26,23 @@ pub enum ResourceStatus {
     Active,
     Broken,
     Archived,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceCurationState {
+    PendingReview,
+    Active,
+    Archived,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceHealth {
+    Unknown,
+    Healthy,
+    Broken,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClassificationSource {
+    Manual,
+    Ai,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceSource {
@@ -79,14 +95,17 @@ pub enum UsageEventKind {
 macro_rules! string_enum {
     ($ty:ty, {$($variant:path => $value:literal),+ $(,)?}) => {
         impl $ty {
-            fn as_str(self) -> &'static str { match self { $($variant => $value),+ } }
-            fn parse(value: &str) -> Result<Self> { match value { $($value => Ok($variant)),+, _ => bail!("invalid {}: {value}", stringify!($ty)) } }
+            pub(super) fn as_str(self) -> &'static str { match self { $($variant => $value),+ } }
+            pub(super) fn parse(value: &str) -> Result<Self> { match value { $($value => Ok($variant)),+, _ => bail!("invalid {}: {value}", stringify!($ty)) } }
         }
     };
 }
 string_enum!(ResourceKind, {ResourceKind::Site=>"site", ResourceKind::Page=>"page", ResourceKind::Article=>"article"});
 string_enum!(ResourcePrivacy, {ResourcePrivacy::Public=>"public", ResourcePrivacy::Private=>"private"});
 string_enum!(ResourceStatus, {ResourceStatus::PendingReview=>"pending_review", ResourceStatus::EnrichmentPending=>"enrichment_pending", ResourceStatus::Active=>"active", ResourceStatus::Broken=>"broken", ResourceStatus::Archived=>"archived"});
+string_enum!(ResourceCurationState, {ResourceCurationState::PendingReview=>"pending_review", ResourceCurationState::Active=>"active", ResourceCurationState::Archived=>"archived"});
+string_enum!(ResourceHealth, {ResourceHealth::Unknown=>"unknown", ResourceHealth::Healthy=>"healthy", ResourceHealth::Broken=>"broken"});
+string_enum!(ClassificationSource, {ClassificationSource::Manual=>"manual", ClassificationSource::Ai=>"ai"});
 string_enum!(ResourceSource, {ResourceSource::Gui=>"gui", ResourceSource::CliAgent=>"cli_agent", ResourceSource::Import=>"import"});
 string_enum!(Pricing, {Pricing::Free=>"free", Pricing::Freemium=>"freemium", Pricing::Paid=>"paid", Pricing::Unknown=>"unknown"});
 string_enum!(Category, {Category::Tool=>"tool", Category::AssetLibrary=>"asset-library", Category::Docs=>"docs", Category::Blog=>"blog", Category::Inspiration=>"inspiration", Category::Service=>"service", Category::Repository=>"repository", Category::Other=>"other"});
@@ -114,6 +133,11 @@ pub struct Resource {
     pub private_note: Option<String>,
     pub privacy: ResourcePrivacy,
     pub status: ResourceStatus,
+    pub curation_state: ResourceCurationState,
+    pub health: ResourceHealth,
+    pub categories_source: ClassificationSource,
+    pub tags_source: ClassificationSource,
+    pub source_failure_count: i64,
     pub source: ResourceSource,
     pub manual_rating: Option<i64>,
     pub latest_snapshot_id: Option<i64>,
@@ -158,19 +182,24 @@ pub struct ImportCandidate {
     pub already_imported: bool,
 }
 
-pub struct ResourceService<'a> {
+pub(super) struct ResourceStore<'a> {
     db: &'a Db,
 }
-impl<'a> ResourceService<'a> {
+impl<'a> ResourceStore<'a> {
     pub fn new(db: &'a Db) -> Self {
         Self { db }
     }
     pub fn create(&self, input: &NewResource, now: i64) -> Result<Resource> {
         validate_rating(input.manual_rating)?;
         let canonical = canonicalize_url(&input.url)?;
+        let curation_state = if input.source == ResourceSource::CliAgent {
+            ResourceCurationState::PendingReview
+        } else {
+            ResourceCurationState::Active
+        };
         self.db.conn.execute(
-            "INSERT INTO resources(url, canonical_url, parent_resource_id, linked_article_id, kind, title, private_note, privacy, status, source, manual_rating, created_at, updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12)",
-            params![input.url.trim(), canonical, input.parent_resource_id, input.linked_article_id, input.kind.as_str(), input.title, input.private_note, input.privacy.as_str(), initial_status(input.source).as_str(), input.source.as_str(), input.manual_rating, now])
+            "INSERT INTO resources(url, canonical_url, parent_resource_id, linked_article_id, kind, title, private_note, privacy, status, curation_state, health, source, manual_rating, created_at, updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'unknown',?11,?12,?13,?13)",
+            params![input.url.trim(), canonical, input.parent_resource_id, input.linked_article_id, input.kind.as_str(), input.title, input.private_note, input.privacy.as_str(), initial_status(input.source).as_str(), curation_state.as_str(), input.source.as_str(), input.manual_rating, now])
             .context("create resource")?;
         let id = self.db.conn.last_insert_rowid();
         self.refresh_search_index(id)?;
@@ -186,6 +215,7 @@ impl<'a> ResourceService<'a> {
             )
             .context("resource not found")
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn update_content(
         &self,
         id: i64,
@@ -214,6 +244,7 @@ impl<'a> ResourceService<'a> {
         self.refresh_search_index(id)?;
         Ok(())
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn update_manual_fields(
         &self,
         id: i64,
@@ -280,40 +311,65 @@ impl<'a> ResourceService<'a> {
         output: &crate::resource_enrichment::EnrichmentOutput,
         now: i64,
     ) -> Result<()> {
+        let tx = self.db.conn.unchecked_transaction()?;
+        Self::apply_enrichment_on(&tx, id, output, now)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Apply an AI result through a caller-owned transaction. The knowledge
+    /// workflow uses this to commit the business result and fenced task state
+    /// atomically.
+    pub(crate) fn apply_enrichment_on(
+        conn: &rusqlite::Connection,
+        id: i64,
+        output: &crate::resource_enrichment::EnrichmentOutput,
+        now: i64,
+    ) -> Result<()> {
         let capabilities = serde_json::to_string(&output.capabilities)?;
         let limitations = serde_json::to_string(&output.limitations)?;
         let languages = serde_json::to_string(&output.languages)?;
-        let tx = self.db.conn.unchecked_transaction()?;
-        tx.execute("UPDATE resources SET purpose_zh=CASE WHEN purpose_source='manual' THEN purpose_zh ELSE ?2 END,purpose_source=CASE WHEN purpose_source='manual' THEN 'manual' ELSE 'ai' END,use_when_zh=CASE WHEN use_when_source='manual' THEN use_when_zh ELSE ?3 END,use_when_source=CASE WHEN use_when_source='manual' THEN 'manual' ELSE 'ai' END,capabilities=?4,limitations=?5,pricing=?6,requires_login=?7,languages=?8,updated_at=?9 WHERE id=?1",params![id,output.purpose_zh,output.use_when_zh,capabilities,limitations,output.pricing,output.requires_login,languages,now])?;
-        tx.execute("DELETE FROM resource_categories WHERE resource_id=?1", [id])?;
-        for category in &output.categories {
-            Category::parse(category)?;
-            tx.execute(
-                "INSERT INTO resource_categories(resource_id,category) VALUES(?1,?2)",
-                params![id, category],
-            )?;
-        }
-        tx.execute(
-            "DELETE FROM resource_tags WHERE resource_id=?1 AND source='ai'",
+        let (categories_manual, tags_manual) = conn.query_row(
+            "SELECT categories_source='manual',tags_source='manual' FROM resources WHERE id=?1",
             [id],
+            |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
         )?;
-        for (name, language) in output
-            .tags_zh
-            .iter()
-            .map(|v| (v, "zh"))
-            .chain(output.tags_en.iter().map(|v| (v, "en")))
-        {
-            if name.trim().is_empty() || name.chars().count() > 100 {
-                bail!("invalid AI tag")
-            };
-            tx.execute("INSERT INTO resource_tags(resource_id,name,language,source,created_at) VALUES(?1,?2,?3,'ai',?4) ON CONFLICT(resource_id,name) DO NOTHING",params![id,name,language,now])?;
+        conn.execute("UPDATE resources SET purpose_zh=CASE WHEN purpose_source='manual' THEN purpose_zh ELSE ?2 END,purpose_source=CASE WHEN purpose_source='manual' THEN 'manual' ELSE 'ai' END,use_when_zh=CASE WHEN use_when_source='manual' THEN use_when_zh ELSE ?3 END,use_when_source=CASE WHEN use_when_source='manual' THEN 'manual' ELSE 'ai' END,capabilities=?4,limitations=?5,pricing=?6,requires_login=?7,languages=?8,updated_at=?9 WHERE id=?1",params![id,output.purpose_zh,output.use_when_zh,capabilities,limitations,output.pricing,output.requires_login,languages,now])?;
+        if !categories_manual {
+            conn.execute("DELETE FROM resource_categories WHERE resource_id=?1", [id])?;
+            for category in &output.categories {
+                Category::parse(category)?;
+                conn.execute(
+                    "INSERT INTO resource_categories(resource_id,category) VALUES(?1,?2)",
+                    params![id, category],
+                )?;
+            }
         }
-        tx.commit()?;
-        self.refresh_search_index(id)?;
+        if !tags_manual {
+            conn.execute(
+                "DELETE FROM resource_tags WHERE resource_id=?1 AND source='ai'",
+                [id],
+            )?;
+            for (name, language) in output
+                .tags_zh
+                .iter()
+                .map(|v| (v, "zh"))
+                .chain(output.tags_en.iter().map(|v| (v, "en")))
+            {
+                if name.trim().is_empty() || name.chars().count() > 100 {
+                    bail!("invalid AI tag")
+                };
+                conn.execute("INSERT INTO resource_tags(resource_id,name,language,source,created_at) VALUES(?1,?2,?3,'ai',?4) ON CONFLICT(resource_id,name) DO NOTHING",params![id,name,language,now])?;
+            }
+        }
+        Self::refresh_search_index_on(conn, id)?;
         Ok(())
     }
     pub fn transition(&self, id: i64, to: ResourceStatus, now: i64) -> Result<()> {
         let from = self.get(id)?.status;
+        if from == to {
+            return Ok(());
+        }
         if !valid_transition(from, to) {
             bail!(
                 "invalid resource transition: {} -> {}",
@@ -321,9 +377,16 @@ impl<'a> ResourceService<'a> {
                 to.as_str()
             );
         }
+        let (curation, health) = match to {
+            ResourceStatus::PendingReview => ("pending_review", None),
+            ResourceStatus::Archived => ("archived", None),
+            ResourceStatus::Broken => ("active", Some("broken")),
+            ResourceStatus::Active | ResourceStatus::EnrichmentPending => ("active", None),
+        };
         self.db.conn.execute(
-            "UPDATE resources SET status=?2,updated_at=?3 WHERE id=?1",
-            params![id, to.as_str(), now],
+            "UPDATE resources SET status=?2,curation_state=?3,
+             health=COALESCE(?4,health),updated_at=?5 WHERE id=?1",
+            params![id, to.as_str(), curation, health, now],
         )?;
         Ok(())
     }
@@ -425,6 +488,7 @@ impl<'a> ResourceService<'a> {
         self.refresh_search_index(id)?;
         Ok(Some(sid))
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn start_enrichment(
         &self,
         id: i64,
@@ -509,10 +573,12 @@ impl<'a> ResourceService<'a> {
     }
 
     fn refresh_search_index(&self, id: i64) -> Result<()> {
-        self.db
-            .conn
-            .execute("DELETE FROM resource_fts WHERE source_id=?1", [id])?;
-        self.db.conn.execute("INSERT INTO resource_fts(source_id,body) SELECT r.id,trim(COALESCE(r.title,'')||char(10)||r.url||char(10)||COALESCE(r.purpose_zh,'')||char(10)||COALESCE(r.use_when_zh,'')||char(10)||r.capabilities||char(10)||r.limitations||char(10)||r.languages||char(10)||COALESCE(r.private_note,'')||char(10)||COALESCE((SELECT group_concat(category,' ') FROM resource_categories c WHERE c.resource_id=r.id),'')||char(10)||COALESCE((SELECT group_concat(name,' ') FROM resource_tags t WHERE t.resource_id=r.id),'')||char(10)||COALESCE((SELECT cleaned_content FROM resource_snapshots s WHERE s.id=r.latest_snapshot_id),'')) FROM resources r WHERE r.id=?1", [id])?;
+        Self::refresh_search_index_on(&self.db.conn, id)
+    }
+
+    pub(crate) fn refresh_search_index_on(conn: &rusqlite::Connection, id: i64) -> Result<()> {
+        conn.execute("DELETE FROM resource_fts WHERE source_id=?1", [id])?;
+        conn.execute("INSERT INTO resource_fts(source_id,body) SELECT r.id,trim(COALESCE(r.title,'')||char(10)||r.url||char(10)||COALESCE(r.purpose_zh,'')||char(10)||COALESCE(r.use_when_zh,'')||char(10)||r.capabilities||char(10)||r.limitations||char(10)||r.languages||char(10)||COALESCE(r.private_note,'')||char(10)||COALESCE((SELECT group_concat(category,' ') FROM resource_categories c WHERE c.resource_id=r.id),'')||char(10)||COALESCE((SELECT group_concat(name,' ') FROM resource_tags t WHERE t.resource_id=r.id),'')||char(10)||COALESCE((SELECT cleaned_content FROM resource_snapshots s WHERE s.id=r.latest_snapshot_id),'')) FROM resources r WHERE r.id=?1", [id])?;
         Ok(())
     }
 
@@ -566,7 +632,7 @@ impl<'a> ResourceService<'a> {
                          WHEN lower(capabilities || limitations || languages || COALESCE((SELECT group_concat(category,' ') FROM resource_categories c WHERE c.resource_id=resources.id),'') || COALESCE((SELECT group_concat(name,' ') FROM resource_tags t WHERE t.resource_id=resources.id),'')) LIKE ?1 ESCAPE '\\' THEN 'metadata'
                          ELSE 'snapshot' END matched_field,
                     COALESCE((SELECT cleaned_content FROM resource_snapshots s WHERE s.id=resources.latest_snapshot_id),'') snapshot
-                 FROM resources WHERE status='active' AND ((?3='' AND lower(COALESCE(title,'')||char(10)||url||char(10)||COALESCE(purpose_zh,'')||char(10)||COALESCE(use_when_zh,'')||char(10)||capabilities||char(10)||limitations||char(10)||languages||char(10)||COALESCE(private_note,'')||char(10)||COALESCE((SELECT group_concat(category,' ') FROM resource_categories c WHERE c.resource_id=resources.id),'')||char(10)||COALESCE((SELECT group_concat(name,' ') FROM resource_tags t WHERE t.resource_id=resources.id),'')||char(10)||COALESCE((SELECT cleaned_content FROM resource_snapshots s WHERE s.id=resources.latest_snapshot_id),'')) LIKE ?1 ESCAPE '\\') OR (?3<>'' AND resources.id IN (SELECT source_id FROM resource_fts WHERE resource_fts MATCH ?3)))
+                 FROM resources WHERE curation_state='active' AND ((?3='' AND lower(COALESCE(title,'')||char(10)||url||char(10)||COALESCE(purpose_zh,'')||char(10)||COALESCE(use_when_zh,'')||char(10)||capabilities||char(10)||limitations||char(10)||languages||char(10)||COALESCE(private_note,'')||char(10)||COALESCE((SELECT group_concat(category,' ') FROM resource_categories c WHERE c.resource_id=resources.id),'')||char(10)||COALESCE((SELECT group_concat(name,' ') FROM resource_tags t WHERE t.resource_id=resources.id),'')||char(10)||COALESCE((SELECT cleaned_content FROM resource_snapshots s WHERE s.id=resources.latest_snapshot_id),'')) LIKE ?1 ESCAPE '\\') OR (?3<>'' AND resources.id IN (SELECT source_id FROM resource_fts WHERE resource_fts MATCH ?3)))
                  ORDER BY COALESCE(manual_rating,0) DESC,updated_at DESC LIMIT ?2"))?;
             let rows = stmt.query_map(
                 params![
@@ -576,8 +642,8 @@ impl<'a> ResourceService<'a> {
                 ],
                 |row| {
                     let resource = map_resource(row)?;
-                    let field: String = row.get(23)?;
-                    let snapshot: String = row.get(24)?;
+                    let field: String = row.get(27)?;
+                    let snapshot: String = row.get(28)?;
                     Ok((resource, field, snapshot))
                 },
             )?;
@@ -681,6 +747,10 @@ impl<'a> ResourceService<'a> {
     }
 }
 
+pub(super) fn refresh_search_index_on(conn: &rusqlite::Connection, id: i64) -> Result<()> {
+    ResourceStore::refresh_search_index_on(conn, id)
+}
+
 pub(crate) fn resource_json(
     r: &Resource,
     field: &str,
@@ -688,7 +758,7 @@ pub(crate) fn resource_json(
     score: f64,
 ) -> Result<Value> {
     Ok(
-        json!({"id":r.id.to_string(),"result_type":"resource","url":r.url,"title":r.title,"kind":r.kind.as_str(),"categories":[],"tags":[],"purpose_zh":r.purpose_zh,"use_when_zh":r.use_when_zh,"capabilities":r.capabilities,"limitations":r.limitations,"pricing":r.pricing.map(Pricing::as_str),"requires_login":r.requires_login,"private_note":r.private_note.as_ref().map(|v|json!({"value":v,"source":"local_private_note"})),"matched_fields":[field],"evidence_snippets":[{"source_type":field,"snapshot_id":r.latest_snapshot_id.map(|v|v.to_string()),"article_id":r.linked_article_id.map(|v|v.to_string()),"text":snippet}],"updated_at":rfc3339(r.updated_at),"last_checked_at":r.last_checked_at.map(rfc3339),"status":r.status.as_str(),"score":score,"score_factors":["text_match",if r.manual_rating.is_some(){"manual_rating_boost"}else{"no_rating_boost"}]}),
+        json!({"id":r.id.to_string(),"result_type":"resource","url":r.url,"title":r.title,"kind":r.kind.as_str(),"categories":[],"tags":[],"purpose_zh":r.purpose_zh,"use_when_zh":r.use_when_zh,"capabilities":r.capabilities,"limitations":r.limitations,"pricing":r.pricing.map(Pricing::as_str),"requires_login":r.requires_login,"private_note":r.private_note.as_ref().map(|v|json!({"value":v,"source":"local_private_note"})),"matched_fields":[field],"evidence_snippets":[{"source_type":field,"snapshot_id":r.latest_snapshot_id.map(|v|v.to_string()),"article_id":r.linked_article_id.map(|v|v.to_string()),"text":snippet}],"updated_at":rfc3339(r.updated_at),"last_checked_at":r.last_checked_at.map(rfc3339),"status":r.status.as_str(),"curation_state":r.curation_state.as_str(),"health":r.health.as_str(),"score":score,"score_factors":["text_match",if r.manual_rating.is_some(){"manual_rating_boost"}else{"no_rating_boost"}]}),
     )
 }
 fn rfc3339(ts: i64) -> String {
@@ -716,8 +786,8 @@ fn evidence_snippet(text: &str, query: &str) -> String {
     }
 }
 
-const RESOURCE_COLS: &str = "id,url,canonical_url,parent_resource_id,linked_article_id,kind,title,purpose_zh,use_when_zh,capabilities,limitations,pricing,requires_login,languages,private_note,privacy,status,source,manual_rating,latest_snapshot_id,last_checked_at,created_at,updated_at";
-fn map_resource(r: &Row) -> rusqlite::Result<Resource> {
+pub(super) const RESOURCE_COLS: &str = "id,url,canonical_url,parent_resource_id,linked_article_id,kind,title,purpose_zh,use_when_zh,capabilities,limitations,pricing,requires_login,languages,private_note,privacy,source,manual_rating,latest_snapshot_id,last_checked_at,created_at,updated_at,curation_state,health,categories_source,tags_source,source_failure_count";
+pub(super) fn map_resource(r: &Row) -> rusqlite::Result<Resource> {
     fn conv(e: anyhow::Error) -> rusqlite::Error {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, e.into())
     }
@@ -727,6 +797,14 @@ fn map_resource(r: &Row) -> rusqlite::Result<Resource> {
         .map(|v| Pricing::parse(&v))
         .transpose()
         .map_err(conv)?;
+    let curation_state = ResourceCurationState::parse(&r.get::<_, String>(22)?).map_err(conv)?;
+    let health = ResourceHealth::parse(&r.get::<_, String>(23)?).map_err(conv)?;
+    let status = match (curation_state, health) {
+        (ResourceCurationState::PendingReview, _) => ResourceStatus::PendingReview,
+        (ResourceCurationState::Archived, _) => ResourceStatus::Archived,
+        (_, ResourceHealth::Broken) => ResourceStatus::Broken,
+        _ => ResourceStatus::Active,
+    };
     Ok(Resource {
         id: r.get(0)?,
         url: r.get(1)?,
@@ -744,13 +822,18 @@ fn map_resource(r: &Row) -> rusqlite::Result<Resource> {
         languages: serde_json::from_str(&r.get::<_, String>(13)?).map_err(|e| conv(e.into()))?,
         private_note: r.get(14)?,
         privacy: ResourcePrivacy::parse(&r.get::<_, String>(15)?).map_err(conv)?,
-        status: ResourceStatus::parse(&r.get::<_, String>(16)?).map_err(conv)?,
-        source: ResourceSource::parse(&r.get::<_, String>(17)?).map_err(conv)?,
-        manual_rating: r.get(18)?,
-        latest_snapshot_id: r.get(19)?,
-        last_checked_at: r.get(20)?,
-        created_at: r.get(21)?,
-        updated_at: r.get(22)?,
+        status,
+        source: ResourceSource::parse(&r.get::<_, String>(16)?).map_err(conv)?,
+        manual_rating: r.get(17)?,
+        latest_snapshot_id: r.get(18)?,
+        last_checked_at: r.get(19)?,
+        created_at: r.get(20)?,
+        updated_at: r.get(21)?,
+        curation_state,
+        health,
+        categories_source: ClassificationSource::parse(&r.get::<_, String>(24)?).map_err(conv)?,
+        tags_source: ClassificationSource::parse(&r.get::<_, String>(25)?).map_err(conv)?,
+        source_failure_count: r.get(26)?,
     })
 }
 fn initial_status(source: ResourceSource) -> ResourceStatus {
@@ -791,7 +874,7 @@ fn validate_phrases(v: &[String]) -> Result<()> {
     }
     Ok(())
 }
-fn canonicalize_url(raw: &str) -> Result<String> {
+pub(super) fn canonicalize_url(raw: &str) -> Result<String> {
     let mut u = Url::parse(raw.trim()).context("invalid resource URL")?;
     if !matches!(u.scheme(), "http" | "https") {
         bail!("resource URL must use HTTP(S)")
@@ -823,8 +906,13 @@ mod tests {
     fn service_db() -> Db {
         let conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-        conn.execute_batch(super::super::db::SCHEMA).unwrap();
-        Db { conn, path: None }
+        conn.execute_batch(crate::db::SCHEMA).unwrap();
+        Db {
+            conn,
+            path: None,
+            _writer_gate: None,
+            _lifetime_permit: None,
+        }
     }
     fn input(url: &str, source: ResourceSource) -> NewResource {
         NewResource {
@@ -842,7 +930,7 @@ mod tests {
     #[test]
     fn canonical_dedup_keeps_different_pages() {
         let db = service_db();
-        let s = ResourceService::new(&db);
+        let s = ResourceStore::new(&db);
         s.create(
             &input("https://EXAMPLE.com:443/a#x", ResourceSource::Gui),
             1,
@@ -860,7 +948,7 @@ mod tests {
     #[test]
     fn initial_state_and_transitions_are_enforced() {
         let db = service_db();
-        let s = ResourceService::new(&db);
+        let s = ResourceStore::new(&db);
         let r = s
             .create(&input("https://example.com", ResourceSource::CliAgent), 1)
             .unwrap();
@@ -873,7 +961,7 @@ mod tests {
     #[test]
     fn manual_tag_wins_and_snapshot_is_content_addressed() {
         let db = service_db();
-        let s = ResourceService::new(&db);
+        let s = ResourceStore::new(&db);
         let r = s
             .create(&input("https://example.com", ResourceSource::Gui), 1)
             .unwrap();
@@ -921,8 +1009,8 @@ mod tests {
         let aid = db.conn.last_insert_rowid();
         let mut i = input("https://x/a", ResourceSource::CliAgent);
         i.linked_article_id = Some(aid);
-        let r = ResourceService::new(&db).create(&i, 1).unwrap();
-        ResourceService::new(&db).delete(r.id).unwrap();
+        let r = ResourceStore::new(&db).create(&i, 1).unwrap();
+        ResourceStore::new(&db).delete(r.id).unwrap();
         let n: i64 = db
             .conn
             .query_row("SELECT COUNT(*) FROM articles WHERE id=?1", [aid], |r| {
@@ -983,7 +1071,7 @@ mod tests {
     #[test]
     fn validates_fields_and_persists_phase_one_auxiliary_records() {
         let db = service_db();
-        let service = ResourceService::new(&db);
+        let service = ResourceStore::new(&db);
         let mut bad = input("https://example.com", ResourceSource::Gui);
         bad.manual_rating = Some(6);
         assert!(service.create(&bad, 1).is_err());
@@ -1051,7 +1139,7 @@ mod tests {
     #[test]
     fn deterministic_search_excludes_pending_and_uses_bounded_rating_boost() {
         let db = service_db();
-        let service = ResourceService::new(&db);
+        let service = ResourceStore::new(&db);
         let first = service
             .create(&input("https://a.test/svg", ResourceSource::Gui), 1)
             .unwrap();
@@ -1109,7 +1197,7 @@ mod tests {
         let normal = db.add_feed("https://example.com/feed", 0).unwrap();
         let clipping = db.ensure_web_clippings_feed(0).unwrap();
         db.conn.execute("INSERT INTO articles(feed_id,entry_id,title,content,starred,fetched_at) VALUES(?1,'plain','Rust plain','Rust GUI',0,1),(?1,'star','Rust starred','Rust GUI',1,2),(?2,'clip','Rust clipping','Rust GUI',0,3)", params![normal,clipping]).unwrap();
-        let service = ResourceService::new(&db);
+        let service = ResourceStore::new(&db);
         let curated = service.search_json("Rust", false, true, false, 10).unwrap();
         let all = service.search_json("Rust", false, true, true, 10).unwrap();
         assert_eq!(curated.len(), 2);
@@ -1119,7 +1207,7 @@ mod tests {
     #[test]
     fn private_resources_never_produce_provider_input() {
         let db = service_db();
-        let service = ResourceService::new(&db);
+        let service = ResourceStore::new(&db);
         let mut private = input("https://private.test", ResourceSource::Gui);
         private.privacy = ResourcePrivacy::Private;
         let resource = service.create(&private, 1).unwrap();
@@ -1130,7 +1218,7 @@ mod tests {
     fn enrichment_preserves_manual_purpose_and_tags() {
         use crate::resource_enrichment::{EnrichmentOutput, Evidence};
         let db = service_db();
-        let service = ResourceService::new(&db);
+        let service = ResourceStore::new(&db);
         let resource = service
             .create(&input("https://icons.test", ResourceSource::Gui), 1)
             .unwrap();
@@ -1198,7 +1286,7 @@ mod tests {
                 1,
             )
             .unwrap();
-        let service = ResourceService::new(&db);
+        let service = ResourceStore::new(&db);
         let preview = service.preview_web_clipping_import().unwrap();
         assert_eq!(preview.len(), 1);
         assert!(!preview[0].already_imported);
@@ -1221,11 +1309,14 @@ mod tests {
 
     #[test]
     fn real_resource_regression_queries_have_an_accepted_top_five_result() {
-        let fixture: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/fixtures/resource-regression.json"))
-                .unwrap();
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/resource-regression.json"
+        ))
+        .unwrap();
+        assert_eq!(fixture["resources"].as_array().unwrap().len(), 20);
+        assert_eq!(fixture["queries"].as_array().unwrap().len(), 10);
         let db = service_db();
-        let service = ResourceService::new(&db);
+        let service = ResourceStore::new(&db);
         for (index, row) in fixture["resources"].as_array().unwrap().iter().enumerate() {
             let url = row[0].as_str().unwrap();
             let title = row[1].as_str().unwrap();
@@ -1256,8 +1347,13 @@ mod tests {
             let query = row[0].as_str().unwrap();
             let expected = row[1].as_str().unwrap();
             let results = service.search_json(query, true, false, false, 5).unwrap();
+            let rank = results
+                .iter()
+                .position(|item| item["url"] == expected)
+                .map(|index| index + 1);
+            println!("query={query:?} accepted={expected:?} rank={rank:?}");
             assert!(
-                results.iter().any(|item| item["url"] == expected),
+                rank.is_some(),
                 "query {query:?} missed {expected:?}: {results:?}"
             );
         }

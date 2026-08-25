@@ -8,6 +8,7 @@
 - 统一搜索网站资源与精选文章；`shiyue-cli resource` 为本机 AI 提供稳定的 JSON 查询接口
 - 可选 DeepSeek/OpenAI-compatible 自动整理用途、分类和标签；私密资源不会发送给云端模型
 - 三栏式订阅、文章列表与正文阅读界面
+- GUI 内可添加、删除、暂停、重新启用订阅，并在右侧订阅设置中调整单源刷新间隔
 - HTML/RSS 正文使用 HTML5 DOM 容错清洗并完成中文段落排版；无标准 `article` 的正文与畸形 HTML 也有 fixture 回归
 - 支持图注、定义列表、复杂表格、代码语言、脚注以及 MathJax 公式排版
 - WebP、PNG、JPEG、GIF 图片显示，包含懒加载、并发限制和失败自动重试
@@ -32,6 +33,8 @@
 前往 [Releases](https://github.com/idkwhatimdoing62/shiyue-rss/releases) 下载最新的 Windows 便携包。解压后双击 `shiyue.exe` 即可运行；`shiyue-cli.exe` 仅在需要终端管理订阅时使用。
 
 > Windows SmartScreen 可能提示“未知发布者”，这是因为当前发行文件尚未购买代码签名证书。可核对 Release 中提供的 SHA-256 后再运行。
+
+维护者发布、自动 Release 与 Windows 代码签名配置见 [docs/releasing.md](docs/releasing.md)。
 
 ## 数据位置
 
@@ -80,6 +83,8 @@ shiyue-cli resource recent --json
 shiyue-cli resource pending --json
 shiyue-cli resource add <url> --json
 shiyue-cli resource retry <id> --json
+shiyue-cli resource retry <id> --timeout 5m --json
+shiyue-cli resource retry <id> --no-wait --json
 ```
 
 ## 隐私

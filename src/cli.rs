@@ -62,6 +62,12 @@ pub enum ResourceCommand {
     },
     Retry {
         id: i64,
+        /// 只持久化处理意图，不等待后台执行。
+        #[arg(long)]
+        no_wait: bool,
+        /// 等待终态的最长时间，例如 30s、5m。
+        #[arg(long, default_value = "5m")]
+        timeout: String,
         #[arg(long, required = true)]
         json: bool,
     },

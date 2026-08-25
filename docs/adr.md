@@ -1,6 +1,10 @@
 # 架构决策记录（ADR）
 
+深化模块决策使用独立文件。资源创建、完整人工编辑、整理状态、健康状态、网页收藏导入、永久删除、权威投影及 Knowledge Processing 的提交后交接见 [ADR-0007：Resource Library Lifecycle](adr/0007-centralize-resource-library-lifecycle.md)。
+
 格式：每条 = 决策 / 背景 / 选择 / 后果。ADR-1～12 为 **Accepted**（2026-07-11）；ADR-13～16 为 **Accepted**（2026-07-13），并取代了 ADR-2、改写了 ADR-4；ADR-17～19 为 **Accepted**（2026-08-13 至 2026-08-14）。
+
+后续深模块决策使用独立文件：从 [ADR-0001](adr/0001-persistent-knowledge-processing-workflow.md) 到 [ADR-0006：Article Library Lifecycle](adr/0006-centralize-article-library-lifecycle.md)。其中 RSS 刷新执行语义见 [ADR-0004](adr/0004-session-bound-rss-refresh-workflow.md)，订阅持久变更与首次刷新排序见 [ADR-0005](adr/0005-centralize-feed-subscription-lifecycle.md)，文章收藏、稍后读、归档、已读、标签与批量操作见 ADR-0006。
 
 ## 速查表
 
@@ -95,10 +99,10 @@
 - **选择**：桌面 GUI，`egui`/`eframe`。渲染器选 **glow**（OpenGL），显式关掉默认的 wgpu 一大坨依赖树；`image` crate 禁 AVIF（不拉 `rav1e`）。图片下载/解码/缓存交给 `egui_extras` 的图片加载器。中文靠加载 Windows 自带字体（雅黑/黑体/宋体），否则 egui 默认字体是豆腐块。
 - **后果**：图片清晰（真像素纹理，非终端半块）；HTML 能好好呈现。代价：引入 egui/eframe/egui_extras/image 一批 GUI 依赖，且是即时模式 UI，得自己管选中态/滚动/焦点。Windows-only（字体路径、`cmd /C start` 开浏览器）；跨平台另说。
 
-## ADR-14 进程形态：全能单进程（GUI 内置抓取+调度）
+## ADR-14 进程形态：全能单进程（由 ADR-0004 深化）
 - **背景**：抓取是异步（tokio+reqwest），egui 是主线程同步 UI 循环；且"新文章提醒"要常驻调度。要么 GUI 只当阅读器、抓取仍靠独立 daemon 进程，要么把抓取+调度收进 GUI 做成全能 app。
-- **选择**：全能单进程。启动时 spawn 一个后台线程，内起 tokio 运行时，跑从 ADR-4 抽出来的共享调度循环（按每源 `next_fetch` 到期抓取写库）。UI 主线程保持同步、自己一个 DB 连接只读；两边靠同一 WAL 库 + `channel` 信号协调，后台抓完 `ctx.request_repaint()` 叫醒 UI。UI 自动刷新但不打断——实时更新未读数/列表，当前选中的源/文章按 id 保住不跳。`rrss daemon` 命令删除，`rrss update` 保留。
-- **后果**：一个可执行文件既读又抓，不用另开 daemon。代价：进程内跨线程并发（两个 DB 连接、focused 标志、repaint 信号）比"两个进程各干各的"要小心；`rusqlite::Connection` 是 `Send` 非 `Sync`，故每线程各持一个连接。
+- **选择**：全能单进程。GUI 持有独立 RSS Refresh Workflow，UI 只提交意图、读取 snapshot 并消费通知；调度、最多 8 路抓取、短连接提交、pending 合并和维护中断均由模块封装。CLI `update` 通过该 facade 执行一次性 Run；新增/启用订阅先经过 Feed Subscription Lifecycle，再由其内部适配器表达单 Feed 刷新意图。完整语义见 ADR-0004 和 ADR-0005。
+- **后果**：一个桌面进程既读又抓，不用另开 daemon；GUI 不再共享 scheduler 原子状态或拼装网络/数据库执行。代价是专用状态机和 adapter 边界，且不同进程仍可能重复发起网络请求。
 
 ## ADR-15 关窗行为：收到系统托盘
 - **背景**：调度/通知只活在 GUI 进程里（ADR-14），关掉窗口就等于停调度、停提醒。想在没有可见窗口时也持续后台抓取+通知。

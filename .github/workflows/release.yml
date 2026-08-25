@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows-release:
+    runs-on: windows-latest
+    env:
+      SIGNING_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify tag matches Cargo version
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          if ($env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Tag $env:GITHUB_REF_NAME does not match Cargo.toml version v$version"
+          }
+      - name: Test
+        run: cargo test --locked
+      - name: Build release binaries
+        run: cargo build --release --locked --bins
+      - name: Sign Windows binaries
+        if: ${{ env.SIGNING_CERTIFICATE != '' }}
+        shell: pwsh
+        env:
+          CERTIFICATE_BASE64: ${{ env.SIGNING_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $certificate = Join-Path $env:RUNNER_TEMP "shiyue-signing.pfx"
+          [IO.File]::WriteAllBytes($certificate, [Convert]::FromBase64String($env:CERTIFICATE_BASE64))
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+            Where-Object FullName -Match '\\x64\\signtool\.exe$' |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $signtool) { throw "signtool.exe was not found" }
+          & $signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certificate /p $env:CERTIFICATE_PASSWORD target/release/shiyue.exe
+          & $signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certificate /p $env:CERTIFICATE_PASSWORD target/release/shiyue-cli.exe
+          Remove-Item -LiteralPath $certificate -Force
+      - name: Package
+        shell: pwsh
+        run: |
+          $package = Join-Path $env:RUNNER_TEMP "shiyue-${env:GITHUB_REF_NAME}-windows-x64"
+          New-Item -ItemType Directory -Path $package | Out-Null
+          Copy-Item target/release/shiyue.exe,target/release/shiyue-cli.exe,README.md,LICENSE -Destination $package
+          Compress-Archive -Path "$package\*" -DestinationPath "shiyue-${env:GITHUB_REF_NAME}-windows-x64.zip"
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: shiyue-*-windows-x64.zip

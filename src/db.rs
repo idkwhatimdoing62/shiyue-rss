@@ -1,19 +1,21 @@
-//! SQLite 访问层（ADR-3）。daemon 与 TUI 两进程共享同一库，WAL 模式扛并发。
+//! SQLite 访问层（ADR-3）。GUI、CLI 与后台工作流共享同一库，WAL 模式扛并发。
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
+use crate::local_data_maintenance::{WriterGate, WriterPermit, run_schema_migration};
 use crate::model::{
-    Article, ArticleBatchAction, ArticleSelection, Feed, NewArticle, SearchHistoryEntry, SearchHit,
-    SearchHitKind, Tag, TextAnchor,
+    Article, ArticleSelection, Feed, NewArticle, SearchHistoryEntry, SearchHit, SearchHitKind,
+    TextAnchor,
 };
 
 /// Hidden, non-network feed used to reuse the normal article reader and its
 /// annotations for locally saved web pages.
 pub const WEB_CLIPPINGS_FEED_URL: &str = "shiyue://web-clippings";
 const WEB_CLIPPINGS_FEED_TITLE: &str = "网页收藏";
+const CURRENT_SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug, Clone)]
 pub struct ArticleAiContent {
@@ -113,6 +115,11 @@ CREATE TABLE IF NOT EXISTS resources (
   private_note       TEXT,
   privacy            TEXT NOT NULL DEFAULT 'public' CHECK (privacy IN ('public', 'private')),
   status             TEXT NOT NULL CHECK (status IN ('pending_review', 'enrichment_pending', 'active', 'broken', 'archived')),
+  curation_state     TEXT NOT NULL DEFAULT 'active' CHECK (curation_state IN ('pending_review', 'active', 'archived')),
+  health             TEXT NOT NULL DEFAULT 'unknown' CHECK (health IN ('unknown', 'healthy', 'broken')),
+  categories_source  TEXT NOT NULL DEFAULT 'ai' CHECK (categories_source IN ('manual', 'ai')),
+  tags_source        TEXT NOT NULL DEFAULT 'ai' CHECK (tags_source IN ('manual', 'ai')),
+  source_failure_count INTEGER NOT NULL DEFAULT 0,
   source             TEXT NOT NULL CHECK (source IN ('gui', 'cli_agent', 'import')),
   manual_rating      INTEGER CHECK (manual_rating IS NULL OR manual_rating BETWEEN 1 AND 5),
   latest_snapshot_id INTEGER REFERENCES resource_snapshots(id) ON DELETE SET NULL,
@@ -121,6 +128,8 @@ CREATE TABLE IF NOT EXISTS resources (
   updated_at         INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_resources_status_updated ON resources(status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_resources_curation_updated ON resources(curation_state, updated_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_resources_health_updated ON resources(health, updated_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_resources_parent ON resources(parent_resource_id);
 CREATE INDEX IF NOT EXISTS idx_resources_article ON resources(linked_article_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_resources_import_article
@@ -164,7 +173,8 @@ CREATE TABLE IF NOT EXISTS resource_enrichment_runs (
   finished_at   INTEGER,
   status        TEXT NOT NULL CHECK (status IN ('pending', 'running', 'succeeded', 'failed')),
   error_code    TEXT,
-  error_message TEXT
+  error_message TEXT,
+  attempt_id    INTEGER REFERENCES knowledge_task_attempts(id) ON DELETE SET NULL
 );
 CREATE TABLE IF NOT EXISTS resource_usage_events (
   id          INTEGER PRIMARY KEY,
@@ -173,6 +183,52 @@ CREATE TABLE IF NOT EXISTS resource_usage_events (
   occurred_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_resource_usage_events ON resource_usage_events(resource_id, occurred_at DESC);
+CREATE TABLE IF NOT EXISTS knowledge_tasks (
+  id            INTEGER PRIMARY KEY,
+  kind          TEXT NOT NULL CHECK (kind IN ('resource_completion', 'article_summary')),
+  target_id     INTEGER NOT NULL,
+  status        TEXT NOT NULL CHECK (status IN ('queued', 'running', 'succeeded', 'failed', 'interrupted')),
+  current_stage TEXT,
+  next_run_at   INTEGER NOT NULL DEFAULT 0,
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL,
+  change_seq    INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_tasks_active_target
+  ON knowledge_tasks(kind, target_id)
+  WHERE status IN ('queued', 'running');
+CREATE INDEX IF NOT EXISTS idx_knowledge_tasks_target_history
+  ON knowledge_tasks(kind, target_id, created_at DESC, id DESC);
+CREATE TABLE IF NOT EXISTS knowledge_task_attempts (
+  id               INTEGER PRIMARY KEY,
+  task_id          INTEGER NOT NULL REFERENCES knowledge_tasks(id) ON DELETE CASCADE,
+  attempt_number   INTEGER NOT NULL,
+  status           TEXT NOT NULL CHECK (status IN ('queued', 'running', 'succeeded', 'failed', 'interrupted')),
+  current_stage    TEXT,
+  automatic_retry INTEGER NOT NULL DEFAULT 0 CHECK (automatic_retry IN (0, 1)),
+  started_at       INTEGER,
+  finished_at      INTEGER,
+  error_kind       TEXT CHECK (error_kind IS NULL OR error_kind IN ('transient', 'authentication', 'security', 'input', 'provider_output', 'storage', 'interrupted')),
+  user_message     TEXT,
+  technical_detail TEXT,
+  claim_generation INTEGER,
+  created_at       INTEGER NOT NULL,
+  UNIQUE(task_id, attempt_number)
+);
+CREATE INDEX IF NOT EXISTS idx_knowledge_attempts_task
+  ON knowledge_task_attempts(task_id, attempt_number DESC);
+CREATE TABLE IF NOT EXISTS knowledge_executor_lease (
+  singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+  owner_id     TEXT,
+  generation   INTEGER NOT NULL DEFAULT 0,
+  heartbeat_at INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO knowledge_executor_lease(singleton_id) VALUES(1);
+CREATE TABLE IF NOT EXISTS knowledge_change_clock (
+  singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+  sequence     INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO knowledge_change_clock(singleton_id) VALUES(1);
 CREATE VIRTUAL TABLE IF NOT EXISTS resource_fts USING fts5(
   source_id UNINDEXED,
   body,
@@ -261,6 +317,11 @@ const SELECTION_COLS: &str = "id, article_id, selected_text, start_offset, end_o
 pub struct Db {
     pub(crate) conn: Connection,
     pub(crate) path: Option<PathBuf>,
+    pub(crate) _writer_gate: Option<WriterGate>,
+    // A normal database connection holds a shared writer lease for its whole
+    // lifetime. Exclusive maintenance therefore cannot begin until every
+    // cooperating connection has actually closed.
+    pub(crate) _lifetime_permit: Option<WriterPermit>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -319,7 +380,228 @@ fn has_column(conn: &Connection, table: &str, expected: &str) -> Result<bool> {
     Ok(has_column)
 }
 
+fn has_table(conn: &Connection, table: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        [table],
+        |row| row.get(0),
+    )?)
+}
+
 fn migrate(conn: &Connection) -> Result<()> {
+    let mut version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version > CURRENT_SCHEMA_VERSION {
+        bail!("数据库版本 {version} 高于当前程序支持的版本 {CURRENT_SCHEMA_VERSION}，请升级拾阅");
+    }
+    while version < CURRENT_SCHEMA_VERSION {
+        let tx = conn.unchecked_transaction()?;
+        match version {
+            0 => migrate_v0_to_v1(&tx)?,
+            1 => migrate_v1_to_v2(&tx)?,
+            2 => migrate_v2_to_v3(&tx)?,
+            3 => migrate_v3_to_v4(&tx)?,
+            _ => bail!("缺少从数据库版本 {version} 开始的迁移"),
+        }
+        version += 1;
+        tx.pragma_update(None, "user_version", version)?;
+        tx.commit()?;
+    }
+    Ok(())
+}
+
+fn migrate_v3_to_v4(conn: &Connection) -> Result<()> {
+    if !has_table(conn, "resources")? {
+        return Ok(());
+    }
+    if !has_column(conn, "resources", "curation_state")? {
+        conn.execute(
+            "ALTER TABLE resources ADD COLUMN curation_state TEXT NOT NULL DEFAULT 'active' CHECK (curation_state IN ('pending_review', 'active', 'archived'))",
+            [],
+        )?;
+    }
+    if !has_column(conn, "resources", "health")? {
+        conn.execute(
+            "ALTER TABLE resources ADD COLUMN health TEXT NOT NULL DEFAULT 'unknown' CHECK (health IN ('unknown', 'healthy', 'broken'))",
+            [],
+        )?;
+    }
+    if !has_column(conn, "resources", "categories_source")? {
+        conn.execute(
+            "ALTER TABLE resources ADD COLUMN categories_source TEXT NOT NULL DEFAULT 'ai' CHECK (categories_source IN ('manual', 'ai'))",
+            [],
+        )?;
+    }
+    if !has_column(conn, "resources", "tags_source")? {
+        conn.execute(
+            "ALTER TABLE resources ADD COLUMN tags_source TEXT NOT NULL DEFAULT 'ai' CHECK (tags_source IN ('manual', 'ai'))",
+            [],
+        )?;
+    }
+    if !has_column(conn, "resources", "source_failure_count")? {
+        conn.execute(
+            "ALTER TABLE resources ADD COLUMN source_failure_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !has_column(conn, "resources", "status")? || !has_column(conn, "resources", "updated_at")? {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "UPDATE resources
+         SET curation_state=CASE status
+               WHEN 'pending_review' THEN 'pending_review'
+               WHEN 'archived' THEN 'archived'
+               ELSE 'active'
+             END,
+             health=CASE
+               WHEN status='broken' THEN 'broken'
+               WHEN EXISTS (
+                 SELECT 1 FROM resource_snapshots s
+                 WHERE s.resource_id=resources.id AND s.content_hash IS NOT NULL
+               ) THEN 'healthy'
+               ELSE 'unknown'
+             END,
+             categories_source=CASE
+               WHEN EXISTS (
+                 SELECT 1 FROM resource_enrichment_runs e
+                 WHERE e.resource_id=resources.id AND e.status='succeeded'
+               ) THEN 'ai'
+               ELSE 'manual'
+             END,
+             tags_source=CASE
+               WHEN EXISTS (
+                 SELECT 1 FROM resource_tags t
+                 WHERE t.resource_id=resources.id AND t.source='manual'
+               ) THEN 'manual'
+               ELSE 'ai'
+             END;
+         CREATE INDEX IF NOT EXISTS idx_resources_curation_updated
+           ON resources(curation_state, updated_at DESC, id DESC);
+         CREATE INDEX IF NOT EXISTS idx_resources_health_updated
+           ON resources(health, updated_at DESC, id DESC);",
+    )?;
+    Ok(())
+}
+
+fn migrate_v1_to_v2(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS knowledge_tasks (
+           id INTEGER PRIMARY KEY,
+           kind TEXT NOT NULL CHECK (kind IN ('resource_completion', 'article_summary')),
+           target_id INTEGER NOT NULL,
+           status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'succeeded', 'failed', 'interrupted')),
+           current_stage TEXT,
+           next_run_at INTEGER NOT NULL DEFAULT 0,
+           created_at INTEGER NOT NULL,
+           updated_at INTEGER NOT NULL
+         );
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_tasks_active_target
+           ON knowledge_tasks(kind, target_id) WHERE status IN ('queued', 'running');
+         CREATE INDEX IF NOT EXISTS idx_knowledge_tasks_target_history
+           ON knowledge_tasks(kind, target_id, created_at DESC, id DESC);
+         CREATE TABLE IF NOT EXISTS knowledge_task_attempts (
+           id INTEGER PRIMARY KEY,
+           task_id INTEGER NOT NULL REFERENCES knowledge_tasks(id) ON DELETE CASCADE,
+           attempt_number INTEGER NOT NULL,
+           status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'succeeded', 'failed', 'interrupted')),
+           current_stage TEXT,
+           automatic_retry INTEGER NOT NULL DEFAULT 0 CHECK (automatic_retry IN (0, 1)),
+           started_at INTEGER,
+           finished_at INTEGER,
+           error_kind TEXT CHECK (error_kind IS NULL OR error_kind IN ('transient', 'authentication', 'security', 'input', 'provider_output', 'storage', 'interrupted')),
+           user_message TEXT,
+           technical_detail TEXT,
+           created_at INTEGER NOT NULL,
+           UNIQUE(task_id, attempt_number)
+         );
+         CREATE INDEX IF NOT EXISTS idx_knowledge_attempts_task
+           ON knowledge_task_attempts(task_id, attempt_number DESC);",
+    )?;
+    conn.execute(
+        "UPDATE resource_enrichment_runs
+         SET status='failed', finished_at=COALESCE(finished_at, strftime('%s','now')),
+             error_code=COALESCE(error_code, 'UPGRADE_INTERRUPTED'),
+             error_message=COALESCE(error_message, '升级前任务已中断')
+         WHERE status IN ('pending', 'running')",
+        [],
+    )?;
+    Ok(())
+}
+
+fn migrate_v2_to_v3(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "knowledge_tasks", "change_seq")? {
+        conn.execute(
+            "ALTER TABLE knowledge_tasks ADD COLUMN change_seq INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !has_column(conn, "knowledge_task_attempts", "claim_generation")? {
+        conn.execute(
+            "ALTER TABLE knowledge_task_attempts ADD COLUMN claim_generation INTEGER",
+            [],
+        )?;
+    }
+    if !has_column(conn, "resource_enrichment_runs", "attempt_id")? {
+        conn.execute(
+            "ALTER TABLE resource_enrichment_runs ADD COLUMN attempt_id INTEGER REFERENCES knowledge_task_attempts(id) ON DELETE SET NULL",
+            [],
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS knowledge_executor_lease (
+           singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+           owner_id TEXT,
+           generation INTEGER NOT NULL DEFAULT 0,
+           heartbeat_at INTEGER NOT NULL DEFAULT 0
+         );
+         INSERT OR IGNORE INTO knowledge_executor_lease(singleton_id) VALUES(1);
+         CREATE TABLE IF NOT EXISTS knowledge_change_clock (
+           singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+           sequence INTEGER NOT NULL DEFAULT 0
+         );
+         INSERT OR IGNORE INTO knowledge_change_clock(singleton_id) VALUES(1);",
+    )?;
+
+    let now = chrono::Utc::now().timestamp();
+    conn.execute(
+        "UPDATE knowledge_task_attempts
+         SET status='interrupted',finished_at=COALESCE(finished_at,?1),
+             error_kind='interrupted',
+             user_message='程序升级后需要重新执行',
+             technical_detail='WORKFLOW_UPGRADE_INTERRUPTED: v2 running attempt had no fencing generation'
+         WHERE status='running'",
+        [now],
+    )?;
+    conn.execute(
+        "UPDATE knowledge_tasks
+         SET status='interrupted',current_stage=NULL,updated_at=?1
+         WHERE status='running'",
+        [now],
+    )?;
+    conn.execute(
+        "UPDATE resource_enrichment_runs
+         SET status='failed',finished_at=COALESCE(finished_at,?1),
+             error_code=COALESCE(error_code,'WORKFLOW_UPGRADE_INTERRUPTED'),
+             error_message=COALESCE(error_message,'知识处理工作流升级中断了旧执行')
+         WHERE status IN ('pending','running')",
+        [now],
+    )?;
+    conn.execute(
+        "UPDATE knowledge_change_clock
+         SET sequence=COALESCE((SELECT MAX(id) FROM knowledge_tasks),0)
+         WHERE singleton_id=1",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE knowledge_tasks
+         SET change_seq=id
+         WHERE change_seq=0",
+        [],
+    )?;
+    Ok(())
+}
+
+fn migrate_v0_to_v1(conn: &Connection) -> Result<()> {
     if !has_column(conn, "resources", "purpose_source")? {
         conn.execute("ALTER TABLE resources ADD COLUMN purpose_source TEXT CHECK (purpose_source IS NULL OR purpose_source IN ('manual','ai'))", [])?;
     }
@@ -423,8 +705,41 @@ fn map_search_hit(row: &Row) -> rusqlite::Result<SearchHit> {
 
 impl Db {
     pub fn open(path: &std::path::Path) -> Result<Self> {
+        loop {
+            let writer_gate = WriterGate::open(path)?;
+            let permit = writer_gate.permit()?;
+            let conn = Connection::open(path)
+                .with_context(|| format!("打开数据库失败: {}", path.display()))?;
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+            conn.pragma_update(None, "foreign_keys", "ON")?;
+            let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+            if version < CURRENT_SCHEMA_VERSION {
+                drop(conn);
+                drop(permit);
+                run_schema_migration(path, || {
+                    let conn = Connection::open(path)?;
+                    conn.pragma_update(None, "journal_mode", "WAL")?;
+                    conn.pragma_update(None, "foreign_keys", "ON")?;
+                    conn.execute_batch(SCHEMA)?;
+                    migrate(&conn)
+                })?;
+                continue;
+            }
+            migrate(&conn)?;
+            permit.validate()?;
+            return Ok(Self {
+                conn,
+                path: Some(path.to_path_buf()),
+                _writer_gate: Some(writer_gate),
+                _lifetime_permit: Some(permit),
+            });
+        }
+    }
+
+    /// Open while the caller holds the exclusive maintenance writer lock.
+    pub(crate) fn open_for_maintenance(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)
-            .with_context(|| format!("打开数据库失败: {}", path.display()))?;
+            .with_context(|| format!("open database for maintenance: {}", path.display()))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
@@ -432,27 +747,43 @@ impl Db {
         Ok(Self {
             conn,
             path: Some(path.to_path_buf()),
+            _writer_gate: None,
+            _lifetime_permit: None,
         })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn write_permit(&self) -> Result<Option<WriterPermit>> {
+        self._writer_gate
+            .as_ref()
+            .map(WriterGate::permit)
+            .transpose()
     }
 
     // ---- 源的增删查改 ----
 
     /// 添加源（幂等：已存在则返回既有 id）。
-    pub fn add_feed(&self, url: &str, now: i64) -> Result<i64> {
+    #[cfg(test)]
+    pub(crate) fn add_feed(&self, url: &str, now: i64) -> Result<i64> {
+        Ok(self.add_feed_with_disposition(url, now)?.0)
+    }
+
+    pub(crate) fn add_feed_with_disposition(&self, url: &str, now: i64) -> Result<(i64, bool)> {
         self.conn.execute(
             "INSERT OR IGNORE INTO feeds (url, next_fetch) VALUES (?1, ?2)",
             params![url, now],
         )?;
+        let created = self.conn.changes() > 0;
         let id = self
             .conn
             .query_row("SELECT id FROM feeds WHERE url = ?1", params![url], |r| {
                 r.get(0)
             })?;
-        Ok(id)
+        Ok((id, created))
     }
 
     /// 按 id 或 url 删除，返回删除行数。
-    pub fn remove_feed(&self, target: &str) -> Result<usize> {
+    pub(crate) fn remove_feed(&self, target: &str) -> Result<usize> {
         let n = if let Ok(id) = target.parse::<i64>() {
             self.conn.execute(
                 "DELETE FROM feeds WHERE id = ?1 AND url <> ?2",
@@ -472,6 +803,22 @@ impl Db {
         Ok(self.conn.query_row(&sql, params![id], map_feed)?)
     }
 
+    pub(crate) fn find_feed(&self, id: i64) -> Result<Option<Feed>> {
+        let sql = format!("SELECT {FEED_COLS} FROM feeds WHERE id = ?1");
+        Ok(self
+            .conn
+            .query_row(&sql, params![id], map_feed)
+            .optional()?)
+    }
+
+    pub(crate) fn find_feed_by_url(&self, url: &str) -> Result<Option<Feed>> {
+        let sql = format!("SELECT {FEED_COLS} FROM feeds WHERE url = ?1");
+        Ok(self
+            .conn
+            .query_row(&sql, params![url], map_feed)
+            .optional()?)
+    }
+
     fn query_feeds(&self, where_clause: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<Feed>> {
         let sql = format!("SELECT {FEED_COLS} FROM feeds {where_clause}");
         let mut stmt = self.conn.prepare(&sql)?;
@@ -479,7 +826,7 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// 到期且未禁用的源（daemon 用）。
+    /// 到期且未禁用的源（RSS Refresh Workflow 自动调度用）。
     pub fn due_feeds(&self, now: i64) -> Result<Vec<Feed>> {
         self.query_feeds(
             "WHERE disabled = 0 AND url <> ?2 AND next_fetch <= ?1 ORDER BY id",
@@ -495,7 +842,7 @@ impl Db {
         )
     }
 
-    /// 最近一个到期时间（daemon 决定 sleep 多久）。
+    /// 最近一个到期时间（RSS Refresh Workflow 决定 sleep 多久）。
     pub fn earliest_next_fetch(&self) -> Result<Option<i64>> {
         let v: Option<i64> = self.conn.query_row(
             "SELECT MIN(next_fetch) FROM feeds WHERE disabled = 0 AND url <> ?1",
@@ -612,142 +959,24 @@ impl Db {
         )?)
     }
 
-    /// Unified article-level saved view: regular starred RSS articles and all
-    /// locally saved web pages, newest first.
-    pub fn saved_articles(&self) -> Result<Vec<Article>> {
-        let sql = format!(
-            "SELECT {ARTICLE_COLS} FROM articles \
-             WHERE archived = 0 AND (starred = 1 \
-                OR feed_id = (SELECT id FROM feeds WHERE url = ?1)) \
-             ORDER BY COALESCE(published, fetched_at) DESC, id DESC"
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![WEB_CLIPPINGS_FEED_URL], map_article)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
-    pub fn saved_article_count(&self) -> Result<usize> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM articles a \
-             JOIN feeds f ON f.id = a.feed_id \
-             WHERE a.archived = 0 AND (a.starred = 1 OR f.url = ?1)",
-            params![WEB_CLIPPINGS_FEED_URL],
-            |row| row.get(0),
-        )?;
-        Ok(count.max(0) as usize)
-    }
-
-    pub fn read_later_articles(&self) -> Result<Vec<Article>> {
-        let sql = format!(
-            "SELECT {ARTICLE_COLS} FROM articles
-             WHERE archived = 0 AND read_later = 1
-             ORDER BY COALESCE(published, fetched_at) DESC, id DESC"
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([], map_article)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
-    pub fn read_later_count(&self) -> Result<usize> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM articles WHERE archived = 0 AND read_later = 1",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(count.max(0) as usize)
-    }
-
-    pub fn set_article_read_later(&self, article_id: i64, read_later: bool) -> Result<usize> {
+    pub(crate) fn set_subscription_interval(&self, id: i64, secs: i64, now: i64) -> Result<usize> {
         Ok(self.conn.execute(
-            "UPDATE articles SET read_later = ?2 WHERE id = ?1",
-            params![article_id, read_later],
+            "UPDATE feeds
+             SET interval_secs = ?2,
+                 next_fetch = COALESCE(last_fetch, ?3) + ?2
+             WHERE id = ?1",
+            params![id, secs, now],
         )?)
     }
 
-    /// Applies one explicit target state to every selected article in one SQL statement.
-    pub fn apply_article_batch(
-        &self,
-        article_ids: &[i64],
-        action: ArticleBatchAction,
-    ) -> Result<usize> {
-        if article_ids.is_empty() {
-            return Ok(0);
-        }
-        let assignment = match action {
-            ArticleBatchAction::Archive => "archived = 1",
-            ArticleBatchAction::Bookmark => "starred = 1",
-            ArticleBatchAction::ReadLater => "read_later = 1",
-        };
-        let placeholders = std::iter::repeat_n("?", article_ids.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!("UPDATE articles SET {assignment} WHERE id IN ({placeholders})");
-        Ok(self
-            .conn
-            .execute(&sql, rusqlite::params_from_iter(article_ids.iter()))?)
-    }
-
-    pub fn tags_for_article(&self, article_id: i64) -> Result<Vec<Tag>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT t.id, t.name FROM tags t
-             JOIN article_tags at ON at.tag_id = t.id
-             WHERE at.article_id = ?1 ORDER BY t.name COLLATE NOCASE",
-        )?;
-        let rows = stmt.query_map(params![article_id], |row| {
-            Ok(Tag {
-                id: row.get(0)?,
-                name: row.get(1)?,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
-    /// Replaces an article's complete tag set atomically. Empty and duplicate
-    /// names are normalized away inside this module.
-    pub fn replace_article_tags(&self, article_id: i64, names: &[String], now: i64) -> Result<()> {
-        let mut normalized = names
-            .iter()
-            .map(|name| name.trim())
-            .filter(|name| !name.is_empty())
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        normalized.sort_by_key(|name| name.to_lowercase());
-        normalized.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
-
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "DELETE FROM article_tags WHERE article_id = ?1",
-            params![article_id],
-        )?;
-        for name in normalized {
-            tx.execute(
-                "INSERT INTO tags(name, created_at) VALUES (?1, ?2)
-                 ON CONFLICT(name) DO NOTHING",
-                params![name, now],
-            )?;
-            tx.execute(
-                "INSERT INTO article_tags(article_id, tag_id, created_at)
-                 SELECT ?1, id, ?3 FROM tags WHERE name = ?2 COLLATE NOCASE",
-                params![article_id, name, now],
-            )?;
-        }
-        tx.execute(
-            "DELETE FROM tags WHERE NOT EXISTS
-             (SELECT 1 FROM article_tags WHERE article_tags.tag_id = tags.id)",
-            [],
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn set_interval(&self, id: i64, secs: i64) -> Result<usize> {
+    pub(crate) fn request_subscription_refresh(&self, id: i64, now: i64) -> Result<usize> {
         Ok(self.conn.execute(
-            "UPDATE feeds SET interval_secs = ?2 WHERE id = ?1",
-            params![id, secs],
+            "UPDATE feeds SET next_fetch = ?2 WHERE id = ?1",
+            params![id, now],
         )?)
     }
 
-    pub fn set_disabled(&self, id: i64, disabled: bool, now: i64) -> Result<usize> {
+    pub(crate) fn set_disabled(&self, id: i64, disabled: bool, now: i64) -> Result<usize> {
         // 启用时清空失败状态并让它尽快重抓。
         Ok(if disabled {
             self.conn
@@ -837,17 +1066,6 @@ impl Db {
 
     // ---- 文章（TUI 用）----
 
-    pub fn articles_for_feed(&self, feed_id: i64) -> Result<Vec<Article>> {
-        let sql = format!(
-            "SELECT {ARTICLE_COLS} FROM articles \
-             WHERE feed_id = ?1 AND archived = 0 \
-             ORDER BY COALESCE(published, fetched_at) DESC"
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![feed_id], map_article)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
     pub fn get_article(&self, article_id: i64) -> Result<Article> {
         let sql = format!("SELECT {ARTICLE_COLS} FROM articles WHERE id = ?1");
         Ok(self
@@ -871,43 +1089,6 @@ impl Db {
             )
             .optional()
             .map_err(Into::into)
-    }
-
-    pub fn save_article_ai(
-        &self,
-        article_id: i64,
-        summary_zh: &str,
-        translation_zh: &str,
-        model: &str,
-        now: i64,
-    ) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO article_ai(article_id,summary_zh,translation_zh,model,updated_at)
-             VALUES(?1,?2,?3,?4,?5)
-             ON CONFLICT(article_id) DO UPDATE SET summary_zh=excluded.summary_zh,
-             translation_zh=excluded.translation_zh,model=excluded.model,updated_at=excluded.updated_at",
-            params![article_id, summary_zh, translation_zh, model, now],
-        )?;
-        Ok(())
-    }
-
-    pub fn archived_articles(&self) -> Result<Vec<Article>> {
-        let sql = format!(
-            "SELECT {ARTICLE_COLS} FROM articles \
-             WHERE archived = 1 ORDER BY COALESCE(published, fetched_at) DESC, id DESC"
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([], map_article)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
-    pub fn archived_article_count(&self) -> Result<usize> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM articles WHERE archived = 1",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(count.max(0) as usize)
     }
 
     /// 在文章、网页快照、摘录与想法中进行统一全文搜索。
@@ -1023,46 +1204,13 @@ impl Db {
         Ok(self.conn.execute("DELETE FROM search_history", [])?)
     }
 
-    pub fn set_article_archived(&self, article_id: i64, archived: bool) -> Result<usize> {
-        Ok(self.conn.execute(
-            "UPDATE articles SET archived = ?2 WHERE id = ?1",
-            params![article_id, archived],
-        )?)
-    }
-
-    pub fn mark_read(&self, article_id: i64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE articles SET is_read = 1 WHERE id = ?1",
-            params![article_id],
-        )?;
-        Ok(())
-    }
-
-    pub fn mark_unread(&self, article_id: i64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE articles SET is_read = 0 WHERE id = ?1",
-            params![article_id],
-        )?;
-        Ok(())
-    }
-
-    pub fn toggle_star(&self, article_id: i64) -> Result<()> {
-        let changed = self.conn.execute(
-            "UPDATE articles SET starred = 1 - starred WHERE id = ?1",
-            params![article_id],
-        )?;
-        if changed == 0 {
-            bail!("文章不存在或已被删除");
-        }
-        Ok(())
-    }
-
     // ---- 文章选区：评论与收藏 ----
 
     /// 保存一段文章选区。评论和收藏可以同时存在，因此使用同一条记录承载。
     ///
     /// `start_offset`/`end_offset` 采用字符偏移而不是字节偏移；它们是可选的，
     /// 仅用于 UI 重新定位选区，正文变化后仍以 `selected_text` 为准。
+    #[allow(dead_code, clippy::too_many_arguments)]
     pub fn add_selection(
         &self,
         article_id: i64,
@@ -1102,10 +1250,10 @@ impl Db {
         if selected_text.is_empty() {
             bail!("选中的文字不能为空");
         }
-        if let (Some(start), Some(end)) = (anchor.start_offset, anchor.end_offset) {
-            if start < 0 || end < start {
-                bail!("选区偏移无效");
-            }
+        if let (Some(start), Some(end)) = (anchor.start_offset, anchor.end_offset)
+            && (start < 0 || end < start)
+        {
+            bail!("选区偏移无效");
         }
         let comment = comment
             .map(str::trim)
@@ -1132,6 +1280,7 @@ impl Db {
     }
 
     /// 只添加评论的便捷接口；选区不存在时会创建一条选区记录。
+    #[allow(dead_code)]
     pub fn add_comment(
         &self,
         article_id: i64,
@@ -1170,6 +1319,7 @@ impl Db {
     }
 
     /// 只收藏一段选区的便捷接口。
+    #[allow(dead_code)]
     pub fn add_favorite_selection(
         &self,
         article_id: i64,
@@ -1218,6 +1368,7 @@ impl Db {
     }
 
     /// 返回所有收藏的文字选区，供单独的“收藏/摘录”视图使用。
+    #[allow(dead_code)]
     pub fn favorite_selections(&self) -> Result<Vec<ArticleSelection>> {
         let sql = format!(
             "SELECT {SELECTION_COLS} FROM article_selections \
@@ -1259,6 +1410,7 @@ impl Db {
         Ok(count.max(0) as usize)
     }
 
+    #[allow(dead_code)]
     pub fn set_selection_comment(
         &self,
         selection_id: i64,
@@ -1275,6 +1427,7 @@ impl Db {
         )?)
     }
 
+    #[allow(dead_code)]
     pub fn set_selection_favorite(
         &self,
         selection_id: i64,
@@ -1287,6 +1440,7 @@ impl Db {
         )?)
     }
 
+    #[allow(dead_code)]
     pub fn toggle_selection_favorite(&self, selection_id: i64, now: i64) -> Result<usize> {
         Ok(self.conn.execute(
             "UPDATE article_selections \
@@ -1333,7 +1487,17 @@ impl Db {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn restore_from(&mut self, path: &Path) -> Result<()> {
+        let permit = self.write_permit()?;
+        self.restore_from_uncoordinated(path)?;
+        if let Some(permit) = permit {
+            permit.validate()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn restore_from_uncoordinated(&mut self, path: &Path) -> Result<()> {
         let check = check_database_file(path)?;
         if !check.ok {
             bail!("拒绝恢复损坏的备份：{}", check.details);
@@ -1350,7 +1514,17 @@ impl Db {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn compact(&self) -> Result<CompactionReport> {
+        let permit = self.write_permit()?;
+        let report = self.compact_uncoordinated()?;
+        if let Some(permit) = permit {
+            permit.validate()?;
+        }
+        Ok(report)
+    }
+
+    pub(crate) fn compact_uncoordinated(&self) -> Result<CompactionReport> {
         let before_bytes = self.disk_bytes();
         self.conn
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")
@@ -1439,7 +1613,12 @@ mod tests {
     fn mem() -> Db {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA).unwrap();
-        Db { conn, path: None }
+        Db {
+            conn,
+            path: None,
+            _writer_gate: None,
+            _lifetime_permit: None,
+        }
     }
 
     fn art(id: &str) -> NewArticle {
@@ -1451,6 +1630,20 @@ mod tests {
             published: Some(100),
             content: Some("body".into()),
         }
+    }
+
+    fn feed_articles(db: &Db, feed_id: i64) -> Vec<Article> {
+        let sql = format!(
+            "SELECT {ARTICLE_COLS} FROM articles \
+             WHERE feed_id = ?1 AND archived = 0 \
+             ORDER BY COALESCE(published, fetched_at) DESC, id DESC"
+        );
+        let mut statement = db.conn.prepare(&sql).unwrap();
+        statement
+            .query_map([feed_id], map_article)
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
     }
 
     #[test]
@@ -1481,11 +1674,15 @@ mod tests {
         let feed = db.get_feed(feed_id).unwrap();
         db.record_success(&feed, 10, &cfg, None, &[art("article")])
             .unwrap();
-        let article_id = db.articles_for_feed(feed_id).unwrap()[0].id;
+        let article_id = feed_articles(&db, feed_id)[0].id;
 
-        assert_eq!(db.set_article_archived(article_id, true).unwrap(), 1);
-        assert!(db.articles_for_feed(feed_id).unwrap().is_empty());
-        assert_eq!(db.archived_article_count().unwrap(), 1);
+        assert_eq!(
+            db.conn
+                .execute("UPDATE articles SET archived=1 WHERE id=?1", [article_id])
+                .unwrap(),
+            1
+        );
+        assert!(feed_articles(&db, feed_id).is_empty());
         assert_eq!(db.feeds_with_unread().unwrap()[0].1, 0);
 
         let mut refreshed = art("article");
@@ -1497,19 +1694,21 @@ mod tests {
             0
         );
 
-        assert!(db.articles_for_feed(feed_id).unwrap().is_empty());
-        let archived = db.archived_articles().unwrap();
-        assert_eq!(archived.len(), 1);
-        assert_eq!(archived[0].id, article_id);
-        assert_eq!(archived[0].feed_id, feed_id);
-        assert_eq!(archived[0].title.as_deref(), Some("refreshed title"));
-        assert!(archived[0].archived);
+        assert!(feed_articles(&db, feed_id).is_empty());
+        let archived = db.get_article(article_id).unwrap();
+        assert_eq!(archived.id, article_id);
+        assert_eq!(archived.feed_id, feed_id);
+        assert_eq!(archived.title.as_deref(), Some("refreshed title"));
+        assert!(archived.archived);
         assert_eq!(db.feeds_with_unread().unwrap()[0].1, 0);
 
-        assert_eq!(db.set_article_archived(article_id, false).unwrap(), 1);
-        assert_eq!(db.archived_article_count().unwrap(), 0);
-        assert!(db.archived_articles().unwrap().is_empty());
-        let restored = db.articles_for_feed(feed_id).unwrap();
+        assert_eq!(
+            db.conn
+                .execute("UPDATE articles SET archived=0 WHERE id=?1", [article_id])
+                .unwrap(),
+            1
+        );
+        let restored = feed_articles(&db, feed_id);
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].id, article_id);
         assert!(!restored[0].archived);
@@ -1597,25 +1796,19 @@ mod tests {
     }
 
     #[test]
-    fn saved_articles_unifies_stars_and_clippings_and_delete_is_scoped() {
+    fn web_clipping_delete_is_scoped_to_hidden_feed() {
         let db = mem();
         let cfg = Config::default();
         let feed_id = db.add_feed("http://x/feed", 0).unwrap();
         let feed = db.get_feed(feed_id).unwrap();
         db.record_success(&feed, 1, &cfg, None, &[art("starred"), art("plain")])
             .unwrap();
-        let normal = db.articles_for_feed(feed_id).unwrap();
+        let normal = feed_articles(&db, feed_id);
         let starred_id = normal
             .iter()
             .find(|article| article.entry_id == "starred")
             .unwrap()
             .id;
-        let plain_id = normal
-            .iter()
-            .find(|article| article.entry_id == "plain")
-            .unwrap()
-            .id;
-        db.toggle_star(starred_id).unwrap();
 
         let clipping_id = db
             .save_web_clipping(
@@ -1626,46 +1819,15 @@ mod tests {
             )
             .unwrap();
 
-        let saved = db.saved_articles().unwrap();
-        assert_eq!(saved.len(), 2);
-        assert_eq!(db.saved_article_count().unwrap(), 2);
-        assert!(saved.iter().any(|article| article.id == starred_id));
-        assert!(saved.iter().any(|article| article.id == clipping_id));
-        assert!(!saved.iter().any(|article| article.id == plain_id));
-
         assert_eq!(db.delete_web_clipping(starred_id).unwrap(), 0);
         assert!(
-            db.articles_for_feed(feed_id)
-                .unwrap()
+            feed_articles(&db, feed_id)
                 .iter()
                 .any(|a| a.id == starred_id)
         );
         assert_eq!(db.delete_web_clipping(clipping_id).unwrap(), 1);
         assert!(db.web_clippings().unwrap().is_empty());
         assert!(!db.is_web_clipping(clipping_id).unwrap());
-        assert_eq!(db.saved_article_count().unwrap(), 1);
-    }
-
-    #[test]
-    fn saved_articles_do_not_reopen_archived_items() {
-        let db = mem();
-        let cfg = Config::default();
-        let feed_id = db.add_feed("http://x/feed", 0).unwrap();
-        let feed = db.get_feed(feed_id).unwrap();
-        db.record_success(&feed, 1, &cfg, None, &[art("starred")])
-            .unwrap();
-        let article_id = db.articles_for_feed(feed_id).unwrap()[0].id;
-        db.toggle_star(article_id).unwrap();
-        db.set_article_archived(article_id, true).unwrap();
-
-        assert!(db.saved_articles().unwrap().is_empty());
-        assert_eq!(db.saved_article_count().unwrap(), 0);
-    }
-
-    #[test]
-    fn toggling_a_missing_article_reports_failure() {
-        let db = mem();
-        assert!(db.toggle_star(999_999).is_err());
     }
 
     #[test]
@@ -1696,6 +1858,11 @@ mod tests {
         migrate(&conn).unwrap();
         migrate(&conn).unwrap();
 
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+
         let archived: bool = conn
             .query_row(
                 "SELECT archived FROM articles WHERE entry_id = 'old'",
@@ -1707,10 +1874,204 @@ mod tests {
     }
 
     #[test]
+    fn migration_rejects_a_database_from_a_newer_application() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION + 1)
+            .unwrap();
+
+        let error = migrate(&conn).unwrap_err().to_string();
+        assert!(error.contains("高于当前程序支持的版本"));
+    }
+
+    #[test]
+    fn version_one_migration_adds_workflow_tables_and_interrupts_legacy_runs() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE resource_enrichment_runs (
+               id INTEGER PRIMARY KEY,
+               status TEXT NOT NULL,
+               finished_at INTEGER,
+               error_code TEXT,
+               error_message TEXT
+             );
+             INSERT INTO resource_enrichment_runs(id,status) VALUES(1,'running');
+             PRAGMA user_version=1;",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let task_table: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='knowledge_tasks'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let legacy_status: (String, String) = conn
+            .query_row(
+                "SELECT status,error_code FROM resource_enrichment_runs WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(task_table, "knowledge_tasks");
+        assert_eq!(
+            legacy_status,
+            ("failed".into(), "UPGRADE_INTERRUPTED".into())
+        );
+    }
+
+    #[test]
+    fn version_two_migration_adds_executor_fencing_and_preserves_queued_work() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE resources(id INTEGER PRIMARY KEY);
+             CREATE TABLE resource_enrichment_runs (
+               id INTEGER PRIMARY KEY,
+               status TEXT NOT NULL,
+               finished_at INTEGER,
+               error_code TEXT,
+               error_message TEXT
+             );
+             CREATE TABLE knowledge_tasks (
+               id INTEGER PRIMARY KEY,
+               kind TEXT NOT NULL,
+               target_id INTEGER NOT NULL,
+               status TEXT NOT NULL,
+               current_stage TEXT,
+               next_run_at INTEGER NOT NULL DEFAULT 0,
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE knowledge_task_attempts (
+               id INTEGER PRIMARY KEY,
+               task_id INTEGER NOT NULL,
+               attempt_number INTEGER NOT NULL,
+               status TEXT NOT NULL,
+               current_stage TEXT,
+               automatic_retry INTEGER NOT NULL DEFAULT 0,
+               started_at INTEGER,
+               finished_at INTEGER,
+               error_kind TEXT,
+               user_message TEXT,
+               technical_detail TEXT,
+               created_at INTEGER NOT NULL
+             );
+             INSERT INTO knowledge_tasks(id,kind,target_id,status,current_stage,created_at,updated_at)
+               VALUES(1,'resource_completion',1,'running','organizing',10,10),
+                     (2,'resource_completion',2,'queued',NULL,11,11);
+             INSERT INTO knowledge_task_attempts(id,task_id,attempt_number,status,current_stage,created_at)
+               VALUES(1,1,1,'running','organizing',10),(2,2,1,'queued',NULL,11);
+             PRAGMA user_version=2;",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let statuses: (String, String) = conn
+            .query_row(
+                "SELECT (SELECT status FROM knowledge_tasks WHERE id=1),
+                        (SELECT status FROM knowledge_tasks WHERE id=2)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(statuses, ("interrupted".into(), "queued".into()));
+        assert!(has_column(&conn, "knowledge_tasks", "change_seq").unwrap());
+        assert!(has_column(&conn, "knowledge_task_attempts", "claim_generation").unwrap());
+        assert!(has_column(&conn, "resource_enrichment_runs", "attempt_id").unwrap());
+        let lease_generation: i64 = conn
+            .query_row(
+                "SELECT generation FROM knowledge_executor_lease WHERE singleton_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(lease_generation, 0);
+    }
+
+    #[test]
+    fn version_three_migration_splits_resource_curation_health_and_provenance() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch(
+            "INSERT INTO resources(id,url,canonical_url,kind,status,source,created_at,updated_at)
+               VALUES(1,'https://example.com/review','https://example.com/review','page','pending_review','cli_agent',1,1),
+                     (2,'https://example.com/healthy','https://example.com/healthy','page','active','gui',2,2),
+                     (3,'https://example.com/broken','https://example.com/broken','page','broken','gui',3,3),
+                     (4,'https://example.com/archived','https://example.com/archived','page','archived','gui',4,4);
+             INSERT INTO resource_snapshots(resource_id,content_hash,fetched_at)
+               VALUES(2,'snapshot-hash',2);
+             INSERT INTO resource_enrichment_runs(
+               resource_id,provider,model,prompt_version,schema_version,started_at,finished_at,status
+             ) VALUES(2,'fixture','fixture','v1','v1',2,2,'succeeded');
+             INSERT INTO resource_tags(resource_id,name,language,source,created_at)
+               VALUES(3,'manual-tag','en','manual',3);
+             UPDATE resources
+               SET curation_state='active',health='unknown',categories_source='ai',tags_source='ai';
+             PRAGMA user_version=3;",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let states = conn
+            .prepare(
+                "SELECT curation_state,health,categories_source,tags_source
+                 FROM resources ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            states,
+            vec![
+                (
+                    "pending_review".into(),
+                    "unknown".into(),
+                    "manual".into(),
+                    "ai".into()
+                ),
+                ("active".into(), "healthy".into(), "ai".into(), "ai".into()),
+                (
+                    "active".into(),
+                    "broken".into(),
+                    "manual".into(),
+                    "manual".into()
+                ),
+                (
+                    "archived".into(),
+                    "unknown".into(),
+                    "manual".into(),
+                    "ai".into()
+                ),
+            ]
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            4
+        );
+    }
+
+    #[test]
     fn backoff_and_disable() {
         let db = mem();
-        let mut cfg = Config::default();
-        cfg.disable_after_failures = 2;
+        let cfg = Config {
+            disable_after_failures: 2,
+            ..Config::default()
+        };
         let id = db.add_feed("http://x/feed", 0).unwrap();
         let feed = db.get_feed(id).unwrap();
         db.record_failure(&feed, 0, &cfg, "boom").unwrap();
@@ -1729,7 +2090,7 @@ mod tests {
         let feed = db.get_feed(feed_id).unwrap();
         db.record_success(&feed, 0, &cfg, None, &[art("article")])
             .unwrap();
-        let article_id = db.articles_for_feed(feed_id).unwrap()[0].id;
+        let article_id = feed_articles(&db, feed_id)[0].id;
 
         let comment_id = db
             .add_comment(
@@ -1780,7 +2141,7 @@ mod tests {
         let feed = db.get_feed(feed_id).unwrap();
         db.record_success(&feed, 0, &cfg, None, &[art("article")])
             .unwrap();
-        let article_id = db.articles_for_feed(feed_id).unwrap()[0].id;
+        let article_id = feed_articles(&db, feed_id)[0].id;
 
         assert!(
             db.add_selection(article_id, "  ", None, None, None, true, 0)
@@ -1808,7 +2169,7 @@ mod tests {
         article.content = Some("<p>正文讨论分层设计和事件驱动。</p>".into());
         db.record_success(&feed, 100, &cfg, None, &[article])
             .unwrap();
-        let article_id = db.articles_for_feed(feed_id).unwrap()[0].id;
+        let article_id = feed_articles(&db, feed_id)[0].id;
         db.add_favorite_selection(article_id, "重要的领域模型摘录", None, None, 110)
             .unwrap();
         db.add_comment(
@@ -1860,14 +2221,14 @@ mod tests {
         second.content = Some("shared keyword".into());
         db.record_success(&feed, 100, &cfg, None, &[first, second])
             .unwrap();
-        let archived_id = db
-            .articles_for_feed(feed_id)
-            .unwrap()
+        let archived_id = feed_articles(&db, feed_id)
             .into_iter()
             .map(|article| article.id)
             .max()
             .unwrap();
-        db.set_article_archived(archived_id, true).unwrap();
+        db.conn
+            .execute("UPDATE articles SET archived=1 WHERE id=?1", [archived_id])
+            .unwrap();
 
         assert!(db.search_library("   ", 20).unwrap().is_empty());
         assert!(db.search_library("shared", 0).unwrap().is_empty());
@@ -1881,41 +2242,6 @@ mod tests {
     }
 
     #[test]
-    fn tags_read_later_and_batch_actions_are_persistent() {
-        let db = mem();
-        let cfg = Config::default();
-        let feed_id = db.add_feed("https://example.com/feed.xml", 0).unwrap();
-        let feed = db.get_feed(feed_id).unwrap();
-        db.record_success(&feed, 100, &cfg, None, &[art("one"), art("two")])
-            .unwrap();
-        let articles = db.articles_for_feed(feed_id).unwrap();
-        let ids = articles
-            .iter()
-            .map(|article| article.id)
-            .collect::<Vec<_>>();
-
-        db.replace_article_tags(
-            ids[0],
-            &[" 架构 ".to_owned(), "Rust".to_owned(), "rust".to_owned()],
-            101,
-        )
-        .unwrap();
-        let tags = db.tags_for_article(ids[0]).unwrap();
-        assert_eq!(tags.len(), 2);
-        assert_eq!(db.search_library("架构", 20).unwrap()[0].article_id, ids[0]);
-
-        db.apply_article_batch(&ids, ArticleBatchAction::ReadLater)
-            .unwrap();
-        assert_eq!(db.read_later_count().unwrap(), 2);
-        db.apply_article_batch(&ids[..1], ArticleBatchAction::Bookmark)
-            .unwrap();
-        assert!(db.get_article(ids[0]).unwrap().starred);
-        db.apply_article_batch(&ids[1..], ArticleBatchAction::Archive)
-            .unwrap();
-        assert_eq!(db.read_later_articles().unwrap().len(), 1);
-    }
-
-    #[test]
     fn anchored_selection_and_search_history_round_trip() {
         let db = mem();
         let cfg = Config::default();
@@ -1923,7 +2249,7 @@ mod tests {
         let feed = db.get_feed(feed_id).unwrap();
         db.record_success(&feed, 100, &cfg, None, &[art("anchor")])
             .unwrap();
-        let article_id = db.articles_for_feed(feed_id).unwrap()[0].id;
+        let article_id = feed_articles(&db, feed_id)[0].id;
         let anchor = TextAnchor {
             start_offset: Some(3),
             end_offset: Some(7),
