@@ -81,6 +81,7 @@ pub(crate) enum ModalKind {
     Search,
     EditTags,
     WriteThought,
+    DeleteExcerpt,
     SaveWebPage,
     DeleteWebPage,
     AddResource,
@@ -98,8 +99,9 @@ impl ModalKind {
                 route == Route::Resources
             }
             Self::RestoreBackup | Self::ClearImages => route == Route::Storage,
-            Self::EditTags | Self::WriteThought | Self::SaveWebPage | Self::DeleteWebPage => {
-                route.is_articles()
+            Self::EditTags | Self::SaveWebPage | Self::DeleteWebPage => route.is_articles(),
+            Self::WriteThought | Self::DeleteExcerpt => {
+                route.is_articles() || route == Route::Excerpts
             }
         }
     }
@@ -108,6 +110,7 @@ impl ModalKind {
 pub(crate) trait ModalPayload {
     fn kind(&self) -> ModalKind;
     fn is_dirty(&self) -> bool;
+    #[cfg(test)]
     fn active_request_id(&self) -> Option<u64> {
         None
     }
@@ -252,6 +255,7 @@ where
         self.modal.as_ref().map(ModalPayload::kind)
     }
 
+    #[cfg(test)]
     pub(crate) fn accepts_modal_event(&self, kind: ModalKind, request_id: u64) -> bool {
         self.modal.as_ref().is_some_and(|modal| {
             modal.kind() == kind && modal.active_request_id() == Some(request_id)
@@ -628,7 +632,8 @@ mod tests {
             (ModalKind::DeleteFeed, [true, true, true, true, true]),
             (ModalKind::Search, [true, true, true, true, true]),
             (ModalKind::EditTags, [true, false, false, false, false]),
-            (ModalKind::WriteThought, [true, false, false, false, false]),
+            (ModalKind::WriteThought, [true, false, true, false, false]),
+            (ModalKind::DeleteExcerpt, [true, false, true, false, false]),
             (ModalKind::SaveWebPage, [true, false, false, false, false]),
             (ModalKind::DeleteWebPage, [true, false, false, false, false]),
             (ModalKind::AddResource, [false, true, false, false, false]),

@@ -59,7 +59,11 @@
 
 Resource 写入已由 [ADR-0007](adr/0007-centralize-resource-library-lifecycle.md) 收口到 `src/resource_library_lifecycle.rs`。GUI 与 CLI 应只调用 `project(scope)` / `apply(change, refresh_scope)`；不要恢复旧 `ResourceService`，也不要在调用方提交后再手工拼接抓取或 AI 任务。
 
-Knowledge Processing 通过 `src/knowledge_workflow/resource_target.rs` 维护抓取、健康和 enrichment 结果，并作为 post-commit handoff adapter 接收资源补全请求。schema 当前版本为 v4，新增整理状态、健康状态、分类来源和来源失败计数。后续修改必须保留事务内权威投影、人工 provenance、private 纯本地、批量导入全有或全无、处理中禁止永久删除等不变量。
+Knowledge Processing 通过 `src/knowledge_workflow/resource_target.rs` 维护抓取、健康和 enrichment 结果，并作为 post-commit handoff adapter 接收资源补全请求。schema 当前版本为 v7：v4 新增整理状态、健康状态、分类来源和来源失败计数；v5 按 [ADR-0008](adr/0008-centralize-library-search-and-ranking.md) 建立统一 `library_search_fts` 派生索引；v6 按 [ADR-0009](adr/0009-centralize-web-clipping-lifecycle.md) 新增 `web_clippings` 来源信息表；v7 按 [ADR-0010](adr/0010-centralize-excerpt-thought-lifecycle.md) 增加 managed Excerpt identity、Legacy 保留和 Thought-only 提升。后续修改必须保留事务内权威投影、人工 provenance、private 纯本地、批量导入全有或全无、处理中禁止永久删除等不变量。
+
+跨资料查询统一经过 `src/library_search.rs`。GUI、CLI 和 agent adapter 不得重新实现 eligibility、排序、去重、证据或 Search History；源资料写入也不得手工刷新 FTS。GUI 必须在后台 adapter 执行同步搜索，并用 request identity 拒绝迟到结果。CLI `resource search` 输出 schema version 2；agent 调用时传隐藏的 `--agent`，避免污染人的 Search History，并拒绝返回 Private Resource。
+
+摘录与想法统一经过 `src/excerpt_thought_lifecycle.rs` 的 `project(scope)` / `apply(change, refresh_scope)`；SQLite 细节位于 `src/excerpt_thought_lifecycle/store.rs`。GUI 不得恢复 `Db` selection helper。Legacy Excerpt 不自动合并，Thought 可单独编辑/删除，删除带 Thought 的 Excerpt 需要确认，任何成功写入都必须采用返回 Projection。Feed 或 Web Clipping 永久删除 Article 后，桌面 root 必须重新投影摘录库。
 
 ## 可直接发送给 rrss Agent 的消息
 

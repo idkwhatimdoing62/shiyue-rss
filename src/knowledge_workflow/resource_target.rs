@@ -4,6 +4,7 @@ use anyhow::{Result, bail};
 use rusqlite::Connection;
 
 use crate::db::Db;
+use crate::library_projection_revision::{self, ProjectionImpact};
 use crate::resource_enrichment::{EnrichmentInput, EnrichmentOutput};
 use crate::resource_library_lifecycle::{Resource, SnapshotInput};
 
@@ -28,7 +29,10 @@ pub(crate) fn record_snapshot_success(
          WHERE id=?1",
         rusqlite::params![resource_id, snapshot_id, input.title, now],
     )?;
-    crate::resource_library_lifecycle::refresh_processing_search_index(conn, resource_id)
+    library_projection_revision::record(conn, ProjectionImpact::resource())?;
+    // Library Search owns its derived index and keeps it current through the
+    // same transaction via SQLite triggers.
+    Ok(())
 }
 
 pub(crate) fn record_fetch_failure(
@@ -43,6 +47,7 @@ pub(crate) fn record_fetch_failure(
             "UPDATE resources SET last_checked_at=?2 WHERE id=?1",
             rusqlite::params![resource_id, now],
         )?;
+        library_projection_revision::record(conn, ProjectionImpact::resource())?;
         return Ok(());
     }
     let lower = technical_detail.to_ascii_lowercase();
@@ -58,6 +63,7 @@ pub(crate) fn record_fetch_failure(
          WHERE id=?1",
         rusqlite::params![resource_id, permanent, now],
     )?;
+    library_projection_revision::record(conn, ProjectionImpact::resource())?;
     Ok(())
 }
 
@@ -67,7 +73,9 @@ pub(crate) fn apply_enrichment(
     output: &EnrichmentOutput,
     now: i64,
 ) -> Result<()> {
-    crate::resource_library_lifecycle::apply_processing_enrichment(conn, resource_id, output, now)
+    crate::resource_library_lifecycle::apply_processing_enrichment(conn, resource_id, output, now)?;
+    library_projection_revision::record(conn, ProjectionImpact::resource())?;
+    Ok(())
 }
 
 pub(crate) fn has_active_processing(conn: &Connection, resource_id: i64) -> Result<bool> {

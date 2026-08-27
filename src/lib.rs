@@ -1,8 +1,12 @@
+mod article_document_presentation;
 mod article_library_lifecycle;
 mod backup;
 mod cli;
 mod config;
 mod db;
+mod desktop_library_projection;
+mod desktop_runtime;
+mod excerpt_thought_lifecycle;
 mod feed_subscription;
 mod fetch;
 mod gui;
@@ -11,21 +15,23 @@ mod gui_state;
 mod gui_theme;
 mod image_store;
 mod knowledge_workflow;
+mod library_projection_revision;
+mod library_search;
 mod local_data_maintenance;
 mod model;
-mod notify;
 mod resource_enrichment;
 mod resource_library_lifecycle;
 mod rss_refresh_workflow;
-mod text;
+mod schema_evolution;
 mod web_clip;
+mod web_clipping_lifecycle;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser};
 
 use crate::cli::{Cli, Command, ResourceCommand, ResourceResultType, ResourceScope};
-use crate::config::Paths;
 use crate::db::Db;
+use crate::desktop_runtime::Paths;
 use crate::feed_subscription::{
     ChangeDisposition, FeedSubscriptions, InitialRefreshOutcome, SubscriptionChange,
 };
@@ -33,17 +39,14 @@ use crate::rss_refresh_workflow::{RefreshRunSnapshot, RefreshRunStatus, RssRefre
 
 /// 启动不带控制台窗口的拾阅桌面界面。
 pub fn run_gui() -> Result<()> {
-    let paths = Paths::resolve()?;
-    init_logging(&paths);
-    let cfg = config::load(&paths)?;
-    gui::run(paths, cfg)
+    desktop_runtime::launch()
 }
 
 /// 运行独立的命令行管理工具。
 pub fn run_cli() -> Result<i32> {
-    let paths = Paths::resolve()?;
-    init_logging(&paths);
-    let cfg = config::load(&paths)?;
+    let environment = desktop_runtime::command_environment()?;
+    let paths = environment.paths;
+    let cfg = environment.settings;
 
     match Cli::parse().command {
         Some(Command::Resource { command }) => {
@@ -161,6 +164,17 @@ fn run_resource_cli(paths: &Paths, cfg: &config::Config, command: ResourceComman
     {
         return run_resource_retry_cli(paths, cfg, id, no_wait, &timeout);
     }
+    if let ResourceCommand::Search {
+        query,
+        r#type,
+        scope,
+        limit,
+        agent,
+        ..
+    } = command
+    {
+        return run_library_search_cli(paths, query, r#type, scope, limit, agent);
+    }
     let db = Db::open(&paths.db_file)?;
     let lifecycle = ResourceLibraryLifecycle::new(&db, &NoProcessingHandoff, &SystemClock);
     let result: Result<serde_json::Value> = (|| {
@@ -247,20 +261,7 @@ fn run_resource_cli(paths: &Paths, cfg: &config::Config, command: ResourceComman
                     .collect::<Result<Vec<_>>>()?,
             ),
             ResourceCommand::Retry { .. } => unreachable!("retry handled before generic commands"),
-            ResourceCommand::Search {
-                query,
-                r#type,
-                scope,
-                limit,
-                ..
-            } => serde_json::Value::Array(resource_library_lifecycle::legacy_search_json(
-                &db,
-                &query,
-                !matches!(r#type, ResourceResultType::Article),
-                !matches!(r#type, ResourceResultType::Resource),
-                matches!(scope, ResourceScope::All),
-                limit,
-            )?),
+            ResourceCommand::Search { .. } => unreachable!("search handled by Library Search"),
         })
     })();
     match result {
@@ -282,6 +283,134 @@ fn run_resource_cli(paths: &Paths, cfg: &config::Config, command: ResourceComman
                 serde_json::json!({"schema_version":1,"ok":false,"error":{"code":if not_found{"RESOURCE_NOT_FOUND"}else{"RESOURCE_ERROR"},"message":error.to_string(),"retryable":false}})
             );
             Ok(if not_found { 3 } else { 1 })
+        }
+    }
+}
+
+fn run_library_search_cli(
+    paths: &Paths,
+    query: String,
+    result_type: ResourceResultType,
+    scope: ResourceScope,
+    limit: usize,
+    agent: bool,
+) -> Result<i32> {
+    use library_search::{
+        LibrarySearch, PrimaryIdentity, ResultType, SearchOrigin, SearchRequest, SearchScope,
+        SearchWarning,
+    };
+
+    let db = match Db::open(&paths.db_file) {
+        Ok(db) => db,
+        Err(error) => {
+            let technical_detail = error.to_string();
+            let maintenance = technical_detail.contains("migration")
+                || technical_detail.contains("schema")
+                || technical_detail.contains("user_version");
+            println!(
+                "{}",
+                serde_json::json!({
+                    "schema_version": 2,
+                    "ok": false,
+                    "error": {
+                        "code": if maintenance { "LIBRARY_SEARCH_MAINTENANCE" } else { "LIBRARY_SEARCH_STORAGE" },
+                        "message": if maintenance { "资料库正在维护或需要迁移" } else { "无法打开本地资料库" },
+                        "technical_detail": technical_detail,
+                        "retryable": true,
+                    }
+                })
+            );
+            return Ok(1);
+        }
+    };
+    let request = SearchRequest {
+        query,
+        scope: match scope {
+            ResourceScope::Curated => SearchScope::Curated,
+            ResourceScope::All => SearchScope::AllArticles,
+            ResourceScope::Archive => SearchScope::Archive,
+        },
+        result_type: match result_type {
+            ResourceResultType::All => ResultType::All,
+            ResourceResultType::Resource => ResultType::Resource,
+            ResourceResultType::Article => ResultType::Article,
+        },
+        origin: if agent {
+            SearchOrigin::Agent
+        } else {
+            SearchOrigin::Human
+        },
+        limit,
+    };
+    match LibrarySearch::new(&db).search(request) {
+        Ok(outcome) => {
+            let data = outcome
+                .results
+                .into_iter()
+                .map(|result| {
+                    let (result_type, id) = match result.primary {
+                        PrimaryIdentity::Resource(id) => ("resource", id),
+                        PrimaryIdentity::Article(id) => ("article", id),
+                    };
+                    serde_json::json!({
+                        "primary_identity":{"type":result_type,"id":id.to_string()},
+                        "title":result.title,
+                        "url":result.url,
+                        "privacy":result.privacy,
+                        "health":result.health,
+                        "archived":result.archived,
+                        "updated_at":result.updated_at,
+                        "evidence":result.evidence.into_iter().map(|evidence| serde_json::json!({
+                            "kind":evidence.kind.as_str(),
+                            "source_id":evidence.source_id.to_string(),
+                            "article_id":evidence.article_id.map(|id| id.to_string()),
+                            "field":evidence.field.as_str(),
+                            "text":evidence.text,
+                        })).collect::<Vec<_>>(),
+                        "score_factors":result.factors.into_iter().map(|factor| factor.as_str()).collect::<Vec<_>>(),
+                        "article_targets":result.article_targets.into_iter().map(|target| serde_json::json!({
+                            "article_id":target.article_id.to_string(),
+                            "feed_id":target.feed_id.to_string(),
+                            "selection_id":target.selection_id.map(|id| id.to_string()),
+                            "archived":target.archived,
+                            "web_clipping":target.web_clipping,
+                        })).collect::<Vec<_>>(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let warnings = outcome
+                .warnings
+                .into_iter()
+                .map(|warning| match warning {
+                    SearchWarning::HistoryNotRecorded { technical_detail } => serde_json::json!({
+                        "code":"SEARCH_HISTORY_NOT_RECORDED",
+                        "message":"搜索结果有效，但历史记录没有保存",
+                        "technical_detail":technical_detail,
+                    }),
+                })
+                .collect::<Vec<_>>();
+            println!(
+                "{}",
+                serde_json::json!({"schema_version":2,"ok":true,"query":outcome.query,"data":data,"warnings":warnings})
+            );
+            Ok(0)
+        }
+        Err(failure) => {
+            let code = match failure.kind {
+                library_search::FailureKind::Input => "LIBRARY_SEARCH_INPUT",
+                library_search::FailureKind::Maintenance => "LIBRARY_SEARCH_MAINTENANCE",
+                library_search::FailureKind::Storage => "LIBRARY_SEARCH_STORAGE",
+                library_search::FailureKind::Index => "LIBRARY_SEARCH_INDEX",
+            };
+            println!(
+                "{}",
+                serde_json::json!({"schema_version":2,"ok":false,"error":{"code":code,"message":failure.user_message,"technical_detail":failure.technical_detail,"retryable":matches!(failure.kind,library_search::FailureKind::Maintenance | library_search::FailureKind::Storage)}})
+            );
+            Ok(if failure.kind == library_search::FailureKind::Input {
+                2
+            } else {
+                1
+            })
         }
     }
 }
@@ -470,20 +599,4 @@ fn list_feeds(feeds: Vec<(crate::model::Feed, i64)>) {
         let title = feed.title.unwrap_or_else(|| feed.url.clone());
         println!("#{:<3} 未读 {:<4} {status} {title}", feed.id, unread);
     }
-}
-
-/// 后台调度与命令行的日志都追加到兼容路径 rrss.log。
-fn init_logging(paths: &Paths) {
-    let path = paths.log_file.clone();
-    let make = move || {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .unwrap_or_else(|_| panic!("无法打开日志文件"))
-    };
-    let _ = tracing_subscriber::fmt()
-        .with_writer(make)
-        .with_ansi(false)
-        .try_init();
 }

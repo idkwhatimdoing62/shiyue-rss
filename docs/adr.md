@@ -1,6 +1,6 @@
 # 架构决策记录（ADR）
 
-深化模块决策使用独立文件。资源创建、完整人工编辑、整理状态、健康状态、网页收藏导入、永久删除、权威投影及 Knowledge Processing 的提交后交接见 [ADR-0007：Resource Library Lifecycle](adr/0007-centralize-resource-library-lifecycle.md)。
+深化模块决策使用独立文件。资源创建、完整人工编辑、整理状态、健康状态、网页收藏导入、永久删除、权威投影及 Knowledge Processing 的提交后交接见 [ADR-0007：Resource Library Lifecycle](adr/0007-centralize-resource-library-lifecycle.md)。跨资料查询、统一排序、主身份合并、Search Evidence、Search History 与派生索引见 [ADR-0008：Library Search](adr/0008-centralize-library-search-and-ranking.md)。网页收藏的抓取租约、取消/提交竞争、来源信息与永久删除见 [ADR-0009：Web Clipping Lifecycle](adr/0009-centralize-web-clipping-lifecycle.md)。摘录身份、单一想法、历史重复保留、权威投影和搜索一致性见 [ADR-0010：Excerpt & Thought Lifecycle](adr/0010-centralize-excerpt-thought-lifecycle.md)。资料库就绪检查、逐版本事务转换、历史发布兼容、漂移拒绝和升级前安全副本见 [ADR-0011：Versioned Schema Evolution](adr/0011-versioned-schema-evolution.md)。正文准备、egui 呈现、稳定字符偏移与异步图片/公式状态见 [ADR-0012：Article Document Presentation](adr/0012-centralize-article-document-presentation.md)。桌面启动、版本化设置、原子持久化、托盘/窗口状态机与通知策略见 [ADR-0013：Desktop Runtime & Settings](adr/0013-centralize-desktop-runtime-and-settings.md)。桌面资料投影的采用、修订号失效、跨进程观察与维护代际隔离见 [ADR-0014：Desktop Library Projection](adr/0014-centralize-desktop-library-projection.md)。
 
 格式：每条 = 决策 / 背景 / 选择 / 后果。ADR-1～12 为 **Accepted**（2026-07-11）；ADR-13～16 为 **Accepted**（2026-07-13），并取代了 ADR-2、改写了 ADR-4；ADR-17～19 为 **Accepted**（2026-08-13 至 2026-08-14）。
 

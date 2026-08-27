@@ -9,14 +9,17 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use chrono::Utc;
 use rusqlite::{Connection, Row, params, params_from_iter};
 
-use crate::db::{Db, WEB_CLIPPINGS_FEED_URL};
+use crate::db::{ArticleAiContent, Db, WEB_CLIPPINGS_FEED_URL};
+use crate::library_projection_revision::{
+    self, ProjectionFamily, ProjectionImpact, ProjectionStamp,
+};
 use crate::model::Article;
 
 const ARTICLE_COLUMNS: &str = "a.id, a.feed_id, a.entry_id, a.url, a.title, a.author, a.published, a.content, \
      a.is_read, a.starred, a.read_later, a.archived, a.fetched_at";
 const QUERY_CHUNK: usize = 400;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ProjectionScope {
     Feed(i64),
     ArticleBookmarks,
@@ -69,8 +72,10 @@ pub(crate) struct ArticleLibraryCounts {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ArticleLibraryProjection {
+    pub(crate) stamp: ProjectionStamp,
     pub(crate) scope: ProjectionScope,
     pub(crate) articles: Vec<Article>,
+    pub(crate) article_ai: HashMap<i64, ArticleAiContent>,
     pub(crate) tags: HashMap<i64, Vec<String>>,
     pub(crate) fixed_bookmark_ids: HashSet<i64>,
     pub(crate) counts: ArticleLibraryCounts,
@@ -116,12 +121,10 @@ pub(crate) enum FailureKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StorageOperation {
     Project,
-    AcquireWriterPermit,
     BeginTransaction,
     ResolveArticles,
     ApplyChange,
     ReloadProjection,
-    ValidateWriterPermit,
     Commit,
 }
 
@@ -202,7 +205,17 @@ impl<'db> ArticleLibraryLifecycle<'db> {
             .conn
             .unchecked_transaction()
             .map_err(|error| LifecycleFailure::storage(StorageOperation::Project, error))?;
-        let projection = build_projection(&tx, scope, StorageOperation::Project)?;
+        let revision = library_projection_revision::read_family(&tx, ProjectionFamily::Article)
+            .map_err(|error| LifecycleFailure::storage(StorageOperation::Project, error))?;
+        let projection = build_projection(
+            &tx,
+            scope,
+            ProjectionStamp {
+                generation: self.db.library_generation(),
+                revision,
+            },
+            StorageOperation::Project,
+        )?;
         tx.commit()
             .map_err(|error| LifecycleFailure::storage(StorageOperation::Project, error))?;
         Ok(projection)
@@ -214,20 +227,27 @@ impl<'db> ArticleLibraryLifecycle<'db> {
         refresh_scope: ProjectionScope,
     ) -> Result<ApplyOutcome, LifecycleFailure> {
         validate_change(&change)?;
-        let permit = self.db.write_permit().map_err(|error| {
-            LifecycleFailure::storage(StorageOperation::AcquireWriterPermit, error)
-        })?;
-        let tx = self.db.conn.unchecked_transaction().map_err(|error| {
+        let tx = self.db.fenced_transaction().map_err(|error| {
             LifecycleFailure::storage(StorageOperation::BeginTransaction, error)
         })?;
 
         let disposition = apply_change(&tx, change)?;
-        let projection = build_projection(&tx, refresh_scope, StorageOperation::ReloadProjection)?;
-        if let Some(permit) = permit.as_ref() {
-            permit.validate().map_err(|error| {
-                LifecycleFailure::storage(StorageOperation::ValidateWriterPermit, error)
-            })?;
-        }
+        let impact = if matches!(disposition, ChangeDisposition::Changed { .. }) {
+            ProjectionImpact::article()
+        } else {
+            ProjectionImpact::none()
+        };
+        let revisions = library_projection_revision::record(&tx, impact)
+            .map_err(|error| LifecycleFailure::storage(StorageOperation::ApplyChange, error))?;
+        let projection = build_projection(
+            &tx,
+            refresh_scope,
+            ProjectionStamp {
+                generation: self.db.library_generation(),
+                revision: revisions.article,
+            },
+            StorageOperation::ReloadProjection,
+        )?;
         tx.commit()
             .map_err(|error| LifecycleFailure::storage(StorageOperation::Commit, error))?;
         Ok(ApplyOutcome {
@@ -235,6 +255,16 @@ impl<'db> ArticleLibraryLifecycle<'db> {
             projection,
         })
     }
+}
+
+/// Transaction-local projection seam for lifecycle modules that must return
+/// the authoritative Article Library view from the same durable change.
+pub(crate) fn project_on(
+    conn: &Connection,
+    scope: ProjectionScope,
+    stamp: ProjectionStamp,
+) -> Result<ArticleLibraryProjection, LifecycleFailure> {
+    build_projection(conn, scope, stamp, StorageOperation::ReloadProjection)
 }
 
 fn validate_change(change: &ArticleLifecycleChange) -> Result<(), LifecycleFailure> {
@@ -527,6 +557,7 @@ fn same_tag_set(left: &[String], right: &[String]) -> bool {
 fn build_projection(
     conn: &Connection,
     scope: ProjectionScope,
+    stamp: ProjectionStamp,
     operation: StorageOperation,
 ) -> Result<ArticleLibraryProjection, LifecycleFailure> {
     let (mut articles, fixed_bookmark_ids) = load_articles(conn, scope, operation)?;
@@ -545,17 +576,59 @@ fn build_projection(
         .iter()
         .map(|article| article.id)
         .collect::<Vec<_>>();
+    let article_ai = article_ai_for_ids(conn, &article_ids, operation)?;
     let tags = tags_for_ids(conn, &article_ids, operation)?;
     let counts = load_counts(conn, operation)?;
     let feed_unread = load_feed_unread(conn, operation)?;
     Ok(ArticleLibraryProjection {
+        stamp,
         scope,
         articles,
+        article_ai,
         tags,
         fixed_bookmark_ids,
         counts,
         feed_unread,
     })
+}
+
+fn article_ai_for_ids(
+    conn: &Connection,
+    article_ids: &[i64],
+    operation: StorageOperation,
+) -> Result<HashMap<i64, ArticleAiContent>, LifecycleFailure> {
+    let mut material = HashMap::new();
+    for chunk in article_ids.chunks(QUERY_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT article_id, summary_zh, translation_zh, model, updated_at
+             FROM article_ai WHERE article_id IN ({placeholders})"
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|error| LifecycleFailure::storage(operation, error))?;
+        let rows = stmt
+            .query_map(params_from_iter(chunk.iter()), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    ArticleAiContent {
+                        summary_zh: row.get(1)?,
+                        translation_zh: row.get(2)?,
+                        model: row.get(3)?,
+                        updated_at: row.get(4)?,
+                    },
+                ))
+            })
+            .map_err(|error| LifecycleFailure::storage(operation, error))?;
+        for row in rows {
+            let (article_id, content) =
+                row.map_err(|error| LifecycleFailure::storage(operation, error))?;
+            material.insert(article_id, content);
+        }
+    }
+    Ok(material)
 }
 
 fn map_article(row: &Row<'_>) -> rusqlite::Result<(Article, bool)> {
@@ -822,6 +895,9 @@ mod tests {
                 .apply(change, ProjectionScope::Feed(feed_id))
                 .unwrap();
         }
+        let revision =
+            library_projection_revision::read_family(&library.db().conn, ProjectionFamily::Article)
+                .unwrap();
         let first = lifecycle
             .apply(
                 ArticleLifecycleChange::SetRead {
@@ -837,6 +913,7 @@ mod tests {
                 matched_articles: 1
             }
         );
+        assert_eq!(first.projection.stamp.revision, revision);
         let article = &first.projection.articles[0];
         assert!(article.starred);
         assert!(article.read_later);
@@ -1038,9 +1115,18 @@ mod tests {
             first.projection.tags[&ids[0]],
             vec!["Rust".to_owned(), "架构".to_owned()]
         );
+        let search = crate::library_search::LibrarySearch::new(library.db())
+            .search(crate::library_search::SearchRequest {
+                query: "架构".into(),
+                scope: crate::library_search::SearchScope::AllArticles,
+                result_type: crate::library_search::ResultType::All,
+                origin: crate::library_search::SearchOrigin::Agent,
+                limit: 20,
+            })
+            .unwrap();
         assert_eq!(
-            library.db().search_library("架构", 20).unwrap()[0].article_id,
-            ids[0]
+            search.results[0].primary,
+            crate::library_search::PrimaryIdentity::Article(ids[0])
         );
         let unchanged = lifecycle
             .apply(
@@ -1103,9 +1189,62 @@ mod tests {
     }
 
     #[test]
+    fn revision_failure_rolls_back_the_article_change() {
+        let library = TestLibrary::new();
+        let (feed_id, ids) = library.add_feed_articles(&["one"]);
+        let lifecycle = ArticleLibraryLifecycle::new(library.db());
+        let before = lifecycle.project(ProjectionScope::Feed(feed_id)).unwrap();
+        library
+            .db()
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER reject_article_revision BEFORE UPDATE ON library_projection_revisions
+                 BEGIN SELECT RAISE(ABORT, 'forced revision failure'); END;",
+            )
+            .unwrap();
+
+        let error = lifecycle
+            .apply(
+                ArticleLifecycleChange::SetBookmark {
+                    article_id: ids[0],
+                    target: true,
+                },
+                ProjectionScope::Feed(feed_id),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind, FailureKind::Storage);
+        let after = lifecycle.project(ProjectionScope::Feed(feed_id)).unwrap();
+        assert_eq!(after.articles[0].starred, before.articles[0].starred);
+        assert_eq!(after.stamp, before.stamp);
+    }
+
+    #[test]
+    fn another_connection_observes_the_committed_article_stamp() {
+        let library = TestLibrary::new();
+        let (feed_id, ids) = library.add_feed_articles(&["one"]);
+        let observer = Connection::open(library.root.join("library.db")).unwrap();
+        let before =
+            library_projection_revision::read_family(&observer, ProjectionFamily::Article).unwrap();
+
+        let outcome = ArticleLibraryLifecycle::new(library.db())
+            .apply(
+                ArticleLifecycleChange::SetReadLater {
+                    article_id: ids[0],
+                    target: true,
+                },
+                ProjectionScope::Feed(feed_id),
+            )
+            .unwrap();
+        let observed =
+            library_projection_revision::read_family(&observer, ProjectionFamily::Article).unwrap();
+        assert_eq!(observed, before + 1);
+        assert_eq!(outcome.projection.stamp.revision, observed);
+    }
+
+    #[test]
     fn maintenance_markers_are_typed() {
         let failure = LifecycleFailure::storage(
-            StorageOperation::AcquireWriterPermit,
+            StorageOperation::BeginTransaction,
             "MAINTENANCE_IN_PROGRESS",
         );
         assert_eq!(failure.kind, FailureKind::Maintenance);

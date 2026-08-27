@@ -4,12 +4,14 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use crate::db::Db;
 
 const PROTECTED_HEADER: &[u8] = b"SHIYUE-DPAPI-1\0";
 pub const DEFAULT_BACKUP_KEEP: usize = 10;
+static BACKUP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackupProtection {
@@ -44,7 +46,12 @@ impl BackupStore {
     }
 
     fn create_unpruned(&self, db: &Db, protection: BackupProtection) -> Result<BackupEntry> {
-        let stamp = Utc::now().format("%Y%m%d-%H%M%S-%3f");
+        let stamp = format!(
+            "{}-{}-{}",
+            Utc::now().format("%Y%m%d-%H%M%S-%3f"),
+            std::process::id(),
+            BACKUP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
         let temporary = self.directory.join(format!(".shiyue-{stamp}.tmp.db"));
         db.backup_to(&temporary)?;
         let final_path = match protection {

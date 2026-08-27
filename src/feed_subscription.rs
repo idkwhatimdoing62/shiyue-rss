@@ -9,7 +9,6 @@ use std::path::PathBuf;
 
 use crate::config::Config;
 use crate::db::Db;
-use crate::local_data_maintenance::WriterGate;
 use crate::model::Feed;
 use crate::rss_refresh_workflow::{
     RefreshRunSnapshot, RefreshRunStatus, RefreshWorkflowStatus, RssRefreshWorkflow,
@@ -179,7 +178,6 @@ impl<'a> FeedSubscriptions<'a> {
         &self,
         change: SubscriptionChange,
     ) -> Result<SubscriptionOutcome, SubscriptionError> {
-        self.ensure_writable()?;
         match change {
             SubscriptionChange::Add { url } => self.add(&url),
             SubscriptionChange::Enable { id } => self.set_disabled(id, false),
@@ -199,18 +197,6 @@ impl<'a> FeedSubscriptions<'a> {
         Db::open(&self.database)
             .and_then(|db| db.find_feed(id))
             .map_err(SubscriptionError::storage)
-    }
-
-    fn ensure_writable(&self) -> Result<(), SubscriptionError> {
-        match WriterGate::maintenance_active(&self.database) {
-            Ok(false) => Ok(()),
-            Ok(true) => Err(SubscriptionError {
-                kind: SubscriptionErrorKind::Maintenance,
-                user_message: "资料维护期间不能修改订阅".into(),
-                technical_detail: "MAINTENANCE_IN_PROGRESS".into(),
-            }),
-            Err(error) => Err(SubscriptionError::storage(error)),
-        }
     }
 
     fn add(&self, input: &str) -> Result<SubscriptionOutcome, SubscriptionError> {

@@ -202,7 +202,6 @@ impl<'a> ResourceStore<'a> {
             params![input.url.trim(), canonical, input.parent_resource_id, input.linked_article_id, input.kind.as_str(), input.title, input.private_note, input.privacy.as_str(), initial_status(input.source).as_str(), curation_state.as_str(), input.source.as_str(), input.manual_rating, now])
             .context("create resource")?;
         let id = self.db.conn.last_insert_rowid();
-        self.refresh_search_index(id)?;
         self.get(id)
     }
     pub fn get(&self, id: i64) -> Result<Resource> {
@@ -241,7 +240,6 @@ impl<'a> ResourceStore<'a> {
         if changed == 0 {
             bail!("resource not found")
         }
-        self.refresh_search_index(id)?;
         Ok(())
     }
     #[allow(clippy::too_many_arguments)]
@@ -263,7 +261,6 @@ impl<'a> ResourceStore<'a> {
         if changed == 0 {
             bail!("resource not found")
         }
-        self.refresh_search_index(id)?;
         Ok(())
     }
     pub fn set_fetched_title_if_empty(&self, id: i64, title: Option<&str>, now: i64) -> Result<()> {
@@ -271,7 +268,6 @@ impl<'a> ResourceStore<'a> {
             "UPDATE resources SET title=COALESCE(title,?2),last_checked_at=?3,updated_at=?3 WHERE id=?1",
             params![id,title,now],
         )?;
-        self.refresh_search_index(id)?;
         Ok(())
     }
     pub fn enrichment_input(
@@ -311,7 +307,7 @@ impl<'a> ResourceStore<'a> {
         output: &crate::resource_enrichment::EnrichmentOutput,
         now: i64,
     ) -> Result<()> {
-        let tx = self.db.conn.unchecked_transaction()?;
+        let tx = self.db.fenced_transaction()?;
         Self::apply_enrichment_on(&tx, id, output, now)?;
         tx.commit()?;
         Ok(())
@@ -362,7 +358,6 @@ impl<'a> ResourceStore<'a> {
                 conn.execute("INSERT INTO resource_tags(resource_id,name,language,source,created_at) VALUES(?1,?2,?3,'ai',?4) ON CONFLICT(resource_id,name) DO NOTHING",params![id,name,language,now])?;
             }
         }
-        Self::refresh_search_index_on(conn, id)?;
         Ok(())
     }
     pub fn transition(&self, id: i64, to: ResourceStatus, now: i64) -> Result<()> {
@@ -404,7 +399,7 @@ impl<'a> ResourceStore<'a> {
         Ok(())
     }
     pub fn set_categories(&self, id: i64, categories: &[Category]) -> Result<()> {
-        let tx = self.db.conn.unchecked_transaction()?;
+        let tx = self.db.fenced_transaction()?;
         tx.execute("DELETE FROM resource_categories WHERE resource_id=?1", [id])?;
         for c in categories {
             tx.execute(
@@ -413,7 +408,6 @@ impl<'a> ResourceStore<'a> {
             )?;
         }
         tx.commit()?;
-        self.refresh_search_index(id)?;
         Ok(())
     }
     pub fn upsert_tag(&self, id: i64, tag: &ResourceTag, now: i64) -> Result<()> {
@@ -422,7 +416,6 @@ impl<'a> ResourceStore<'a> {
             bail!("invalid tag")
         };
         self.db.conn.execute("INSERT INTO resource_tags(resource_id,name,language,source,created_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(resource_id,name) DO UPDATE SET language=CASE WHEN resource_tags.source='manual' THEN resource_tags.language ELSE excluded.language END, source=CASE WHEN resource_tags.source='manual' THEN 'manual' ELSE excluded.source END",params![id,name,tag.language.as_str(),tag.source.as_str(),now])?;
-        self.refresh_search_index(id)?;
         Ok(())
     }
     pub fn tags(&self, id: i64) -> Result<Vec<ResourceTag>> {
@@ -485,7 +478,6 @@ impl<'a> ResourceStore<'a> {
         self.db.conn.execute("INSERT INTO resource_snapshots(resource_id,content_hash,fetched_url,http_status,title,cleaned_content,fetched_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![id,hash,input.fetched_url,input.http_status,input.title,input.cleaned_content,now])?;
         let sid = self.db.conn.last_insert_rowid();
         self.db.conn.execute("UPDATE resources SET latest_snapshot_id=?2,last_checked_at=?3,updated_at=?3 WHERE id=?1",params![id,sid,now])?;
-        self.refresh_search_index(id)?;
         Ok(Some(sid))
     }
     #[allow(clippy::too_many_arguments)]
@@ -545,7 +537,7 @@ impl<'a> ResourceStore<'a> {
         Ok(candidates)
     }
     pub fn import_web_clippings(&self, article_ids: &[i64], now: i64) -> Result<Vec<i64>> {
-        let tx = self.db.conn.unchecked_transaction()?;
+        let tx = self.db.fenced_transaction()?;
         let mut ids = Vec::new();
         for article_id in article_ids {
             let row:Option<(String,Option<String>)>=tx.query_row("SELECT a.url,a.title FROM articles a JOIN feeds f ON f.id=a.feed_id WHERE a.id=?1 AND f.url=?2 AND a.url IS NOT NULL",params![article_id,crate::db::WEB_CLIPPINGS_FEED_URL],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
@@ -557,9 +549,6 @@ impl<'a> ResourceStore<'a> {
             }
         }
         tx.commit()?;
-        for id in &ids {
-            self.refresh_search_index(*id)?;
-        }
         Ok(ids)
     }
 
@@ -570,149 +559,6 @@ impl<'a> ResourceStore<'a> {
         let mut stmt = self.db.conn.prepare(&sql)?;
         let rows = stmt.query_map([i64::try_from(limit).unwrap_or(i64::MAX)], map_resource)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
-    fn refresh_search_index(&self, id: i64) -> Result<()> {
-        Self::refresh_search_index_on(&self.db.conn, id)
-    }
-
-    pub(crate) fn refresh_search_index_on(conn: &rusqlite::Connection, id: i64) -> Result<()> {
-        conn.execute("DELETE FROM resource_fts WHERE source_id=?1", [id])?;
-        conn.execute("INSERT INTO resource_fts(source_id,body) SELECT r.id,trim(COALESCE(r.title,'')||char(10)||r.url||char(10)||COALESCE(r.purpose_zh,'')||char(10)||COALESCE(r.use_when_zh,'')||char(10)||r.capabilities||char(10)||r.limitations||char(10)||r.languages||char(10)||COALESCE(r.private_note,'')||char(10)||COALESCE((SELECT group_concat(category,' ') FROM resource_categories c WHERE c.resource_id=r.id),'')||char(10)||COALESCE((SELECT group_concat(name,' ') FROM resource_tags t WHERE t.resource_id=r.id),'')||char(10)||COALESCE((SELECT cleaned_content FROM resource_snapshots s WHERE s.id=r.latest_snapshot_id),'')) FROM resources r WHERE r.id=?1", [id])?;
-        Ok(())
-    }
-
-    pub fn search_json(
-        &self,
-        query: &str,
-        include_resources: bool,
-        include_articles: bool,
-        all_articles: bool,
-        limit: usize,
-    ) -> Result<Vec<Value>> {
-        let query = query.trim();
-        if query.is_empty() || limit == 0 {
-            return Ok(Vec::new());
-        }
-        let pattern = format!(
-            "%{}%",
-            query.to_lowercase().replace('%', "\\%").replace('_', "\\_")
-        );
-        let mut results = Vec::new();
-        if include_resources {
-            let fts_query = if query
-                .split_whitespace()
-                .all(|term| term.chars().count() >= 3)
-            {
-                query
-                    .split_whitespace()
-                    .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
-                    .collect::<Vec<_>>()
-                    .join(" AND ")
-            } else {
-                String::new()
-            };
-            let fallback_terms = query
-                .split_whitespace()
-                .map(str::to_lowercase)
-                .collect::<Vec<_>>();
-            let sql_pattern = if fts_query.is_empty() {
-                "%".to_owned()
-            } else {
-                pattern.clone()
-            };
-            let sql_limit = if fts_query.is_empty() { 1000 } else { limit };
-            let mut stmt = self.db.conn.prepare(&format!(
-                "SELECT {RESOURCE_COLS},
-                    CASE WHEN lower(COALESCE(title,'')) LIKE ?1 ESCAPE '\\' THEN 'title'
-                         WHEN lower(url) LIKE ?1 ESCAPE '\\' THEN 'url'
-                         WHEN lower(COALESCE(purpose_zh,'')) LIKE ?1 ESCAPE '\\' THEN 'purpose_zh'
-                         WHEN lower(COALESCE(use_when_zh,'')) LIKE ?1 ESCAPE '\\' THEN 'use_when_zh'
-                         WHEN lower(private_note) LIKE ?1 ESCAPE '\\' THEN 'private_note'
-                         WHEN lower(capabilities || limitations || languages || COALESCE((SELECT group_concat(category,' ') FROM resource_categories c WHERE c.resource_id=resources.id),'') || COALESCE((SELECT group_concat(name,' ') FROM resource_tags t WHERE t.resource_id=resources.id),'')) LIKE ?1 ESCAPE '\\' THEN 'metadata'
-                         ELSE 'snapshot' END matched_field,
-                    COALESCE((SELECT cleaned_content FROM resource_snapshots s WHERE s.id=resources.latest_snapshot_id),'') snapshot
-                 FROM resources WHERE curation_state='active' AND ((?3='' AND lower(COALESCE(title,'')||char(10)||url||char(10)||COALESCE(purpose_zh,'')||char(10)||COALESCE(use_when_zh,'')||char(10)||capabilities||char(10)||limitations||char(10)||languages||char(10)||COALESCE(private_note,'')||char(10)||COALESCE((SELECT group_concat(category,' ') FROM resource_categories c WHERE c.resource_id=resources.id),'')||char(10)||COALESCE((SELECT group_concat(name,' ') FROM resource_tags t WHERE t.resource_id=resources.id),'')||char(10)||COALESCE((SELECT cleaned_content FROM resource_snapshots s WHERE s.id=resources.latest_snapshot_id),'')) LIKE ?1 ESCAPE '\\') OR (?3<>'' AND resources.id IN (SELECT source_id FROM resource_fts WHERE resource_fts MATCH ?3)))
-                 ORDER BY COALESCE(manual_rating,0) DESC,updated_at DESC LIMIT ?2"))?;
-            let rows = stmt.query_map(
-                params![
-                    sql_pattern,
-                    i64::try_from(sql_limit).unwrap_or(i64::MAX),
-                    fts_query
-                ],
-                |row| {
-                    let resource = map_resource(row)?;
-                    let field: String = row.get(27)?;
-                    let snapshot: String = row.get(28)?;
-                    Ok((resource, field, snapshot))
-                },
-            )?;
-            for row in rows {
-                let (r, mut field, snapshot) = row?;
-                let haystack = format!(
-                    "{} {} {} {} {} {} {} {}",
-                    r.title.as_deref().unwrap_or(""),
-                    r.url,
-                    r.purpose_zh.as_deref().unwrap_or(""),
-                    r.use_when_zh.as_deref().unwrap_or(""),
-                    r.capabilities.join(" "),
-                    r.limitations.join(" "),
-                    r.languages.join(" "),
-                    snapshot
-                );
-                if !fallback_terms.is_empty()
-                    && !fallback_terms
-                        .iter()
-                        .all(|term| haystack.to_lowercase().contains(term))
-                {
-                    continue;
-                }
-                if !fallback_terms.is_empty() {
-                    field = "multi_field".into();
-                }
-                results.push(self.to_json(
-                    &r,
-                    &field,
-                    evidence_snippet(&haystack, query),
-                    1.0 + r.manual_rating.unwrap_or(0) as f64 * 0.05,
-                )?);
-            }
-        }
-        if include_articles {
-            let scope = if all_articles {
-                "a.archived=0 AND ?3 IS NOT NULL"
-            } else {
-                "a.archived=0 AND (a.starred=1 OR f.url=?3)"
-            };
-            let sql = format!(
-                "SELECT a.id,a.url,a.title,a.content,a.starred,a.fetched_at,f.url FROM articles a JOIN feeds f ON f.id=a.feed_id WHERE {scope} AND lower(COALESCE(a.title,'')||char(10)||COALESCE(a.content,'')||char(10)||COALESCE(a.url,'')) LIKE ?1 ESCAPE '\\' ORDER BY COALESCE(a.published,a.fetched_at) DESC LIMIT ?2"
-            );
-            let mut stmt = self.db.conn.prepare(&sql)?;
-            let rows = stmt.query_map(
-                params![
-                    pattern,
-                    i64::try_from(limit).unwrap_or(i64::MAX),
-                    crate::db::WEB_CLIPPINGS_FEED_URL
-                ],
-                |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, Option<String>>(1)?,
-                        r.get::<_, Option<String>>(2)?,
-                        r.get::<_, Option<String>>(3)?,
-                        r.get::<_, bool>(4)?,
-                        r.get::<_, i64>(5)?,
-                        r.get::<_, String>(6)?,
-                    ))
-                },
-            )?;
-            for row in rows {
-                let (id, url, title, content, starred, updated, feed) = row?;
-                results.push(json!({"id":id.to_string(),"result_type":"article","url":url,"title":title,"kind":if feed==crate::db::WEB_CLIPPINGS_FEED_URL{"web_clipping"}else{"article"},"categories":[],"tags":[],"purpose_zh":null,"use_when_zh":null,"capabilities":[],"limitations":[],"pricing":null,"requires_login":null,"private_note":null,"matched_fields":["article_text"],"evidence_snippets":[{"source_type":"article","article_id":id.to_string(),"snapshot_id":null,"text":evidence_snippet(content.as_deref().unwrap_or(""),query)}],"updated_at":rfc3339(updated),"last_checked_at":null,"status":"active","score":1.0,"score_factors":[if starred{"starred"}else{"web_clipping"}]}));
-            }
-        }
-        results.truncate(limit);
-        Ok(results)
     }
 
     pub fn to_json(
@@ -747,10 +593,6 @@ impl<'a> ResourceStore<'a> {
     }
 }
 
-pub(super) fn refresh_search_index_on(conn: &rusqlite::Connection, id: i64) -> Result<()> {
-    ResourceStore::refresh_search_index_on(conn, id)
-}
-
 pub(crate) fn resource_json(
     r: &Resource,
     field: &str,
@@ -766,26 +608,6 @@ fn rfc3339(ts: i64) -> String {
         .unwrap_or(chrono::DateTime::UNIX_EPOCH)
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
-fn evidence_snippet(text: &str, query: &str) -> String {
-    let clean = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let lower = clean.to_lowercase();
-    let q = query.to_lowercase();
-    if let Some(byte) = lower.find(&q) {
-        let start = clean[..byte]
-            .char_indices()
-            .rev()
-            .nth(40)
-            .map_or(0, |(i, _)| i);
-        let end = clean[byte..]
-            .char_indices()
-            .nth(q.chars().count() + 80)
-            .map_or(clean.len(), |(i, _)| byte + i);
-        clean[start..end].to_string()
-    } else {
-        clean.chars().take(160).collect()
-    }
-}
-
 pub(super) const RESOURCE_COLS: &str = "id,url,canonical_url,parent_resource_id,linked_article_id,kind,title,purpose_zh,use_when_zh,capabilities,limitations,pricing,requires_login,languages,private_note,privacy,source,manual_rating,latest_snapshot_id,last_checked_at,created_at,updated_at,curation_state,health,categories_source,tags_source,source_failure_count";
 pub(super) fn map_resource(r: &Row) -> rusqlite::Result<Resource> {
     fn conv(e: anyhow::Error) -> rusqlite::Error {
@@ -874,7 +696,7 @@ fn validate_phrases(v: &[String]) -> Result<()> {
     }
     Ok(())
 }
-pub(super) fn canonicalize_url(raw: &str) -> Result<String> {
+pub(crate) fn canonicalize_url(raw: &str) -> Result<String> {
     let mut u = Url::parse(raw.trim()).context("invalid resource URL")?;
     if !matches!(u.scheme(), "http" | "https") {
         bail!("resource URL must use HTTP(S)")
@@ -902,16 +724,19 @@ fn snapshot_hash(i: &SnapshotInput) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::library_search::{
+        LibrarySearch, PrimaryIdentity, ResultType, ScoreFactor, SearchOrigin, SearchRequest,
+        SearchScope,
+    };
     use rusqlite::Connection;
     fn service_db() -> Db {
         let conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-        conn.execute_batch(crate::db::SCHEMA).unwrap();
+        crate::schema_evolution::evolve(&conn).unwrap();
         Db {
             conn,
             path: None,
-            _writer_gate: None,
-            _lifetime_permit: None,
+            _maintenance_fence: None,
         }
     }
     fn input(url: &str, source: ResourceSource) -> NewResource {
@@ -1027,11 +852,12 @@ mod tests {
         conn.execute_batch(
             "CREATE TABLE feeds(id INTEGER PRIMARY KEY,url TEXT NOT NULL UNIQUE,title TEXT,interval_secs INTEGER,last_fetch INTEGER,next_fetch INTEGER NOT NULL DEFAULT 0,last_error TEXT,fail_count INTEGER NOT NULL DEFAULT 0,disabled INTEGER NOT NULL DEFAULT 0);
              CREATE TABLE articles(id INTEGER PRIMARY KEY,feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE CASCADE,entry_id TEXT NOT NULL,url TEXT,title TEXT,author TEXT,published INTEGER,content TEXT,is_read INTEGER NOT NULL DEFAULT 0,starred INTEGER NOT NULL DEFAULT 0,read_later INTEGER NOT NULL DEFAULT 0,archived INTEGER NOT NULL DEFAULT 0,fetched_at INTEGER NOT NULL,UNIQUE(feed_id,entry_id));
+             CREATE TABLE article_selections(id INTEGER PRIMARY KEY,article_id INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,selected_text TEXT NOT NULL,start_offset INTEGER,end_offset INTEGER,comment TEXT,is_favorite INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
              INSERT INTO feeds(id,url) VALUES(1,'https://legacy.test/feed');
              INSERT INTO articles(id,feed_id,entry_id,title,fetched_at) VALUES(1,1,'entry','legacy',1);",
         ).unwrap();
-        conn.execute_batch(crate::db::SCHEMA).unwrap();
-        conn.execute_batch(crate::db::SCHEMA).unwrap();
+        crate::schema_evolution::evolve(&conn).unwrap();
+        crate::schema_evolution::evolve(&conn).unwrap();
         let legacy: String = conn
             .query_row("SELECT title FROM articles WHERE id=1", [], |r| r.get(0))
             .unwrap();
@@ -1176,17 +1002,37 @@ mod tests {
         service
             .transition(first.id, ResourceStatus::Active, 3)
             .unwrap();
-        let results = service.search_json("SVG", true, false, false, 5).unwrap();
+        let results = LibrarySearch::new(&db)
+            .search(SearchRequest {
+                query: "SVG".into(),
+                scope: SearchScope::Curated,
+                result_type: ResultType::Resource,
+                origin: SearchOrigin::Agent,
+                limit: 5,
+            })
+            .unwrap()
+            .results;
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0]["id"], first.id.to_string());
-        assert_ne!(results[0]["id"], pending.id.to_string());
-        assert_eq!(results[0]["score_factors"][1], "manual_rating_boost");
-        assert_eq!(results[0]["categories"][0], "tool");
-        assert_eq!(results[0]["tags"][0]["name"], "图标");
+        assert_eq!(results[0].primary, PrimaryIdentity::Resource(first.id));
+        assert_ne!(results[0].primary, PrimaryIdentity::Resource(pending.id));
+        assert!(results[0].factors.contains(&ScoreFactor::ManualRating));
         assert!(
-            service
-                .search_json("not-present", true, false, false, 5)
+            results[0]
+                .evidence
+                .iter()
+                .any(|evidence| evidence.text.contains("SVG"))
+        );
+        assert!(
+            LibrarySearch::new(&db)
+                .search(SearchRequest {
+                    query: "not-present".into(),
+                    scope: SearchScope::Curated,
+                    result_type: ResultType::Resource,
+                    origin: SearchOrigin::Agent,
+                    limit: 5,
+                })
                 .unwrap()
+                .results
                 .is_empty()
         );
     }
@@ -1197,11 +1043,30 @@ mod tests {
         let normal = db.add_feed("https://example.com/feed", 0).unwrap();
         let clipping = db.ensure_web_clippings_feed(0).unwrap();
         db.conn.execute("INSERT INTO articles(feed_id,entry_id,title,content,starred,fetched_at) VALUES(?1,'plain','Rust plain','Rust GUI',0,1),(?1,'star','Rust starred','Rust GUI',1,2),(?2,'clip','Rust clipping','Rust GUI',0,3)", params![normal,clipping]).unwrap();
-        let service = ResourceStore::new(&db);
-        let curated = service.search_json("Rust", false, true, false, 10).unwrap();
-        let all = service.search_json("Rust", false, true, true, 10).unwrap();
-        assert_eq!(curated.len(), 2);
-        assert_eq!(all.len(), 3);
+        let search = LibrarySearch::new(&db);
+        let request = |scope| SearchRequest {
+            query: "Rust".into(),
+            scope,
+            result_type: ResultType::Article,
+            origin: SearchOrigin::Agent,
+            limit: 10,
+        };
+        assert_eq!(
+            search
+                .search(request(SearchScope::Curated))
+                .unwrap()
+                .results
+                .len(),
+            2
+        );
+        assert_eq!(
+            search
+                .search(request(SearchScope::AllArticles))
+                .unwrap()
+                .results
+                .len(),
+            3
+        );
     }
 
     #[test]
@@ -1308,13 +1173,15 @@ mod tests {
     }
 
     #[test]
-    fn real_resource_regression_queries_have_an_accepted_top_five_result() {
+    fn mixed_library_regression_has_perfect_recall_at_five() {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../tests/fixtures/resource-regression.json"
+            "../../tests/fixtures/library-search-regression.json"
         ))
         .unwrap();
-        assert_eq!(fixture["resources"].as_array().unwrap().len(), 20);
-        assert_eq!(fixture["queries"].as_array().unwrap().len(), 10);
+        let resource_count = fixture["resources"].as_array().unwrap().len();
+        let article_count = fixture["articles"].as_array().unwrap().len();
+        assert!(resource_count + article_count >= 40);
+        assert!(fixture["queries"].as_array().unwrap().len() >= 25);
         let db = service_db();
         let service = ResourceStore::new(&db);
         for (index, row) in fixture["resources"].as_array().unwrap().iter().enumerate() {
@@ -1343,19 +1210,59 @@ mod tests {
                 .transition(resource.id, ResourceStatus::Active, index as i64 + 1)
                 .unwrap();
         }
+        let feed_id = db.add_feed("https://articles.test/feed", 1).unwrap();
+        for (index, row) in fixture["articles"].as_array().unwrap().iter().enumerate() {
+            db.conn
+                .execute(
+                    "INSERT INTO articles(feed_id,entry_id,url,title,content,starred,fetched_at)
+                     VALUES(?1,?2,?3,?4,?5,1,?6)",
+                    params![
+                        feed_id,
+                        row[0].as_str().unwrap(),
+                        row[1].as_str().unwrap(),
+                        row[2].as_str().unwrap(),
+                        row[3].as_str().unwrap(),
+                        i64::try_from(resource_count + index + 1).unwrap()
+                    ],
+                )
+                .unwrap();
+        }
+        let mut reciprocal_rank = 0.0;
+        let mut recalled = 0usize;
         for row in fixture["queries"].as_array().unwrap() {
             let query = row[0].as_str().unwrap();
-            let expected = row[1].as_str().unwrap();
-            let results = service.search_json(query, true, false, false, 5).unwrap();
+            let expected_type = row[1].as_str().unwrap();
+            let expected = row[2].as_str().unwrap();
+            let results = LibrarySearch::new(&db)
+                .search(SearchRequest {
+                    query: query.into(),
+                    scope: SearchScope::Curated,
+                    result_type: if expected_type == "resource" {
+                        ResultType::Resource
+                    } else {
+                        ResultType::Article
+                    },
+                    origin: SearchOrigin::Agent,
+                    limit: 5,
+                })
+                .unwrap()
+                .results;
             let rank = results
                 .iter()
-                .position(|item| item["url"] == expected)
+                .position(|item| item.url.as_deref() == Some(expected))
                 .map(|index| index + 1);
             println!("query={query:?} accepted={expected:?} rank={rank:?}");
+            if let Some(rank) = rank {
+                recalled += 1;
+                reciprocal_rank += 1.0 / rank as f64;
+            }
             assert!(
                 rank.is_some(),
                 "query {query:?} missed {expected:?}: {results:?}"
             );
         }
+        let query_count = fixture["queries"].as_array().unwrap().len();
+        assert_eq!(recalled, query_count, "Recall@5 must remain 100%");
+        println!("MRR={:.3}", reciprocal_rank / query_count as f64);
     }
 }

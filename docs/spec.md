@@ -29,11 +29,13 @@ Product scope: personal, local-first, Windows desktop
 - Cargo package 是 `rrss`，桌面二进制是 `shiyue`，CLI 二进制是 `shiyue-cli`。
 - SQLite schema 当前由 `src/db.rs` 中幂等 `CREATE TABLE IF NOT EXISTS` 语句维护。
 - 网页收藏当前作为 `shiyue://web-clippings` 隐藏 Feed 下的 Article 保存。
-- `library_fts` 是 SQLite FTS5 trigram 表，现有 kind `0..3` 表示 Article、WebClipping、Excerpt、Thought。
+- 网页收藏的 URL/HTML 识别、安全抓取、正文准备、来源信息、保存和永久删除统一经过 [ADR-0009](adr/0009-centralize-web-clipping-lifecycle.md) 的 Web Clipping Lifecycle；GUI 只提交输入、观察 Capture Lease 并采用权威投影。
+- `library_search_fts` 是 schema v5 的统一 SQLite FTS5 trigram 派生索引，覆盖 Resource、Article、Excerpt 与 Thought；Web Clipping 作为 Article 的可搜索形态进入同一主身份。
 - `web_clip.rs` 已实施 HTTP(S) 限制、SSRF/内网阻断、重定向检查和响应体上限；Resource 抓取复用同一安全路径。
 - `text.rs` 已提供标题与正文抽取；Resource 不另写第二套 HTML 清洗器。
 - `lib.rs` 中模块当前均为私有；CLI 与 GUI 应调用同一内部 service，而不是各复制一套流程。
 - Article 的收藏、稍后读、归档、已读、标签和批量操作统一经过 Article Library Lifecycle；GUI 采用其权威投影，不直接拼接 `Db` 写操作或自行修补计数（ADR-0006）。
+- 摘录与想法的创建、编辑、删除、计数和搜索可见性统一经过 [ADR-0010](adr/0010-centralize-excerpt-thought-lifecycle.md) 的 Excerpt & Thought Lifecycle；GUI 只提交完整意图并采用权威投影。
 
 规格中的命令使用实际二进制名 `shiyue-cli`。重命名可执行文件不属于本功能。
 
@@ -441,3 +443,33 @@ shiyue-cli resource add <url> [--note <text>] [--private] --json
 Resource 的创建、完整人工编辑、整理状态转换、永久删除、网页收藏导入和集合投影统一经过 [ADR-0007](adr/0007-centralize-resource-library-lifecycle.md) 的 Resource Library Lifecycle。GUI 和 CLI 不得直接组合低层 Resource 写入与 Knowledge Processing 请求。
 
 整理状态（待确认、可用、已归档）与来源健康（未知、健康、失效）必须保持正交；“失效”是与未归档集合重叠的运维视图。人工编辑以完整替换事务写入，并标记人工 provenance。后台补全只能在资源事务提交后交接；失败时保留已提交资料并提供可重试技术详情。schema v4 的迁移与生命周期回归测试是该边界的验收证据。
+
+## 18. Library Search 架构约束
+
+跨 Active Resources、Article Bookmarks、Web Clippings、Excerpts 与 Thoughts 的查询统一经过 [ADR-0008](adr/0008-centralize-library-search-and-ranking.md) 的 Library Search。GUI、CLI 和 agent adapter 只能提交 typed request 并采用 typed result，不能自行决定 corpus、排序、去重、证据或历史记录。
+
+默认 Curated scope 不包含完整 RSS 和归档主资料；All Articles 与 Archive 必须显式选择。关联 Resource 与 Article 只占一个排名位置，Resource 优先；Search Evidence 有界且不暴露原始数值分数。Private Resource 允许本机人的查询，但 agent adapter 必须拒绝。
+
+schema v5 以单一 `library_search_fts` 替换旧双索引。索引只能由迁移、维护和源资料事务内 trigger 更新，普通查询不得静默修复。GUI 搜索必须在后台 adapter 执行，并以 request identity 丢弃迟到结果；CLI 搜索输出 schema version 2。
+
+验收使用 40 个公开主身份与 25 条查询的混合回归集，Recall@5 必须为 100%。1,000 Resources、10,000 Articles、2,000 notes 的本地基准中，每次查询必须低于两秒，P50/P95 只记录趋势。
+
+## 19. Excerpt & Thought Lifecycle 架构约束
+
+Excerpt 由 Article 与精确 Stable Excerpt Anchor 标识；同一 managed identity 重复捕获必须复用，等文本不同锚点必须保持独立。Thought 是 Excerpt 上单一可选当前笔记：写入新选区会同时保留 Excerpt，替换和删除 Thought 不改变 Excerpt，删除 Excerpt 则级联 Thought。
+
+单 Article 与完整资料库均采用 [ADR-0010](adr/0010-centralize-excerpt-thought-lifecycle.md) 的权威 Projection。主计数只计算 Excerpts，Thought 数为补充。归档、取消文章收藏、稍后读和已读变化不移除 Excerpt；永久删除 Article 才级联。Resolved 与 Unresolved 均保留并参与 Library Search。
+
+schema v7 为 managed Excerpt 增加稳定 identity 和部分唯一索引。迁移不得合并旧精确锚点重复记录；最新记录成为 managed representative，其余标记为 Legacy。旧 Thought-only 行必须提升为 retained Excerpt。源资料、FTS 可见性、计数和返回 Projection 必须在同一短 SQLite 事务中完成；no-op 不更新时间或排序。GUI 不得调用旧 selection 写 helper，本阶段不新增 CLI 命令。
+
+## 20. Article Document Presentation Pipeline 架构约束
+
+Article 正文准备、排版、选择映射、图片与公式异步状态统一经过 [ADR-0012](adr/0012-centralize-article-document-presentation.md) 的 Article Document Presentation Pipeline。其外部 Interface 直接接收 egui `Ui` 和不可变 Article 展示输入并返回 typed outcome；GUI 不得直接调用 `content_blocks`、匹配正文语义枚举、持有媒体缓存或从 galley 坐标推断持久选择。
+
+`PreparedDocument` 与解析语法不进入 GUI Interface。缓存身份是对标题、正文 HTML、有效 base URL 进行长度分隔后计算的 SHA-256 content fingerprint；Article identity 单独保留在请求与选择身份中。theme、viewport、scroll 和媒体进度不得触发重新解析。固定 fingerprint 下的可选文本采用 Unicode scalar character offset，图片或公式完成、窗口宽度变化和重新排版不得改变相同范围提取出的正文。
+
+图片获取通过私有 `ImageFetch` Adapter 隔离真实网络，帧内不得阻塞；异步事件只更新内容身份对应的模块内缓存，选择拖动同时绑定 Article identity 与 content fingerprint，旧修订状态不得污染新文档。Pipeline 返回打开链接、选中文本、选择开始及锚点恢复结果；媒体重试是模块内部交互。它不写数据库、不持久化 Excerpt、不修改 Article 生命周期状态，也不拥有 Route、Modal 或系统浏览器副作用。验收以真实 HTML fixture、确定性 fake、不同 viewport 的 egui frame 和异步完成前后选择一致性为主。
+
+## 21. Desktop Runtime & Settings 架构约束
+
+桌面启动、路径和日志初始化、版本化设置、原子 TOML 持久化、字体/样式、托盘、窗口显隐/退出状态与系统通知统一经过 [ADR-0013](adr/0013-centralize-desktop-runtime-and-settings.md) 的 Desktop Runtime & Settings Module。GUI 不得持有配置文件路径、托盘菜单 ID、独立 `hidden/quitting/focused` 标志或直接调用 `notify-rust`；它只读取 `DesktopSession` 快照、提交 typed `SettingsChange` 并采用 `DesktopIntent`。CLI 只读取相同的验证后命令环境，不启动桌面 Session。API Key 不进入该设置模型。

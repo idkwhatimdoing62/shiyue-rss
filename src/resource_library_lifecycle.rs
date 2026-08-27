@@ -15,17 +15,20 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::db::{Db, WEB_CLIPPINGS_FEED_URL};
 use crate::knowledge_workflow::resource_target;
+use crate::library_projection_revision::{
+    self, ProjectionFamily, ProjectionImpact, ProjectionStamp,
+};
 
 pub(crate) use store::{
     Category, ImportCandidate, Pricing, Resource, ResourceCurationState, ResourceHealth,
     ResourceKind, ResourcePrivacy, ResourceSource, ResourceTag, SnapshotInput, TagLanguage,
-    TagSource,
+    TagSource, canonicalize_url,
 };
 
 const DEFAULT_PAGE_SIZE: usize = 100;
 const MAX_PAGE_SIZE: usize = 200;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ResourceCollection {
     Active,
     PendingReview,
@@ -33,13 +36,13 @@ pub(crate) enum ResourceCollection {
     Broken,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ResourceCursor {
     pub(crate) updated_at: i64,
     pub(crate) id: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ProjectionScope {
     Collection {
         collection: ResourceCollection,
@@ -54,6 +57,14 @@ impl ProjectionScope {
         Self::Collection {
             collection,
             after: None,
+            limit: DEFAULT_PAGE_SIZE,
+        }
+    }
+
+    pub(crate) fn collection_after(collection: ResourceCollection, after: ResourceCursor) -> Self {
+        Self::Collection {
+            collection,
+            after: Some(after),
             limit: DEFAULT_PAGE_SIZE,
         }
     }
@@ -77,6 +88,7 @@ pub(crate) struct ResourceDetail {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub(crate) struct ResourceLibraryProjection {
+    pub(crate) stamp: ProjectionStamp,
     pub(crate) scope: ProjectionScope,
     pub(crate) resources: Vec<Resource>,
     pub(crate) detail: Option<ResourceDetail>,
@@ -275,7 +287,18 @@ impl<'db, 'adapter> ResourceLibraryLifecycle<'db, 'adapter> {
         &self,
         scope: ProjectionScope,
     ) -> Result<ResourceLibraryProjection, LifecycleFailure> {
-        build_projection(&self.db.conn, scope).map_err(LifecycleFailure::projection)
+        let revision =
+            library_projection_revision::read_family(&self.db.conn, ProjectionFamily::Resource)
+                .map_err(LifecycleFailure::projection)?;
+        build_projection(
+            &self.db.conn,
+            scope,
+            ProjectionStamp {
+                generation: self.db.library_generation(),
+                revision,
+            },
+        )
+        .map_err(LifecycleFailure::projection)
     }
 
     pub(crate) fn preview_web_clipping_import(
@@ -310,21 +333,34 @@ impl<'db, 'adapter> ResourceLibraryLifecycle<'db, 'adapter> {
         refresh_scope: ProjectionScope,
     ) -> Result<ApplyOutcome, LifecycleFailure> {
         validate_change(&change)?;
-        let permit = self.db.write_permit().map_err(LifecycleFailure::storage)?;
         let now = self.clock.now();
         let tx = self
             .db
-            .conn
-            .unchecked_transaction()
+            .fenced_transaction()
             .map_err(LifecycleFailure::storage)?;
         let mut processing_ids = Vec::new();
         let (disposition, affected_resource_ids) =
             apply_change(&tx, change, now, &mut processing_ids)?;
-        let projection =
-            build_projection(&tx, refresh_scope).map_err(LifecycleFailure::projection)?;
-        if let Some(permit) = permit.as_ref() {
-            permit.validate().map_err(LifecycleFailure::storage)?;
-        }
+        let impact = if matches!(
+            disposition,
+            ChangeDisposition::Created | ChangeDisposition::Changed | ChangeDisposition::Deleted
+        ) {
+            ProjectionImpact::resource()
+        } else {
+            ProjectionImpact::none()
+        };
+        let revision = library_projection_revision::record(&tx, impact)
+            .map_err(LifecycleFailure::storage)?
+            .resource;
+        let projection = build_projection(
+            &tx,
+            refresh_scope,
+            ProjectionStamp {
+                generation: self.db.library_generation(),
+                revision,
+            },
+        )
+        .map_err(LifecycleFailure::projection)?;
         tx.commit().map_err(LifecycleFailure::storage)?;
 
         let requested = processing_ids.iter().copied().collect::<HashSet<_>>();
@@ -481,7 +517,6 @@ fn apply_change(
             )
             .map_err(LifecycleFailure::storage)?;
             let id = conn.last_insert_rowid();
-            store::refresh_search_index_on(conn, id).map_err(LifecycleFailure::storage)?;
             if input.source != ResourceSource::CliAgent {
                 processing_ids.push(id);
             }
@@ -500,6 +535,20 @@ fn apply_change(
             let purpose = normalize_optional(edit.purpose_zh);
             let use_when = normalize_optional(edit.use_when_zh);
             let private_note = normalize_optional(edit.private_note);
+            if manual_edit_is_noop(
+                conn,
+                &current,
+                title.as_deref(),
+                purpose.as_deref(),
+                use_when.as_deref(),
+                private_note.as_deref(),
+                edit.privacy,
+                edit.manual_rating,
+                &edit.categories,
+                &edit.tags,
+            )? {
+                return Ok((ChangeDisposition::Unchanged, vec![edit.resource_id]));
+            }
             conn.execute(
                 "UPDATE resources SET title=?2,purpose_zh=?3,purpose_source='manual',
                    use_when_zh=?4,use_when_source='manual',private_note=?5,privacy=?6,
@@ -547,8 +596,6 @@ fn apply_change(
                 )
                 .map_err(LifecycleFailure::storage)?;
             }
-            store::refresh_search_index_on(conn, edit.resource_id)
-                .map_err(LifecycleFailure::storage)?;
             Ok((ChangeDisposition::Changed, vec![edit.resource_id]))
         }
         ResourceLifecycleChange::SetCurationState {
@@ -621,8 +668,6 @@ fn apply_change(
                     LifecycleFailure::storage(error)
                 }
             })?;
-            conn.execute("DELETE FROM resource_fts WHERE source_id=?1", [resource_id])
-                .map_err(LifecycleFailure::storage)?;
             conn.execute("DELETE FROM resources WHERE id=?1", [resource_id])
                 .map_err(LifecycleFailure::storage)?;
             Ok((ChangeDisposition::Deleted, vec![resource_id]))
@@ -670,7 +715,6 @@ fn apply_change(
                 )
                 .map_err(LifecycleFailure::storage)?;
                 let id = conn.last_insert_rowid();
-                store::refresh_search_index_on(conn, id).map_err(LifecycleFailure::storage)?;
                 ids.push(id);
                 processing_ids.push(id);
                 created = true;
@@ -701,6 +745,7 @@ fn get_resource(conn: &Connection, id: i64) -> Result<Resource, LifecycleFailure
 fn build_projection(
     conn: &Connection,
     scope: ProjectionScope,
+    stamp: ProjectionStamp,
 ) -> Result<ResourceLibraryProjection, anyhow::Error> {
     let counts = conn.query_row(
         "SELECT
@@ -724,6 +769,7 @@ fn build_projection(
             let resource = get_resource(conn, id).map_err(anyhow::Error::new)?;
             let detail = load_detail(conn, resource.clone())?;
             Ok(ResourceLibraryProjection {
+                stamp,
                 scope,
                 resources: vec![resource],
                 detail: Some(detail),
@@ -769,6 +815,7 @@ fn build_projection(
                 }
             });
             Ok(ResourceLibraryProjection {
+                stamp,
                 scope,
                 resources,
                 detail: None,
@@ -777,6 +824,65 @@ fn build_projection(
             })
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn manual_edit_is_noop(
+    conn: &Connection,
+    current: &Resource,
+    title: Option<&str>,
+    purpose: Option<&str>,
+    use_when: Option<&str>,
+    private_note: Option<&str>,
+    privacy: ResourcePrivacy,
+    manual_rating: Option<i64>,
+    categories: &[Category],
+    tags: &[ResourceTag],
+) -> Result<bool, LifecycleFailure> {
+    let (purpose_source, use_when_source): (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT purpose_source,use_when_source FROM resources WHERE id=?1",
+            [current.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(LifecycleFailure::storage)?;
+    if current.title.as_deref() != title
+        || current.purpose_zh.as_deref() != purpose
+        || current.use_when_zh.as_deref() != use_when
+        || current.private_note.as_deref() != private_note
+        || current.privacy != privacy
+        || current.manual_rating != manual_rating
+        || purpose_source.as_deref() != Some("manual")
+        || use_when_source.as_deref() != Some("manual")
+        || current.categories_source != store::ClassificationSource::Manual
+        || current.tags_source != store::ClassificationSource::Manual
+    {
+        return Ok(false);
+    }
+
+    let detail = load_detail(conn, current.clone()).map_err(LifecycleFailure::storage)?;
+    let mut desired_categories = categories.to_vec();
+    desired_categories.sort_by_key(|category| category.as_str());
+    desired_categories.dedup();
+    if detail.categories != desired_categories {
+        return Ok(false);
+    }
+
+    let mut desired_tags = tags
+        .iter()
+        .map(|tag| ResourceTag {
+            name: tag.name.trim().to_owned(),
+            language: tag.language,
+            source: TagSource::Manual,
+        })
+        .collect::<Vec<_>>();
+    desired_tags.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.language.as_str().cmp(right.language.as_str()))
+    });
+    Ok(detail.tags == desired_tags)
 }
 
 fn load_detail(conn: &Connection, resource: Resource) -> anyhow::Result<ResourceDetail> {
@@ -820,23 +926,6 @@ fn load_detail(conn: &Connection, resource: Resource) -> anyhow::Result<Resource
     })
 }
 
-pub(crate) fn legacy_search_json(
-    db: &Db,
-    query: &str,
-    include_resources: bool,
-    include_articles: bool,
-    all_articles: bool,
-    limit: usize,
-) -> anyhow::Result<Vec<serde_json::Value>> {
-    store::ResourceStore::new(db).search_json(
-        query,
-        include_resources,
-        include_articles,
-        all_articles,
-        limit,
-    )
-}
-
 pub(crate) fn resource_json(
     db: &Db,
     resource: &Resource,
@@ -856,10 +945,6 @@ pub(crate) fn build_processing_input(
     id: i64,
 ) -> anyhow::Result<Option<crate::resource_enrichment::EnrichmentInput>> {
     store::ResourceStore::new(db).enrichment_input(id)
-}
-
-pub(crate) fn refresh_processing_search_index(conn: &Connection, id: i64) -> anyhow::Result<()> {
-    store::refresh_search_index_on(conn, id)
 }
 
 pub(crate) fn apply_processing_enrichment(
@@ -903,12 +988,11 @@ mod lifecycle_tests {
     fn test_db() -> Db {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-        conn.execute_batch(crate::db::SCHEMA).unwrap();
+        crate::schema_evolution::evolve(&conn).unwrap();
         Db {
             conn,
             path: None,
-            _writer_gate: None,
-            _lifetime_permit: None,
+            _maintenance_fence: None,
         }
     }
 
@@ -1055,6 +1139,65 @@ mod lifecycle_tests {
                 "manual".into(),
                 "manual".into()
             )
+        );
+    }
+
+    #[test]
+    fn identical_manual_edit_is_a_true_no_op_and_does_not_bump_revision() {
+        let db = test_db();
+        let handoff = RecordingHandoff::default();
+        let created = lifecycle(&db, &handoff, &FixedClock(100))
+            .apply(
+                ResourceLifecycleChange::Create(CreateResource {
+                    url: "https://example.com/no-op".into(),
+                    parent_resource_id: None,
+                    linked_article_id: None,
+                    kind: ResourceKind::Site,
+                    title: None,
+                    private_note: None,
+                    privacy: ResourcePrivacy::Public,
+                    source: ResourceSource::Gui,
+                    manual_rating: None,
+                }),
+                ProjectionScope::collection(ResourceCollection::Active),
+            )
+            .unwrap();
+        let id = created.affected_resource_ids[0];
+        let edit = CompleteManualEdit {
+            resource_id: id,
+            title: Some("No-op".into()),
+            purpose_zh: Some("验证幂等写入".into()),
+            use_when_zh: Some("回归测试".into()),
+            private_note: None,
+            privacy: ResourcePrivacy::Public,
+            manual_rating: Some(4),
+            categories: vec![Category::Tool],
+            tags: vec![ResourceTag {
+                name: "Rust".into(),
+                language: TagLanguage::En,
+                source: TagSource::Ai,
+            }],
+        };
+        let changed = lifecycle(&db, &handoff, &FixedClock(200))
+            .apply(
+                ResourceLifecycleChange::CompleteManualEdit(edit.clone()),
+                ProjectionScope::Resource(id),
+            )
+            .unwrap();
+        assert_eq!(changed.disposition, ChangeDisposition::Changed);
+        let revision = changed.projection.stamp.revision;
+
+        let unchanged = lifecycle(&db, &handoff, &FixedClock(300))
+            .apply(
+                ResourceLifecycleChange::CompleteManualEdit(edit),
+                ProjectionScope::Resource(id),
+            )
+            .unwrap();
+        assert_eq!(unchanged.disposition, ChangeDisposition::Unchanged);
+        assert_eq!(unchanged.projection.stamp.revision, revision);
+        assert_eq!(
+            unchanged.projection.detail.unwrap().resource.updated_at,
+            200
         );
     }
 

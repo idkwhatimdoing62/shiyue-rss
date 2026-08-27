@@ -19,7 +19,7 @@ use tokio::task::JoinSet;
 
 use crate::config::Config;
 use crate::db::Db;
-use crate::local_data_maintenance::{MaintenanceParticipant, WriterGate};
+use crate::local_data_maintenance::{GenerationFence, MaintenanceFence, MaintenanceParticipant};
 use crate::model::{Feed, NewArticle};
 
 const MAX_CONCURRENT_FEEDS: usize = 8;
@@ -506,7 +506,10 @@ async fn worker_loop(
                     None => return,
                 },
                 _ = tokio::time::sleep(EXTERNAL_MAINTENANCE_POLL) => {
-                    if !WriterGate::maintenance_active(&db_path).unwrap_or(true) {
+                    if !MaintenanceFence::observe(&db_path)
+                        .map(|availability| availability.is_active())
+                        .unwrap_or(true)
+                    {
                         paused = false;
                         set_workflow_status(&state, RefreshWorkflowStatus::Idle);
                     }
@@ -637,7 +640,7 @@ async fn execute_run(
         return RunControl::Continue;
     }
 
-    let generation = match WriterGate::open(db_path) {
+    let generation = match MaintenanceFence::witness(db_path) {
         Ok(generation) => generation,
         Err(error) if is_maintenance_error(&error) => {
             interrupt_run(&mut run);
@@ -869,26 +872,29 @@ fn commit_result(
     db_path: &Path,
     cfg: &Config,
     now: i64,
-    generation: &WriterGate,
+    generation: &GenerationFence,
     feed: &Feed,
     result: std::result::Result<FetchPayload, RefreshFailure>,
 ) -> Result<CommitResult> {
-    let permit = generation.permit()?;
     let db = Db::open(db_path)?;
+    let tx = db.fenced_transaction_for(generation)?;
     if db.find_feed(feed.id)?.is_none() {
-        permit.validate()?;
+        tx.commit()?;
         return Ok(CommitResult::Removed);
     }
     let committed = match result {
-        Ok(payload) => match db.record_success(feed, now, cfg, payload.title, &payload.articles) {
-            Ok(new_articles) => CommitResult::Applied {
-                new_articles,
-                failure: None,
-            },
-            Err(_error) if db.find_feed(feed.id)?.is_none() => CommitResult::Removed,
-            Err(error) => return Err(error),
-        },
-        Err(failure) => match db.record_failure(feed, now, cfg, &failure.technical_detail) {
+        Ok(payload) => {
+            match Db::record_success_on(&tx, feed, now, cfg, payload.title, &payload.articles) {
+                Ok(new_articles) => CommitResult::Applied {
+                    new_articles,
+                    failure: None,
+                },
+                Err(_error) if db.find_feed(feed.id)?.is_none() => CommitResult::Removed,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(failure) => match Db::record_failure_on(&tx, feed, now, cfg, &failure.technical_detail)
+        {
             Ok(()) => CommitResult::Applied {
                 new_articles: 0,
                 failure: Some(failure),
@@ -897,7 +903,7 @@ fn commit_result(
             Err(error) => return Err(error),
         },
     };
-    permit.validate()?;
+    tx.commit()?;
     Ok(committed)
 }
 
@@ -971,8 +977,7 @@ fn classify_fetch_error(error: anyhow::Error) -> RefreshFailure {
 }
 
 fn is_maintenance_error(error: &anyhow::Error) -> bool {
-    let detail = format!("{error:#}");
-    detail.contains("MAINTENANCE_IN_PROGRESS") || detail.contains("STALE_LIBRARY_EPOCH")
+    MaintenanceFence::rejected(error)
 }
 
 fn sanitize_detail(detail: &str) -> String {

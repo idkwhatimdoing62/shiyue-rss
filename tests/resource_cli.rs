@@ -43,6 +43,19 @@ fn json_envelopes_keep_stdout_clean_and_use_documented_exit_codes() {
     let envelope: serde_json::Value = serde_json::from_slice(&pending.stdout).unwrap();
     assert_eq!(envelope["data"].as_array().unwrap().len(), 1);
 
+    let search = run(
+        &root,
+        &[
+            "resource", "search", "App icon", "--scope", "curated", "--json",
+        ],
+    );
+    assert_eq!(search.status.code(), Some(0));
+    let envelope: serde_json::Value = serde_json::from_slice(&search.stdout).unwrap();
+    assert_eq!(envelope["schema_version"], 2);
+    assert_eq!(envelope["ok"], true);
+    assert!(envelope["data"].is_array());
+    assert!(envelope["warnings"].is_array());
+
     let queued = run(&root, &["resource", "retry", "1", "--no-wait", "--json"]);
     assert_eq!(queued.status.code(), Some(0));
     let envelope: serde_json::Value = serde_json::from_slice(&queued.stdout).unwrap();

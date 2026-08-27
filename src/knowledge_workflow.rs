@@ -8,18 +8,21 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::article_document_presentation::prepare_article_html;
 use crate::config::ResourceEnrichmentConfig;
 use crate::db::Db;
+use crate::library_projection_revision::{self, ProjectionImpact};
 use crate::local_data_maintenance::MaintenanceParticipant;
 use crate::resource_enrichment::{
     CredentialSource, EnrichmentOutput, EnrichmentProvider, ProviderRequest,
 };
 use crate::resource_library_lifecycle::{ResourcePrivacy, SnapshotInput};
 
+pub(crate) mod article_target;
 mod failure;
 pub(crate) mod resource_target;
 mod types;
@@ -46,6 +49,9 @@ enum EngineCommand {
     },
     TestConnection {
         reply: std_mpsc::Sender<Result<(), String>>,
+    },
+    Observe {
+        key: TaskKey,
     },
     Quiesce {
         deadline: Instant,
@@ -83,7 +89,86 @@ pub(crate) struct KnowledgeEngine {
     db_path: PathBuf,
     command_tx: std_mpsc::Sender<EngineCommand>,
     notice_rx: std_mpsc::Receiver<KnowledgeNotice>,
+    projection_observer: KnowledgeProjectionObserver,
     join: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Workflow-owned, memory-only view of task snapshots for desktop projection.
+/// `None` from `snapshot` means the key has not been materialized yet; an
+/// inner `None` means it was materialized and has no durable task.
+#[derive(Default)]
+struct KnowledgeProjectionState {
+    residents: HashSet<TaskKey>,
+    snapshots: HashMap<TaskKey, Option<TaskSnapshot>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct KnowledgeProjectionObserver {
+    command_tx: std_mpsc::Sender<EngineCommand>,
+    state: Arc<RwLock<KnowledgeProjectionState>>,
+    changed_rx: Arc<Mutex<std_mpsc::Receiver<TaskKey>>>,
+}
+
+impl KnowledgeProjectionObserver {
+    pub(crate) fn observe(&self, key: TaskKey) {
+        let inserted = self
+            .state
+            .write()
+            .expect("knowledge projection state poisoned")
+            .residents
+            .insert(key);
+        if inserted {
+            let _ = self.command_tx.send(EngineCommand::Observe { key });
+        }
+    }
+
+    pub(crate) fn forget(&self, key: TaskKey) {
+        let mut state = self
+            .state
+            .write()
+            .expect("knowledge projection state poisoned");
+        state.residents.remove(&key);
+        state.snapshots.remove(&key);
+    }
+
+    pub(crate) fn snapshot(&self, key: TaskKey) -> Option<Option<TaskSnapshot>> {
+        self.state
+            .read()
+            .expect("knowledge projection state poisoned")
+            .snapshots
+            .get(&key)
+            .cloned()
+    }
+
+    pub(crate) fn try_changed(&self) -> impl Iterator<Item = TaskKey> + '_ {
+        std::iter::from_fn(|| {
+            self.changed_rx
+                .lock()
+                .expect("knowledge projection notice receiver poisoned")
+                .try_recv()
+                .ok()
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disconnected_for_test() -> Self {
+        let (command_tx, _command_rx) = std_mpsc::channel();
+        let (_changed_tx, changed_rx) = std_mpsc::channel();
+        Self {
+            command_tx,
+            state: Arc::new(RwLock::new(KnowledgeProjectionState::default())),
+            changed_rx: Arc::new(Mutex::new(changed_rx)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_resident(&self, key: TaskKey) -> bool {
+        self.state
+            .read()
+            .expect("knowledge projection state poisoned")
+            .residents
+            .contains(&key)
+    }
 }
 
 struct KnowledgeMaintenanceParticipant {
@@ -164,6 +249,17 @@ impl KnowledgeEngine {
         Db::open(&db_path).context("知识处理模块无法打开数据库")?;
         let (command_tx, command_rx) = std_mpsc::channel();
         let (notice_tx, notice_rx) = std_mpsc::channel();
+        let projection_state = Arc::new(RwLock::new(KnowledgeProjectionState::default()));
+        let (projection_notice_tx, projection_notice_rx) = std_mpsc::sync_channel(32);
+        let projection_observer = KnowledgeProjectionObserver {
+            command_tx: command_tx.clone(),
+            state: Arc::clone(&projection_state),
+            changed_rx: Arc::new(Mutex::new(projection_notice_rx)),
+        };
+        let projection_publication = ProjectionPublication {
+            state: projection_state,
+            notice_tx: projection_notice_tx,
+        };
         let thread_path = db_path.clone();
         let join = std::thread::Builder::new()
             .name("shiyue-knowledge-engine".into())
@@ -171,10 +267,9 @@ impl KnowledgeEngine {
                 let mut explicitly_quiesced = false;
                 loop {
                     let maintenance_active =
-                        match crate::local_data_maintenance::WriterGate::maintenance_active(
-                            &thread_path,
-                        ) {
-                            Ok(active) => active,
+                        match crate::local_data_maintenance::MaintenanceFence::observe(&thread_path)
+                        {
+                            Ok(availability) => availability.is_active(),
                             Err(error) => {
                                 let _ = notice_tx.send(KnowledgeNotice::ModuleFault {
                                     user_message: "无法读取资料维护状态".into(),
@@ -185,6 +280,7 @@ impl KnowledgeEngine {
                             }
                         };
                     if explicitly_quiesced || maintenance_active {
+                        projection_publication.clear_materialized();
                         match command_rx.recv_timeout(Duration::from_millis(100)) {
                             Ok(EngineCommand::Shutdown)
                             | Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
@@ -198,6 +294,7 @@ impl KnowledgeEngine {
                                     "MAINTENANCE_IN_PROGRESS: 资料维护期间不能测试连接".into(),
                                 ));
                             }
+                            Ok(EngineCommand::Observe { .. }) => {}
                             Ok(EngineCommand::Quiesce { reply, .. }) => {
                                 explicitly_quiesced = true;
                                 let _ = reply.send(Ok(()));
@@ -223,11 +320,26 @@ impl KnowledgeEngine {
                         policy,
                         &command_rx,
                         notice_tx.clone(),
+                        &projection_publication,
                     ) {
                         Ok(EngineExit::Maintenance { explicit }) => {
+                            projection_publication.clear_materialized();
                             explicitly_quiesced = explicit;
                         }
                         Ok(EngineExit::Shutdown) => break,
+                        Err(error)
+                            if crate::local_data_maintenance::MaintenanceFence::rejected(
+                                &error,
+                            ) =>
+                        {
+                            // The sidecar may become active between this
+                            // worker's observation and a fenced write. The
+                            // rejected write is the safe point: `db` is
+                            // dropped by `engine_loop`, and the outer host now
+                            // waits for the explicit participant handshake.
+                            projection_publication.clear_materialized();
+                            explicitly_quiesced = false;
+                        }
                         Err(error) => {
                             let _ = notice_tx.send(KnowledgeNotice::ModuleFault {
                                 user_message: "后台知识处理模块已停止".into(),
@@ -242,6 +354,7 @@ impl KnowledgeEngine {
             db_path,
             command_tx,
             notice_rx,
+            projection_observer,
             join: Some(join),
         })
     }
@@ -295,6 +408,10 @@ impl KnowledgeEngine {
         std::iter::from_fn(|| self.notice_rx.try_recv().ok())
     }
 
+    pub(crate) fn projection_observer(&self) -> KnowledgeProjectionObserver {
+        self.projection_observer.clone()
+    }
+
     pub(crate) fn maintenance_participant(&self) -> Arc<dyn MaintenanceParticipant> {
         Arc::new(KnowledgeMaintenanceParticipant {
             command_tx: self.command_tx.clone(),
@@ -336,7 +453,7 @@ impl<'a> WorkflowStore<'a> {
     }
 
     fn request(&self, key: TaskKey, now: i64) -> Result<RequestReceipt> {
-        let tx = self.db.conn.unchecked_transaction()?;
+        let tx = self.db.fenced_transaction()?;
         Self::validate_target_on(&tx, key)?;
         let latest: Option<(i64, String)> = tx
             .query_row(
@@ -454,7 +571,13 @@ impl<'a> WorkflowStore<'a> {
     }
 
     fn acquire_lease(&self, owner: &str, now: i64) -> Result<Option<i64>> {
-        let tx = self.db.conn.unchecked_transaction()?;
+        let tx = match self.db.fenced_transaction() {
+            Ok(tx) => tx,
+            Err(error) if crate::local_data_maintenance::MaintenanceFence::rejected(&error) => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
         let (current_owner, generation, heartbeat): (Option<String>, i64, i64) = tx.query_row(
             "SELECT owner_id,generation,heartbeat_at FROM knowledge_executor_lease WHERE singleton_id=1",
             [],
@@ -485,11 +608,17 @@ impl<'a> WorkflowStore<'a> {
     }
 
     fn heartbeat(&self, owner: &str, generation: i64, now: i64) -> Result<bool> {
-        Ok(self.db.conn.execute(
+        // Heartbeat does not claim work. Allowing it during the drain race
+        // preserves the generation so the next observation can release the
+        // lease at the participant safe point.
+        let tx = self.db.maintenance_drain_transaction()?;
+        let owned = tx.execute(
             "UPDATE knowledge_executor_lease SET heartbeat_at=?3
              WHERE singleton_id=1 AND owner_id=?1 AND generation=?2",
             params![owner, generation, now],
-        )? == 1)
+        )? == 1;
+        tx.commit()?;
+        Ok(owned)
     }
 
     fn owns_lease(&self, owner: &str, generation: i64) -> Result<bool> {
@@ -502,16 +631,17 @@ impl<'a> WorkflowStore<'a> {
     }
 
     fn release_lease(&self, owner: &str, generation: i64) -> Result<()> {
-        self.db.conn.execute(
+        let tx = self.db.maintenance_drain_transaction()?;
+        tx.execute(
             "UPDATE knowledge_executor_lease SET owner_id=NULL,heartbeat_at=0
              WHERE singleton_id=1 AND owner_id=?1 AND generation=?2",
             params![owner, generation],
         )?;
-        Ok(())
+        tx.commit()
     }
 
     fn interrupt_stale_running(&self, generation: i64, now: i64) -> Result<usize> {
-        let tx = self.db.conn.unchecked_transaction()?;
+        let tx = self.db.maintenance_drain_transaction()?;
         let mut stmt = tx.prepare(
             "SELECT DISTINCT t.id FROM knowledge_tasks t
              JOIN knowledge_task_attempts a ON a.task_id=t.id
@@ -548,7 +678,7 @@ impl<'a> WorkflowStore<'a> {
     }
 
     fn interrupt_generation(&self, owner: &str, generation: i64, now: i64) -> Result<()> {
-        let tx = self.db.conn.unchecked_transaction()?;
+        let tx = self.db.maintenance_drain_transaction()?;
         if !lease_owned_on(&tx, owner, generation)? {
             tx.commit()?;
             return Ok(());
@@ -587,7 +717,13 @@ impl<'a> WorkflowStore<'a> {
     }
 
     fn claim_next(&self, owner: &str, generation: i64, now: i64) -> Result<Option<ClaimedTask>> {
-        let tx = self.db.conn.unchecked_transaction()?;
+        let tx = match self.db.fenced_transaction() {
+            Ok(tx) => tx,
+            Err(error) if crate::local_data_maintenance::MaintenanceFence::rejected(&error) => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
         if !lease_owned_on(&tx, owner, generation)? {
             tx.commit()?;
             return Ok(None);
@@ -637,7 +773,7 @@ impl<'a> WorkflowStore<'a> {
     }
 
     fn advance(&self, owner: &str, task: &ClaimedTask, stage: TaskStage, now: i64) -> Result<bool> {
-        let tx = self.db.conn.unchecked_transaction()?;
+        let tx = self.db.fenced_transaction()?;
         if !fence_valid(&tx, owner, task.id, task.generation)? {
             tx.commit()?;
             return Ok(false);
@@ -663,7 +799,7 @@ impl<'a> WorkflowStore<'a> {
         input: &SnapshotInput,
         now: i64,
     ) -> Result<bool> {
-        let tx = self.db.conn.unchecked_transaction()?;
+        let tx = self.db.fenced_transaction()?;
         if !fence_valid(&tx, owner, task.id, task.generation)? {
             tx.commit()?;
             return Ok(false);
@@ -710,7 +846,7 @@ impl<'a> WorkflowStore<'a> {
         snapshot_id: Option<i64>,
         now: i64,
     ) -> Result<Option<i64>> {
-        let tx = self.db.conn.unchecked_transaction()?;
+        let tx = self.db.fenced_transaction()?;
         if !fence_valid(&tx, owner, task.id, task.generation)? {
             tx.commit()?;
             return Ok(None);
@@ -750,7 +886,7 @@ impl<'a> WorkflowStore<'a> {
         output: &EnrichmentOutput,
         now: i64,
     ) -> Result<bool> {
-        let tx = self.db.conn.unchecked_transaction()?;
+        let tx = self.db.fenced_transaction()?;
         if !fence_valid(&tx, owner, task.id, task.generation)? {
             tx.commit()?;
             return Ok(false);
@@ -772,7 +908,7 @@ impl<'a> WorkflowStore<'a> {
         task: &ClaimedTask,
         now: i64,
     ) -> Result<bool> {
-        let tx = self.db.conn.unchecked_transaction()?;
+        let tx = self.db.fenced_transaction()?;
         if !fence_valid(&tx, owner, task.id, task.generation)? {
             tx.commit()?;
             return Ok(false);
@@ -791,18 +927,41 @@ impl<'a> WorkflowStore<'a> {
         model: &str,
         now: i64,
     ) -> Result<bool> {
-        let tx = self.db.conn.unchecked_transaction()?;
+        let tx = self.db.fenced_transaction()?;
         if !fence_valid(&tx, owner, task.id, task.generation)? {
             tx.commit()?;
             return Ok(false);
         }
-        tx.execute(
-            "INSERT INTO article_ai(article_id,summary_zh,translation_zh,model,updated_at)
-             VALUES(?1,?2,?3,?4,?5)
-             ON CONFLICT(article_id) DO UPDATE SET summary_zh=excluded.summary_zh,
-             translation_zh=excluded.translation_zh,model=excluded.model,updated_at=excluded.updated_at",
-            params![task.key.target_id, summary, translation, model, now],
-        )?;
+        let existing = tx
+            .query_row(
+                "SELECT summary_zh,translation_zh,model FROM article_ai WHERE article_id=?1",
+                [task.key.target_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let article_changed = existing.as_ref().is_none_or(
+            |(current_summary, current_translation, current_model)| {
+                current_summary != summary
+                    || current_translation != translation
+                    || current_model != model
+            },
+        );
+        if article_changed {
+            tx.execute(
+                "INSERT INTO article_ai(article_id,summary_zh,translation_zh,model,updated_at)
+                 VALUES(?1,?2,?3,?4,?5)
+                 ON CONFLICT(article_id) DO UPDATE SET summary_zh=excluded.summary_zh,
+                 translation_zh=excluded.translation_zh,model=excluded.model,updated_at=excluded.updated_at",
+                params![task.key.target_id, summary, translation, model, now],
+            )?;
+            library_projection_revision::record(&tx, ProjectionImpact::article())?;
+        }
         finish_success_on(&tx, task, now)?;
         tx.commit()?;
         Ok(true)
@@ -818,7 +977,7 @@ impl<'a> WorkflowStore<'a> {
     ) -> Result<bool> {
         let (kind, user_message) = classify_error(error);
         let detail = sanitize_detail(&format!("{error:#}"));
-        let tx = self.db.conn.unchecked_transaction()?;
+        let tx = self.db.fenced_transaction()?;
         if !fence_valid(&tx, owner, task.id, task.generation)? {
             tx.commit()?;
             return Ok(false);
@@ -902,12 +1061,13 @@ impl<'a> WorkflowStore<'a> {
 
     fn prune_terminal_history(&self, now: i64) -> Result<()> {
         const RETENTION_SECONDS: i64 = 90 * 24 * 60 * 60;
-        self.db.conn.execute(
+        let tx = self.db.fenced_transaction()?;
+        tx.execute(
             "DELETE FROM knowledge_tasks
              WHERE status IN ('succeeded','failed','interrupted') AND updated_at<?1",
             [now - RETENTION_SECONDS],
         )?;
-        Ok(())
+        tx.commit()
     }
 }
 
@@ -917,6 +1077,39 @@ enum EngineExit {
     Maintenance { explicit: bool },
 }
 
+struct ProjectionPublication {
+    state: Arc<RwLock<KnowledgeProjectionState>>,
+    notice_tx: std_mpsc::SyncSender<TaskKey>,
+}
+
+impl ProjectionPublication {
+    fn residents(&self) -> Vec<TaskKey> {
+        self.state
+            .read()
+            .expect("knowledge projection state poisoned")
+            .residents
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    fn is_resident(&self, key: TaskKey) -> bool {
+        self.state
+            .read()
+            .expect("knowledge projection state poisoned")
+            .residents
+            .contains(&key)
+    }
+
+    fn clear_materialized(&self) {
+        self.state
+            .write()
+            .expect("knowledge projection state poisoned")
+            .snapshots
+            .clear();
+    }
+}
+
 fn engine_loop(
     db_path: PathBuf,
     config: ResourceEnrichmentConfig,
@@ -924,6 +1117,7 @@ fn engine_loop(
     policy: ExecutorPolicy,
     command_rx: &std_mpsc::Receiver<EngineCommand>,
     notice_tx: std_mpsc::Sender<KnowledgeNotice>,
+    projection: &ProjectionPublication,
 ) -> Result<EngineExit> {
     let db = match Db::open(&db_path) {
         Ok(db) => db,
@@ -934,6 +1128,10 @@ fn engine_loop(
     };
     let store = WorkflowStore::new(&db);
     store.prune_terminal_history(now())?;
+    let observed = projection.residents();
+    for key in observed {
+        publish_projection_snapshot(&store, key, projection)?;
+    }
     let owner_id = owner_id();
     let mut generation = None;
     let mut last_lease_attempt = Instant::now() - Duration::from_secs(2);
@@ -953,7 +1151,7 @@ fn engine_loop(
 
     loop {
         if !shutting_down
-            && crate::local_data_maintenance::WriterGate::maintenance_active(&db_path)?
+            && crate::local_data_maintenance::MaintenanceFence::observe(&db_path)?.is_active()
         {
             shutting_down = true;
             maintenance_requested = true;
@@ -1009,6 +1207,9 @@ fn engine_loop(
                         coalesced.insert(key);
                     }
                     for key in coalesced {
+                        if projection.is_resident(key) {
+                            publish_projection_snapshot(&store, key, projection)?;
+                        }
                         let _ = notice_tx.send(KnowledgeNotice::Changed(key));
                     }
                 }
@@ -1050,6 +1251,9 @@ fn engine_loop(
                     store.release_lease(&owner_id, current)?;
                 }
                 drop(db);
+                if maintenance_requested {
+                    projection.clear_materialized();
+                }
                 if let Some(reply) = quiesce_reply.take() {
                     let _ = reply.send(Ok(()));
                 }
@@ -1070,6 +1274,9 @@ fn engine_loop(
                     store.release_lease(&owner_id, current)?;
                 }
                 drop(db);
+                if maintenance_requested {
+                    projection.clear_materialized();
+                }
                 if let Some(reply) = quiesce_reply.take() {
                     let _ = reply.send(Ok(()));
                 }
@@ -1133,6 +1340,9 @@ fn engine_loop(
                 };
                 let _ = reply.send(result);
             }
+            Ok(EngineCommand::Observe { key }) => {
+                publish_projection_snapshot(&store, key, projection)?;
+            }
             Ok(EngineCommand::Quiesce { deadline, reply }) => {
                 if quiesce_reply.is_some() {
                     let _ = reply.send(Err(
@@ -1163,6 +1373,25 @@ fn engine_loop(
             Err(std_mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
+}
+
+fn publish_projection_snapshot(
+    store: &WorkflowStore<'_>,
+    key: TaskKey,
+    projection: &ProjectionPublication,
+) -> Result<()> {
+    let snapshot = store.latest_snapshot(key)?;
+    let mut state = projection
+        .state
+        .write()
+        .expect("knowledge projection state poisoned");
+    if !state.residents.contains(&key) {
+        return Ok(());
+    }
+    state.snapshots.insert(key, snapshot);
+    drop(state);
+    let _ = projection.notice_tx.try_send(key);
+    Ok(())
 }
 
 fn spawn_task(
@@ -1216,7 +1445,7 @@ fn execute_resource(
         let fetched = crate::web_clip::client()
             .and_then(|client| crate::web_clip::fetch_html(&client, &resource.url))
             .context("资源网页抓取失败")?;
-        let snapshot = crate::text::prepare_html_snapshot(&fetched.html);
+        let snapshot = prepare_article_html(&fetched.html);
         if snapshot.content.trim().is_empty() {
             bail!("资源网页没有可处理正文");
         }
@@ -1445,7 +1674,9 @@ fn now() -> i64 {
 mod tests {
     use super::*;
     use crate::backup::BackupStore;
+    use crate::config::Config;
     use crate::local_data_maintenance::{MaintenanceEngine, MaintenanceRequest, MaintenanceStatus};
+    use crate::model::NewArticle;
     use crate::resource_library_lifecycle::{
         Clock, CreateResource, NoProcessingHandoff, ProjectionScope, ResourceCollection,
         ResourceKind, ResourceLibraryLifecycle, ResourceLifecycleChange, ResourcePrivacy,
@@ -1578,6 +1809,73 @@ mod tests {
     }
 
     #[test]
+    fn identical_article_knowledge_output_is_a_revision_noop() {
+        let (db, path) = file_db("article-revision");
+        let feed_id = db.add_feed("https://example.test/article-feed", 0).unwrap();
+        let feed = db.get_feed(feed_id).unwrap();
+        db.record_success(
+            &feed,
+            1,
+            &Config::default(),
+            None,
+            &[NewArticle {
+                entry_id: "article".into(),
+                url: Some("https://example.test/article".into()),
+                title: Some("Article".into()),
+                author: None,
+                published: None,
+                content: Some("Body".into()),
+            }],
+        )
+        .unwrap();
+        let article_id = db
+            .conn
+            .query_row(
+                "SELECT id FROM articles WHERE feed_id=?1",
+                [feed_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        let store = WorkflowStore::new(&db);
+        let owner = "article-revision-owner";
+        let generation = store.acquire_lease(owner, 10).unwrap().unwrap();
+        let key = TaskKey::new(TaskKind::ArticleSummary, article_id);
+        store.request(key, 11).unwrap();
+        let first = store.claim_next(owner, generation, 11).unwrap().unwrap();
+        let before = library_projection_revision::read(&db.conn).unwrap();
+        assert!(
+            store
+                .complete_article(owner, &first, "摘要", "翻译", "model", 12)
+                .unwrap()
+        );
+        let after_first = library_projection_revision::read(&db.conn).unwrap();
+        assert_eq!(after_first.article, before.article + 1);
+        let projected = crate::article_library_lifecycle::ArticleLibraryLifecycle::new(&db)
+            .project(crate::article_library_lifecycle::ProjectionScope::Article(
+                article_id,
+            ))
+            .unwrap();
+        let ai = &projected.article_ai[&article_id];
+        assert_eq!(ai.summary_zh, "摘要");
+        assert_eq!(ai.translation_zh, "翻译");
+        assert_eq!(projected.stamp.revision, after_first.article);
+
+        store.request(key, 13).unwrap();
+        let second = store.claim_next(owner, generation, 13).unwrap().unwrap();
+        assert!(
+            store
+                .complete_article(owner, &second, "摘要", "翻译", "model", 14)
+                .unwrap()
+        );
+        assert_eq!(
+            library_projection_revision::read(&db.conn).unwrap(),
+            after_first
+        );
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn request_is_idempotent_and_failed_request_creates_attempt() {
         let (db, path) = file_db("request");
         let id = resource(&db, 10);
@@ -1688,6 +1986,76 @@ mod tests {
     }
 
     #[test]
+    fn projection_residency_evicts_immediately_and_reobserve_materializes() {
+        let _guard = engine_test_guard();
+        let (db, path) = file_db("projection-residency");
+        let id = resource(&db, now());
+        drop(db);
+        let engine = KnowledgeEngine::start_with_provider(
+            path.clone(),
+            Default::default(),
+            Arc::new(ValidResourceProvider),
+        )
+        .unwrap();
+        let observer = engine.projection_observer();
+        let key = TaskKey::new(TaskKind::ResourceCompletion, id);
+        observer.observe(key);
+        let initial_deadline = Instant::now() + Duration::from_secs(2);
+        while observer.snapshot(key).is_none() {
+            assert!(
+                Instant::now() < initial_deadline,
+                "initial materialization timed out"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        engine.request(key).unwrap();
+        let terminal_deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            if observer
+                .snapshot(key)
+                .flatten()
+                .is_some_and(|snapshot| snapshot.status == TaskStatus::Succeeded)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < terminal_deadline,
+                "terminal materialization timed out"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        observer.forget(key);
+        assert!(!observer.is_resident(key));
+        assert!(observer.snapshot(key).is_none());
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            observer.snapshot(key).is_none(),
+            "queued publication resurrected an evicted snapshot"
+        );
+
+        observer.observe(key);
+        let rematerialize_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if observer
+                .snapshot(key)
+                .flatten()
+                .is_some_and(|snapshot| snapshot.status == TaskStatus::Succeeded)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < rematerialize_deadline,
+                "re-observation did not materialize durable state"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(engine);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn cli_style_no_wait_survives_restart_and_waits_for_terminal_state() {
         let _guard = engine_test_guard();
         let (db, path) = file_db("cli-style");
@@ -1733,12 +2101,21 @@ mod tests {
             Arc::new(ValidResourceProvider),
         )
         .unwrap();
+        let key = TaskKey::new(TaskKind::ResourceCompletion, id);
+        let observer = engine.projection_observer();
+        observer.observe(key);
+        let materialize_deadline = Instant::now() + Duration::from_secs(2);
+        while observer.snapshot(key).is_none() {
+            assert!(Instant::now() < materialize_deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let participant = engine.maintenance_participant();
         participant
             .quiesce(Instant::now() + Duration::from_secs(2), "epoch-a")
             .unwrap();
+        assert!(observer.is_resident(key));
+        assert!(observer.snapshot(key).is_none());
 
-        let key = TaskKey::new(TaskKind::ResourceCompletion, id);
         assert!(
             engine
                 .request(key)
@@ -1755,6 +2132,11 @@ mod tests {
         );
 
         participant.resume("epoch-b").unwrap();
+        let rematerialize_deadline = Instant::now() + Duration::from_secs(2);
+        while observer.snapshot(key).is_none() {
+            assert!(Instant::now() < rematerialize_deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
         engine.request(key).unwrap();
         wait_for_status(&engine, key, TaskStatus::Succeeded);
         drop(engine);

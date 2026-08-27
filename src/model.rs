@@ -150,26 +150,6 @@ pub fn resolve_excerpt_anchor(
 
 /// 全局搜索的一条命中。文章标题、作者、正文与网址产生 `Article` 命中；
 /// 摘录原文和想法分别产生对应命中。所有结果都保留文章 id，供界面直接跳回原文。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SearchHitKind {
-    Article,
-    WebClipping,
-    Excerpt,
-    Thought,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SearchHit {
-    pub kind: SearchHitKind,
-    pub article_id: i64,
-    pub selection_id: Option<i64>,
-    pub feed_id: i64,
-    pub article_title: Option<String>,
-    pub snippet: String,
-    pub timestamp: i64,
-    pub archived: bool,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchHistoryEntry {
     pub query: String,

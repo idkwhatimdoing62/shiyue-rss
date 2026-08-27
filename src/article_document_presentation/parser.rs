@@ -1,39 +1,42 @@
-//! HTML→有序 文字/图片 块 + 时间格式化（ADR-16）。
-//! ponytail: 够读就行，不追求完整 HTML 渲染；坏在这里也只是排版丑，不会崩。
+//! Private semantic HTML parser for Article Document Presentation.
+//!
+//! The grammar in this module is implementation detail. Callers outside the
+//! parent Module receive only presentation outcomes or bounded text/snapshot
+//! projections and never depend on `Block` or its supporting types.
 
 /// 正文按 HTML 解析出的一个有序单元。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InlineLinkRange {
-    pub url: String,
-    pub start: usize,
-    pub end: usize,
+pub(super) struct InlineLinkRange {
+    pub(super) url: String,
+    pub(super) start: usize,
+    pub(super) end: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InlineTextRange {
-    pub start: usize,
-    pub end: usize,
+pub(super) struct InlineTextRange {
+    pub(super) start: usize,
+    pub(super) end: usize,
 }
 
 /// One semantic table cell. Spans are retained instead of flattening the
 /// source table, so the renderer can reserve the same logical columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TableCell {
-    pub text: String,
-    pub row_span: usize,
-    pub col_span: usize,
-    pub header: bool,
+pub(super) struct TableCell {
+    pub(super) text: String,
+    pub(super) row_span: usize,
+    pub(super) col_span: usize,
+    pub(super) header: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DefinitionItem {
-    pub term: String,
-    pub definitions: Vec<String>,
+pub(super) struct DefinitionItem {
+    pub(super) term: String,
+    pub(super) definitions: Vec<String>,
 }
 
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Block {
+pub(super) enum Block {
     Text(String),
     Strong(String),
     /// Inline HTML `<code>` that remains part of the surrounding sentence.
@@ -126,13 +129,13 @@ const IGNORED_ELEMENTS: &[&str] = &[
 /// The useful parts extracted from a complete HTML document before it is
 /// stored as a local reading snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HtmlSnapshot {
+pub(super) struct HtmlSnapshot {
     /// Page title, using `og:title`, `<title>` and `<h1>` in that order.
-    pub title: Option<String>,
+    pub(super) title: Option<String>,
     /// Article-oriented HTML, with page chrome and executable content removed.
-    pub content: String,
+    pub(super) content: String,
     /// The document's declared `<base href>`, if present.
-    pub base_href: Option<String>,
+    pub(super) base_href: Option<String>,
 }
 
 struct LinkState {
@@ -175,7 +178,7 @@ struct SemanticProfile {
 /// further; multiple articles mean the page is probably an index and are kept
 /// together. Script, style and surrounding navigation elements are removed
 /// even when the caller supplied only an HTML fragment.
-pub fn prepare_html_snapshot(html: &str) -> HtmlSnapshot {
+pub(super) fn prepare_html_snapshot(html: &str) -> HtmlSnapshot {
     let title = extract_html_title(html);
     let base_href = extract_html_base_href(html);
     let scope = html5_reading_scope(html);
@@ -330,7 +333,7 @@ fn semantic_profile(html: &str) -> SemanticProfile {
 }
 
 /// Extract a human-facing page title without retaining any HTML markup.
-pub fn extract_html_title(html: &str) -> Option<String> {
+fn extract_html_title(html: &str) -> Option<String> {
     use scraper::{Html, Selector};
 
     let document = Html::parse_document(html);
@@ -365,7 +368,7 @@ pub fn extract_html_title(html: &str) -> Option<String> {
 }
 
 /// Read the first declared `<base href>` from a complete HTML document.
-pub fn extract_html_base_href(html: &str) -> Option<String> {
+fn extract_html_base_href(html: &str) -> Option<String> {
     use scraper::{Html, Selector};
 
     let document = Html::parse_document(html);
@@ -708,7 +711,7 @@ fn tag_end(html: &str, start: usize) -> Option<usize> {
 
 /// 把正文 HTML 拆成有序的 文字块 / 图片块，图片按它在原文里的位置穿插。
 /// `base` 是文章 URL，用来把相对 `<img src>` 补成绝对地址。
-pub fn content_blocks(html: &str, base: Option<&str>) -> Vec<Block> {
+pub(super) fn content_blocks(html: &str, base: Option<&str>) -> Vec<Block> {
     // Read `<base>` before removing `<head>`, and resolve a relative base
     // against the caller-provided page URL.  This keeps full-page snapshots
     // working while preserving the old RSS-fragment behaviour.
@@ -1235,6 +1238,62 @@ pub fn content_blocks(html: &str, base: Option<&str>) -> Vec<Block> {
     blocks
 }
 
+/// Extract the readable text represented by an HTML fragment without exposing
+/// the presentation parser grammar to callers.
+///
+/// Search adapters use this projection for snippets. Article presentation
+/// consumes the same semantic parser privately, so tables, definitions, code
+/// and formula source stay searchable without making `Block` part of the GUI
+/// seam.
+pub(super) fn visible_text(html: &str, base: Option<&str>) -> String {
+    text_from_blocks(&content_blocks(html, base), " ")
+}
+
+pub(super) fn selection_text(html: &str, base: Option<&str>) -> String {
+    text_from_blocks(&content_blocks(html, base), "\n\n")
+}
+
+fn text_from_blocks(blocks: &[Block], separator: &str) -> String {
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            Block::Text(value)
+            | Block::Strong(value)
+            | Block::InlineCode(value)
+            | Block::Heading(value)
+            | Block::Quote(value)
+            | Block::Code(value)
+            | Block::Caption(value) => Some(value.clone()),
+            Block::CodeBlock { text, .. } | Block::Math { source: text, .. } => Some(text.clone()),
+            Block::HeadingWithInlineCode { text, .. }
+            | Block::HeadingLink { text, .. }
+            | Block::Link { text, .. } => Some(text.clone()),
+            Block::Table { rows, .. } => Some(
+                rows.iter()
+                    .flatten()
+                    .map(|cell| cell.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
+            Block::DefinitionList(items) => Some(
+                items
+                    .iter()
+                    .flat_map(|item| {
+                        std::iter::once(item.term.as_str())
+                            .chain(item.definitions.iter().map(String::as_str))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
+            Block::ListItemStart { .. }
+            | Block::ListItemEnd { .. }
+            | Block::Image(_)
+            | Block::LinkedImage { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join(separator)
+}
+
 fn push_line_break(buf: &mut String) {
     if !buf.is_empty() && !buf.ends_with('\n') {
         buf.push('\n');
@@ -1406,7 +1465,7 @@ fn positive_span_attr(tag: &str, name: &str) -> usize {
 /// Resolve each source cell to its first logical column while respecting
 /// row-spans from previous rows. Both the egui renderer and visual snapshots
 /// use this function, so regression tests exercise the same placement rules.
-pub fn table_cell_columns(
+pub(super) fn table_cell_columns(
     rows: &[Vec<TableCell>],
     column_count: usize,
 ) -> Vec<Vec<(usize, usize)>> {
@@ -1872,14 +1931,14 @@ fn split_numbered_headings(text: &str) -> Vec<String> {
         .collect()
 }
 
-pub(crate) fn is_numbered_heading(text: &str) -> bool {
+pub(super) fn is_numbered_heading(text: &str) -> bool {
     let s = text.trim_start();
     let c: Vec<char> = s.chars().collect();
     numbered_marker_len(&c, 0) > 0
 }
 
 /// 是否只有编号标记、没有跟随的标题文字，例如 `(1)`、`（1）`、`1.`。
-pub(crate) fn is_numbered_marker_only(text: &str) -> bool {
+pub(super) fn is_numbered_marker_only(text: &str) -> bool {
     let chars: Vec<char> = text.trim().chars().collect();
     !chars.is_empty() && numbered_marker_len(&chars, 0) == chars.len()
 }
@@ -1960,7 +2019,7 @@ fn merge_bare_number_markers(blocks: &mut Vec<Block>) {
     }
 }
 
-pub(crate) fn is_bare_plain_number_marker(text: &str) -> bool {
+fn is_bare_plain_number_marker(text: &str) -> bool {
     let s = text.trim();
     let chars: Vec<char> = s.chars().collect();
     if chars.is_empty() || chars[0] == '(' || chars[0] == '（' {
@@ -2227,12 +2286,6 @@ fn decode_entities(s: &str) -> String {
     out
 }
 
-pub fn fmt_ts(ts: i64) -> String {
-    chrono::DateTime::from_timestamp(ts, 0)
-        .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
-        .unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2435,7 +2488,7 @@ mod tests {
 
     #[test]
     fn rust_blog_full_page_without_article_keeps_the_main_post() {
-        let html = include_str!("../tests/fixtures/rust-blog-full-page-no-article.html");
+        let html = include_str!("../../tests/fixtures/rust-blog-full-page-no-article.html");
         let scope = html5_reading_scope(html);
         assert_eq!(scope.kind, CompletePageKind::IndexOrDocument);
 
@@ -2470,7 +2523,7 @@ mod tests {
 
     #[test]
     fn malformed_no_article_fixture_keeps_dom_semantics_and_math() {
-        let html = include_str!("../tests/fixtures/simon-willison-malformed-entry.html");
+        let html = include_str!("../../tests/fixtures/simon-willison-malformed-entry.html");
         let snapshot = prepare_html_snapshot(html);
         assert_eq!(
             snapshot.title.as_deref(),
@@ -3215,7 +3268,7 @@ mod tests {
     #[test]
     fn rust_blog_fixture_separates_inline_and_preformatted_code() {
         let blocks = content_blocks(
-            include_str!("../tests/fixtures/rust-blog-inline-code.html"),
+            include_str!("../../tests/fixtures/rust-blog-inline-code.html"),
             Some("https://blog.rust-lang.org/2026/07/09/Rust-1.97.0/"),
         );
 
@@ -3302,7 +3355,7 @@ mod tests {
     #[test]
     fn martin_fowler_fixture_keeps_linked_heading_image_and_nested_lists() {
         let blocks = content_blocks(
-            include_str!("../tests/fixtures/martinfowler-architecture-card.html"),
+            include_str!("../../tests/fixtures/martinfowler-architecture-card.html"),
             Some("https://martinfowler.com/architecture/"),
         );
 
@@ -3333,7 +3386,7 @@ mod tests {
     #[test]
     fn beekka_fixture_keeps_table_code_language_and_list_media() {
         let blocks = content_blocks(
-            include_str!("../tests/fixtures/beekka-weekly-rich-content.html"),
+            include_str!("../../tests/fixtures/beekka-weekly-rich-content.html"),
             Some("https://www.ruanyifeng.com/blog/2026/08/weekly-issue-407.html"),
         );
 
@@ -3365,7 +3418,7 @@ mod tests {
     #[test]
     fn wikipedia_fixture_keeps_math_table_and_clickable_footnotes() {
         let blocks = content_blocks(
-            include_str!("../tests/fixtures/wikipedia-math-footnotes-table.html"),
+            include_str!("../../tests/fixtures/wikipedia-math-footnotes-table.html"),
             Some("https://zh.wikipedia.org/wiki/欧拉恒等式"),
         );
 
@@ -3393,8 +3446,9 @@ mod tests {
 
     #[test]
     fn responsive_fixture_keeps_picture_caption_definitions_and_spans() {
-        let snapshot =
-            prepare_html_snapshot(include_str!("../tests/fixtures/responsive-semantics.html"));
+        let snapshot = prepare_html_snapshot(include_str!(
+            "../../tests/fixtures/responsive-semantics.html"
+        ));
         let blocks = content_blocks(
             &snapshot.content,
             Some("https://fixture.example/articles/semantic.html"),
@@ -3443,7 +3497,7 @@ mod tests {
 
     #[test]
     fn html5_dom_and_readability_candidates_are_fixture_gated() {
-        let html = include_str!("../tests/fixtures/responsive-semantics.html");
+        let html = include_str!("../../tests/fixtures/responsive-semantics.html");
 
         // scraper is backed by html5ever. This proves a browser-grade DOM can
         // recover the nested semantics we currently preserve by hand.
@@ -3582,11 +3636,11 @@ mod tests {
     #[test]
     fn semantic_blocks_match_visual_svg_snapshot() {
         let blocks = content_blocks(
-            include_str!("../tests/fixtures/responsive-semantics.html"),
+            include_str!("../../tests/fixtures/responsive-semantics.html"),
             Some("https://fixture.example/articles/semantic.html"),
         );
         let actual = semantic_snapshot_svg(&blocks);
-        let expected = include_str!("../tests/snapshots/semantic-blocks.svg");
+        let expected = include_str!("../../tests/snapshots/semantic-blocks.svg");
         assert_eq!(actual, expected, "semantic visual snapshot changed");
     }
 }

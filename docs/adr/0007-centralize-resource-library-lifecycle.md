@@ -20,7 +20,7 @@ Introduce `Resource Library Lifecycle` as the only application-level read and wr
 - CLI Agent creation enters Pending Review and does not start processing. GUI creation and Web Clipping import enter Active. Moving Pending Review to Active requests Resource Completion after the database commit.
 - A complete manual edit atomically replaces title, purpose, use-when guidance, private note, privacy, rating, Categories, and Tags. Purpose, use-when guidance, Categories, and Tags receive manual provenance so later AI output cannot overwrite them.
 - Public-to-private conversion is rejected while Resource Completion is queued or running. Private Resources remain local and Knowledge Processing completes them without a cloud provider call.
-- Permanent deletion is allowed only from Pending Review or Archived. It rejects queued or running processing, removes terminal Resource Completion history, Resource FTS rows, snapshots, classifications, and the Resource in one transaction, and never deletes a linked Article.
+- Permanent deletion is allowed only from Pending Review or Archived. It rejects queued or running processing, removes terminal Resource Completion history, snapshots, classifications, and the Resource in one transaction, and never deletes a linked Article. The derived search index follows the transaction through ADR-0008 rather than lifecycle-owned FTS writes.
 - Web Clipping import validates the complete selection before commit and is all-or-nothing. Canonical URL and linked Article constraints make reruns idempotent. Newly imported Resources are Active and Healthy because their local content already exists.
 - Collection projections are ordered by `(updated_at DESC, id DESC)`, use a stable cursor, return authoritative full collection counts, and cap a page at 200 rows. GUI routes adopt the projection instead of loading 1,000 rows and filtering locally.
 - Failures are typed as Input, Not Found, Invalid Transition, Processing Active, Maintenance, or Storage, with separate user-facing and technical detail.
@@ -32,7 +32,7 @@ Resource Library Lifecycle owns Resource identity, curation, health projection, 
 
 Knowledge Processing owns Resource fetch, snapshot success/failure recording, enrichment, privacy-safe execution, task state, retry, and technical failure detail. It crosses a narrow internal Resource target seam for loading processing input and applying processing results. Its task request adapter implements the Resource Library post-commit handoff.
 
-Search ranking, Article Library, Feed Subscription, RSS Refresh, Local Data Maintenance, and Desktop Route/Modal state remain sibling modules. The temporary deterministic search/JSON compatibility functions are read-only adapters; they do not authorize lifecycle writes.
+Library Search and ranking are owned by the sibling module in [ADR-0008](0008-centralize-library-search-and-ranking.md). Article Library, Feed Subscription, RSS Refresh, Local Data Maintenance, and Desktop Route/Modal state also remain sibling modules.
 
 ## Persistence and migration
 
@@ -48,7 +48,7 @@ The legacy `status` column remains only for backward-compatible storage during t
 
 GUI and CLI now share one definition of Resource collections, transitions, import idempotence, deletion safety, maintenance behavior, and projection counts. AI work cannot begin before its Resource commit, manual data is protected from enrichment, and the Knowledge workflow can update health without owning library membership.
 
-The cost is an explicit projection read inside each write transaction and a small compatibility layer around the existing SQLite search implementation. The module intentionally keeps SQLite concrete; real-database tests cover constraints, rollback, FTS, task races, migration, and cursor behavior instead of introducing a repository abstraction or cache.
+The cost is an explicit projection read inside each write transaction. The module intentionally keeps SQLite concrete; real-database tests cover constraints, rollback, task races, migration, and cursor behavior instead of introducing a repository abstraction or cache. Search-index consistency is verified by ADR-0008.
 
 ## Rejected alternatives
 

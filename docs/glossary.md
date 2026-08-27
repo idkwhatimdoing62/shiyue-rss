@@ -6,6 +6,18 @@
 - **Resource Health / 资源健康状态**：来源可访问性的运行状态：未知、健康或失效。失效资源仍可处于可用整理状态，因此会同时出现在“我的资源”和“失效”视图（ADR-0007）。
 - **Resource Library Projection / 资源库投影**：同一 SQLite 一致快照中的作用域资源、详情、完整集合计数和稳定分页游标；GUI 必须整体采用（ADR-0007）。
 - **Processing Handoff / 处理交接**：资源事务提交后向 Knowledge Processing 请求后台补全。交接失败不回滚已保存资源，而是返回可观察、可重试的 Deferred 结果（ADR-0007）。
+- **Library Search / 资料库搜索**：跨 Active Resources、Article Bookmarks、Web Clippings、Excerpts 与 Thoughts 的统一相关性查询；完整 RSS 与归档主资料需要显式 scope（ADR-0008）。
+- **Library Search Result / 资料库搜索结果**：一个主 Resource 或 Article 身份及其关联资料、导航目标、隐私/健康事实和有界 Search Evidence；关联资料不重复占用排名位置（ADR-0008）。
+- **Search Evidence / 搜索依据**：解释结果命中原因的有界字段片段或资料形态，不暴露内部数值分数（ADR-0008）。
+- **Web Clipping / 网页收藏**：从公开 HTTP(S) 网页或粘贴 HTML 创建的不可变本地 Article；重复抓取始终保留独立身份（ADR-0009）。
+- **Capture Lease / 捕获租约**：一次网页收藏捕获的不可复用能力，只暴露身份、revisioned snapshot 和取消；`Committing` 是取消的线性化点（ADR-0009）。
+- **Web Clipping Provenance / 网页收藏来源信息**：捕获输入类型、时间、original/final URL 或粘贴 HTML base URL；旧数据中不可证明的字段保持未知（ADR-0009）。
+- **Excerpt / 摘录**：由 Article 与精确 Stable Excerpt Anchor 标识的长期保留原文片段；归档或取消文章收藏不会移除它（ADR-0010）。
+- **Thought / 想法**：附在一个 Excerpt 上的单一可选当前个人笔记；可单独替换或删除，不改变摘录身份（ADR-0010）。
+- **Excerpt Resolution / 摘录定位状态**：摘录锚点能否在当前 Article 正文中解析；Unresolved 摘录仍保留并参与搜索，只是不保证自动定位（ADR-0010）。
+- **Legacy Excerpt / 历史摘录**：schema v7 前形成且不能安全自动合并的精确锚点重复记录；保留独立身份和想法（ADR-0010）。
+- **Excerpt & Thought Projection / 摘录与想法投影**：单篇 Article 或完整摘录库的一致快照，包含摘录、想法、定位状态、身份类型、导航资料和权威计数（ADR-0010）。
+- **Excerpt & Thought Lifecycle / 摘录与想法生命周期**：创建、维护、投影及删除摘录与想法的唯一生产写入口，并保证搜索可见性与源记录同事务生效（ADR-0010）。
 
 - **Feed / 源**：一个订阅 URL 及其元数据（`feeds` 表一行）。
 - **Feed Subscription / RSS 订阅**：用户持续关注一个 Feed 的持久意图，包含规范化 URL、启用状态和可选单源刷新间隔；删除时连同该 Feed 的本地文章永久移除（ADR-0005）。
@@ -16,6 +28,11 @@
 - **Article Archive / 文章归档**：暂时从 Feed、文章收藏和稍后读集合隐藏 Article，但保留其收藏、稍后读、已读和标签状态；恢复后重新显露（ADR-0006）。
 - **Article Library Lifecycle / 文章资料生命周期**：文章收藏、稍后读、归档、已读、标签和批量操作的唯一应用边界，统一事务、维护期、固定网页收藏和错误语义（ADR-0006）。
 - **Article Library Projection / 文章资料投影**：从同一 SQLite 一致快照返回的作用域文章、标签、固定收藏标识、集合计数和 Feed 未读数；GUI 必须整体采用，不能自行推断或乐观修改（ADR-0006）。
+- **Article Document Presentation Pipeline / 文章文档呈现管线**：准备并通过 egui 呈现一篇 Article 正文的唯一 Module Interface，统一正文语义、排版、选择映射和图片/公式异步状态，但不拥有 Article 或 Excerpt 的持久化生命周期（ADR-0012）。
+- **Desktop Runtime & Settings / 桌面运行时与设置**：桌面启动、路径、日志、版本化 TOML、原子持久化、字体/样式、托盘、窗口生命周期和系统通知的唯一 Module；GUI 只通过 `DesktopSession` 接收快照、提交设置变更并采用语义 Intent（ADR-0013）。
+- **Maintenance Fence / 资料维护栅栏**：正常代码观察资料维护窗口和提交资料库写入的唯一权威 Interface。连接栅栏让独占维护感知仍存活的数据库连接，generation witness 阻止维护前产生的外部结果写入恢复后的资料库，fenced transaction 在 SQLite commit 前统一复核维护状态和 generation；maintenance-drain transaction 仅允许 participant 为到达安全点而写入中断与 lease 释放记录（ADR-0003）。
+- **Content Fingerprint / 内容指纹**：对 Article 标题、正文 HTML 与有效 base URL 的长度分隔精确展示输入计算的 SHA-256；它标识可复用的 Prepared Document 内容修订，Article identity 另外属于请求与选择身份，theme、viewport 和媒体进度不属于指纹（ADR-0012）。
+- **Document Character Range / 文档字符范围**：Prepared Document 规范纯文本中的 Unicode scalar character offset 区间；不使用 UTF-8 byte 或 egui galley cursor，因此重新排版和媒体完成不会改变同一范围的文本含义（ADR-0012）。
 - **guid / id**：条目的规范唯一标识（RSS `<guid>` / Atom `<id>`）；去重键，缺失时回退用文章 URL。
 - **RSS Refresh Run / RSS 刷新运行**：一次会话内对确定 Feed 集合执行的「拉取 → 解析 → 独立提交」。运行本身不跨重启恢复；文章、下次刷新时间和最近失败由 Feed 数据持久保存（ADR-0004）。
 - **due / 到期**：`now >= next_fetch` 且未禁用的源，本轮需要抓。

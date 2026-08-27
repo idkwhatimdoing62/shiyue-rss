@@ -1,43 +1,40 @@
-# 资源搜索 Top 5 验收基线
+# Library Search Top 5 验收基线
 
-更新时间：2026-08-19
+更新时间：2026-08-25
 
 ## 数据集
 
-- 资源：20 个真实公开网站，覆盖图标、图片、设计、文档、Rust、代码仓库和灵感网站。
-- 查询：10 条来自当前使用场景的中文/中英混合查询。
-- 人工认可：每条查询在 `accepted` 位置记录至少一个用户认可 URL。
-- 固定数据：`tests/fixtures/resource-regression.json`。
+- 固定数据：`tests/fixtures/library-search-regression.json`
+- 公开主身份：40 个，其中 Resource 25 个、Article 15 个
+- 查询：25 条，覆盖工具、素材、文档、文章、架构、数据库、隐私和后台工作流
+- 隐私、归档、失效资源不进入公开 fixture，使用独立确定性测试验证
 
 ## 验收规则
 
-每条查询取资源搜索前 5 条；只要人工认可 URL 位于 Top 5，即判定通过。测试同时锁定资源数为 20、查询数为 10，避免数据集被无意缩小后仍显示通过。
+每条查询使用 ADR-0008 的 Library Search，取前 5 条结果。人工认可 URL 位于 Top 5 即召回成功。Recall@5 必须为 100%；MRR 只记录趋势，暂不作为发布门槛。
 
 复现命令：
 
 ```powershell
-cargo test --lib resource::tests::real_resource_regression_queries_have_an_accepted_top_five_result --locked -- --exact --nocapture
+cargo test mixed_library_regression -- --nocapture
 ```
 
-## v0.5.0 后结构化基线结果
+当前结果：25/25 查询通过 Recall@5，MRR = 1.000。
 
-| 查询 | 人工认可结果 | 排名 |
-|---|---|---:|
-| App icon | Koboyo Icons | 1 |
-| 商用 SVG 图标 | SVG Repo | 1 |
-| 开源 SVG 图标 | Heroicons | 2 |
-| 在线图片编辑 | Photopea | 1 |
-| 图片压缩 | Squoosh | 1 |
-| 架构图 | Excalidraw | 1 |
-| 设计配色 | Coolors | 1 |
-| Rust crate 文档 | docs.rs | 1 |
-| Rust GUI | egui | 1 |
-| 设计灵感网站 | Awwwards | 1 |
+## 性能基线
 
-结论：10/10 查询通过 Top 5 门槛；9 条 Top 1，1 条 Top 2。
+本地性能夹具包含 1,000 个 Resources、10,000 个 Articles 和 2,000 条 Excerpts。它记录 30 次混合查询的 P50/P95，并强制每次查询低于两秒。
 
-## 解释边界
+复现命令：
 
-当前 fixture 使用真实 URL 和真实查询，但用途描述是人工整理的稳定文本。因此它验证搜索、排序和 JSON 输出回归，不证明任意网页经 AI 自动补全后都能达到同等召回率。
+```powershell
+cargo test benchmark_records_p50_p95 -- --ignored --nocapture
+```
 
-后续每次模型提示词或解析规则变化，应从本机真实资源库匿名抽样，人工检查 AI 补全字段，再把经确认且可公开的案例加入 fixture。私密 URL、正文和备注不得进入仓库。
+性能数字依赖机器，只用于同一环境的趋势比较；CI 的硬门槛仍是每次查询不得超过两秒。
+
+2026-08-25 本机 debug 测试结果：P50 = 50.7883 ms，P95 = 63.9456 ms，30/30 查询低于两秒。
+
+## 维护约束
+
+新增查询时必须先确认真实使用意图和认可结果，再加入 fixture。不能通过删除困难查询或扩大认可列表掩盖回归。私密 URL、正文、备注和凭据不得进入仓库。

@@ -42,6 +42,9 @@ pub enum ResourceCommand {
         scope: ResourceScope,
         #[arg(long, default_value_t = 5)]
         limit: usize,
+        /// Agent adapters set this to keep machine queries out of human history.
+        #[arg(long, hide = true)]
+        agent: bool,
         #[arg(long, required = true)]
         json: bool,
     },
@@ -93,4 +96,5 @@ pub enum ResourceResultType {
 pub enum ResourceScope {
     Curated,
     All,
+    Archive,
 }

@@ -1,13 +1,17 @@
 //! 配置与路径。ADR-12：directories 定位标准目录 + TOML 配置。
 
-use anyhow::{Context, Result};
-use directories::ProjectDirs;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+
+pub const UI_SCALE_OPTIONS: [u16; 4] = [90, 100, 110, 125];
+pub const CURRENT_SETTINGS_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Missing in legacy TOML; Desktop Runtime upgrades zero to the current version in memory.
+    #[serde(default)]
+    pub settings_version: u32,
     /// 全局默认抓取间隔（秒）。
     pub default_interval_secs: i64,
     /// 退避基数（秒）：失败后 next = base * 2^fail_count，封顶 cap。
@@ -17,6 +21,8 @@ pub struct Config {
     pub disable_after_failures: i64,
     /// 是否弹桌面通知（ADR-7）。
     pub notifications: bool,
+    /// GUI logical-point zoom. Kept in the shared config so it survives restarts.
+    pub ui_scale_percent: u16,
     pub resource_enrichment: ResourceEnrichmentConfig,
 }
 
@@ -49,79 +55,47 @@ impl Default for ResourceEnrichmentConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            settings_version: CURRENT_SETTINGS_VERSION,
             default_interval_secs: 900, // 15 分钟
             backoff_base_secs: 60,
             backoff_cap_secs: 3600,
             disable_after_failures: 10,
             notifications: true,
+            ui_scale_percent: 100,
             resource_enrichment: ResourceEnrichmentConfig::default(),
         }
     }
 }
 
-pub struct Paths {
-    pub data_dir: PathBuf,
-    pub config_file: PathBuf,
-    pub db_file: PathBuf,
-    pub log_file: PathBuf,
-    pub image_cache_dir: PathBuf,
-    pub backup_dir: PathBuf,
-}
-
-impl Paths {
-    pub fn resolve() -> Result<Self> {
-        if cfg!(debug_assertions)
-            && let Some(root) = std::env::var_os("SHIYUE_TEST_ROOT")
-        {
-            let root = PathBuf::from(root);
-            let config_dir = root.join("config");
-            let data_dir = root.join("data");
-            std::fs::create_dir_all(&config_dir)?;
-            std::fs::create_dir_all(&data_dir)?;
-            let image_cache_dir = data_dir.join("image-cache");
-            let backup_dir = data_dir.join("backups");
-            std::fs::create_dir_all(&image_cache_dir)?;
-            std::fs::create_dir_all(&backup_dir)?;
-            return Ok(Self {
-                data_dir: data_dir.clone(),
-                config_file: config_dir.join("config.toml"),
-                db_file: data_dir.join("rrss.db"),
-                log_file: data_dir.join("rrss.log"),
-                image_cache_dir,
-                backup_dir,
-            });
-        }
-        // LEGACY COMPATIBILITY: 拾阅的早期开发版本使用 rrss 作为应用
-        // 标识。继续读取这个目录，升级后用户的订阅、归档和摘录不会丢失。
-        let pd = ProjectDirs::from("", "", "rrss").context("无法确定用户目录")?;
-        let config_dir = pd.config_dir().to_path_buf();
-        let data_dir = pd.data_local_dir().to_path_buf();
-        std::fs::create_dir_all(&config_dir)?;
-        std::fs::create_dir_all(&data_dir)?;
-        let image_cache_dir = data_dir.join("image-cache");
-        let backup_dir = data_dir.join("backups");
-        std::fs::create_dir_all(&image_cache_dir)?;
-        std::fs::create_dir_all(&backup_dir)?;
-        Ok(Self {
-            data_dir: data_dir.clone(),
-            config_file: config_dir.join("config.toml"),
-            db_file: data_dir.join("rrss.db"),
-            log_file: data_dir.join("rrss.log"),
-            image_cache_dir,
-            backup_dir,
-        })
+impl Config {
+    pub fn ui_scale_factor(&self) -> f32 {
+        let percent = if UI_SCALE_OPTIONS.contains(&self.ui_scale_percent) {
+            self.ui_scale_percent
+        } else {
+            100
+        };
+        f32::from(percent) / 100.0
     }
-}
 
-/// 读配置；首次运行写出一份默认 config.toml。
-pub fn load(paths: &Paths) -> Result<Config> {
-    if paths.config_file.exists() {
-        let text = std::fs::read_to_string(&paths.config_file)?;
-        Ok(toml::from_str(&text).context("解析 config.toml 失败")?)
-    } else {
-        let cfg = Config::default();
-        std::fs::write(&paths.config_file, toml::to_string_pretty(&cfg)?)?;
-        Ok(cfg)
+    pub fn validate(&self) -> Result<()> {
+        if self.settings_version > CURRENT_SETTINGS_VERSION {
+            anyhow::bail!(
+                "配置版本 {} 高于当前支持的版本 {}",
+                self.settings_version,
+                CURRENT_SETTINGS_VERSION
+            );
+        }
+        if !UI_SCALE_OPTIONS.contains(&self.ui_scale_percent) {
+            anyhow::bail!("不支持的界面缩放比例：{}%", self.ui_scale_percent);
+        }
+        if self.default_interval_secs <= 0
+            || self.backoff_base_secs <= 0
+            || self.backoff_cap_secs < self.backoff_base_secs
+            || self.disable_after_failures <= 0
+        {
+            anyhow::bail!("订阅刷新设置无效");
+        }
+        Ok(())
     }
 }
 
@@ -148,7 +122,7 @@ pub fn parse_duration(s: &str) -> Result<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_duration;
+    use super::{Config, parse_duration};
     #[test]
     fn durations() {
         assert_eq!(parse_duration("30s").unwrap(), 30);
@@ -157,5 +131,15 @@ mod tests {
         assert_eq!(parse_duration("2d").unwrap(), 172800);
         assert_eq!(parse_duration("45").unwrap(), 45);
         assert!(parse_duration("abc").is_err());
+    }
+
+    #[test]
+    fn legacy_config_gets_readable_default_scale_and_invalid_scale_is_safe() {
+        let legacy: Config = toml::from_str("notifications = false").unwrap();
+        assert_eq!(legacy.ui_scale_percent, 100);
+        assert_eq!(legacy.ui_scale_factor(), 1.0);
+
+        let invalid: Config = toml::from_str("ui_scale_percent = 777").unwrap();
+        assert_eq!(invalid.ui_scale_factor(), 1.0);
     }
 }

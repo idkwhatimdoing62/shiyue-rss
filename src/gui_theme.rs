@@ -24,7 +24,9 @@ impl ReaderTheme {
             canvas: egui::Color32::from_rgb(255, 255, 255),
             panel: egui::Color32::from_rgb(250, 250, 250),
             text: egui::Color32::from_rgb(51, 51, 51),
-            muted: egui::Color32::from_rgb(136, 136, 136),
+            // Secondary labels are frequently rendered at 13 px. #666 keeps
+            // them clearly readable on white while remaining subordinate.
+            muted: egui::Color32::from_rgb(102, 102, 102),
             accent: egui::Color32::from_rgb(255, 126, 121),
             link: egui::Color32::from_rgb(242, 47, 39),
             border: egui::Color32::from_rgb(238, 238, 238),

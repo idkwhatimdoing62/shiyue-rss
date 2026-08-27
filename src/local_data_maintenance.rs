@@ -14,7 +14,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use fs2::FileExt;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use std::ops::{Deref, DerefMut};
 
 use crate::backup::{BackupEntry, BackupStore};
 use crate::db::Db;
@@ -224,16 +225,236 @@ impl CoordinationPaths {
     }
 }
 
-/// Per-database writer gate. A `Db` keeps the epoch it opened under; after a
-/// restore that handle can no longer acquire a new permit and must be reopened.
+/// The only external seam for observing maintenance and fencing normal
+/// database work. Callers never interpret the sidecar protocol or handle raw
+/// writer permits themselves.
+pub(crate) struct MaintenanceFence;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MaintenanceAvailability {
+    Available,
+    Active,
+}
+
+impl MaintenanceAvailability {
+    pub(crate) fn is_active(self) -> bool {
+        self == Self::Active
+    }
+}
+
+impl MaintenanceFence {
+    pub(crate) fn rejected(error: &anyhow::Error) -> bool {
+        let detail = format!("{error:#}");
+        detail.contains("MAINTENANCE_IN_PROGRESS") || detail.contains("STALE_LIBRARY_EPOCH")
+    }
+
+    /// Open the fence held for the complete lifetime of a normal `Db`.
+    pub(crate) fn open_connection(database: &Path) -> Result<ConnectionFence> {
+        let generation = GenerationFence::open(database)?;
+        let lifetime_permit = generation.acquire(WriteIntent::Mutation)?;
+        Ok(ConnectionFence {
+            generation,
+            _lifetime_permit: lifetime_permit,
+        })
+    }
+
+    /// Capture the current library generation without holding maintenance
+    /// open while an external/network operation runs.
+    pub(crate) fn witness(database: &Path) -> Result<GenerationFence> {
+        GenerationFence::open(database)
+    }
+
+    /// Observe maintenance without exposing sidecar layout or fail-open
+    /// choices to callers.
+    pub(crate) fn observe(database: &Path) -> Result<MaintenanceAvailability> {
+        let state = read_state(&CoordinationPaths::for_database(database))?;
+        Ok(if state.active {
+            MaintenanceAvailability::Active
+        } else {
+            MaintenanceAvailability::Available
+        })
+    }
+}
+
+/// Fence retained by a normal database connection. Its lifetime permit makes
+/// the connection itself visible to exclusive maintenance; each write still
+/// receives a short permit so maintenance intent is checked at commit time.
+#[derive(Debug)]
+pub(crate) struct ConnectionFence {
+    generation: GenerationFence,
+    _lifetime_permit: WriterPermit,
+}
+
+impl ConnectionFence {
+    pub(crate) fn generation(&self) -> &str {
+        self.generation.opened_epoch()
+    }
+
+    pub(crate) fn begin_write<'connection>(
+        &self,
+        connection: &'connection Connection,
+    ) -> Result<FencedTransaction<'connection>> {
+        self.generation.begin_write(connection)
+    }
+
+    pub(crate) fn begin_immediate_write<'connection>(
+        &self,
+        connection: &'connection mut Connection,
+    ) -> Result<FencedTransaction<'connection>> {
+        self.generation.begin_immediate_write(connection)
+    }
+
+    /// Acquire the write permit before a lifecycle publishes its irreversible
+    /// `Committing` state. A permit obtained while maintenance is unavailable
+    /// may drain after maintenance intent is published, but no new one may be
+    /// acquired once that intent is visible.
+    pub(crate) fn begin_linearized_immediate_write<'connection>(
+        &self,
+        connection: &'connection mut Connection,
+    ) -> Result<FencedTransaction<'connection>> {
+        self.generation
+            .begin_immediate_write_for(connection, WriteIntent::LinearizedMutation)
+    }
+
+    /// Persist only the participant state required to reach a maintenance
+    /// safe point. The shared lock still prevents epoch rotation while this
+    /// commits, but an already-published maintenance intent is allowed.
+    pub(crate) fn begin_drain_write<'connection>(
+        &self,
+        connection: &'connection Connection,
+    ) -> Result<FencedTransaction<'connection>> {
+        self.generation
+            .begin_write_for(connection, WriteIntent::MaintenanceDrain)
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        self._lifetime_permit.validate()
+    }
+}
+
+/// Generation witness retained across work whose result must not cross a
+/// restore boundary (for example an RSS network fetch).
 #[derive(Debug, Clone)]
-pub(crate) struct WriterGate {
+pub(crate) struct GenerationFence {
+    gate: WriterGate,
+}
+
+impl GenerationFence {
+    fn open(database: &Path) -> Result<Self> {
+        Ok(Self {
+            gate: WriterGate::open(database)?,
+        })
+    }
+
+    fn opened_epoch(&self) -> &str {
+        self.gate.opened_epoch()
+    }
+
+    fn acquire(&self, intent: WriteIntent) -> Result<WriterPermit> {
+        self.gate.permit(intent)
+    }
+
+    pub(crate) fn begin_write<'connection>(
+        &self,
+        connection: &'connection Connection,
+    ) -> Result<FencedTransaction<'connection>> {
+        self.begin_write_for(connection, WriteIntent::Mutation)
+    }
+
+    fn begin_write_for<'connection>(
+        &self,
+        connection: &'connection Connection,
+        intent: WriteIntent,
+    ) -> Result<FencedTransaction<'connection>> {
+        let permit = self.acquire(intent)?;
+        let transaction = connection.unchecked_transaction()?;
+        Ok(FencedTransaction {
+            transaction: Some(transaction),
+            permit: Some(permit),
+        })
+    }
+
+    fn begin_immediate_write<'connection>(
+        &self,
+        connection: &'connection mut Connection,
+    ) -> Result<FencedTransaction<'connection>> {
+        self.begin_immediate_write_for(connection, WriteIntent::Mutation)
+    }
+
+    fn begin_immediate_write_for<'connection>(
+        &self,
+        connection: &'connection mut Connection,
+        intent: WriteIntent,
+    ) -> Result<FencedTransaction<'connection>> {
+        let permit = self.acquire(intent)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Ok(FencedTransaction {
+            transaction: Some(transaction),
+            permit: Some(permit),
+        })
+    }
+}
+
+/// Transaction whose only commit path validates the maintenance generation
+/// immediately before SQLite commit. Dropping it rolls back as usual.
+#[derive(Debug)]
+pub(crate) struct FencedTransaction<'connection> {
+    transaction: Option<Transaction<'connection>>,
+    permit: Option<WriterPermit>,
+}
+
+impl<'connection> Deref for FencedTransaction<'connection> {
+    type Target = Transaction<'connection>;
+
+    fn deref(&self) -> &Self::Target {
+        self.transaction
+            .as_ref()
+            .expect("fenced transaction already committed")
+    }
+}
+
+impl DerefMut for FencedTransaction<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.transaction
+            .as_mut()
+            .expect("fenced transaction already committed")
+    }
+}
+
+impl<'connection> FencedTransaction<'connection> {
+    pub(crate) fn uncoordinated(
+        transaction: Transaction<'connection>,
+    ) -> FencedTransaction<'connection> {
+        FencedTransaction {
+            transaction: Some(transaction),
+            permit: None,
+        }
+    }
+
+    pub(crate) fn commit(mut self) -> Result<()> {
+        if let Some(permit) = self.permit.as_ref() {
+            permit.validate()?;
+        }
+        let transaction = self
+            .transaction
+            .take()
+            .expect("fenced transaction already committed");
+        transaction.commit()?;
+        self.permit.take();
+        Ok(())
+    }
+}
+
+/// Internal implementation for a per-database writer generation. It is kept
+/// private so every caller crosses `MaintenanceFence`.
+#[derive(Debug, Clone)]
+struct WriterGate {
     paths: CoordinationPaths,
     opened_epoch: String,
 }
 
 impl WriterGate {
-    pub(crate) fn open(database: &Path) -> Result<Self> {
+    fn open(database: &Path) -> Result<Self> {
         let paths = CoordinationPaths::for_database(database);
         let state = read_state(&paths)?;
         if state.active {
@@ -245,16 +466,15 @@ impl WriterGate {
         })
     }
 
-    #[cfg(test)]
     fn opened_epoch(&self) -> &str {
         &self.opened_epoch
     }
 
-    pub(crate) fn permit(&self) -> Result<WriterPermit> {
+    fn permit(&self, intent: WriteIntent) -> Result<WriterPermit> {
         let file = open_lock_file(&self.paths.writer_lock)?;
         FileExt::lock_shared(&file).context("acquire local-library writer permit")?;
         let state = read_state(&self.paths)?;
-        if state.active {
+        if state.active && intent != WriteIntent::MaintenanceDrain {
             let _ = FileExt::unlock(&file);
             bail!("MAINTENANCE_IN_PROGRESS: local library is temporarily read-only");
         }
@@ -266,11 +486,8 @@ impl WriterGate {
             file: Some(file),
             paths: self.paths.clone(),
             epoch: self.opened_epoch.clone(),
+            intent,
         })
-    }
-
-    pub(crate) fn maintenance_active(database: &Path) -> Result<bool> {
-        Ok(read_state(&CoordinationPaths::for_database(database))?.active)
     }
 }
 
@@ -302,6 +519,40 @@ pub(crate) fn run_schema_migration<T>(
     }
 
     snapshot.epoch = rotate_epoch(&paths)?;
+    snapshot.stage = MaintenanceStage::CreatingSafetyBackup;
+    snapshot.updated_at = Utc::now().timestamp();
+    write_snapshot(&paths, &snapshot)?;
+
+    let backup_directory = database
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("backups");
+    let safety_result = (|| -> Result<BackupEntry> {
+        let conn = Connection::open(database)?;
+        let raw_library = Db {
+            conn,
+            path: Some(database.to_path_buf()),
+            _maintenance_fence: None,
+        };
+        BackupStore::open(backup_directory)?.create_safety(&raw_library)
+    })();
+    let safety = match safety_result {
+        Ok(safety) => safety,
+        Err(error) => {
+            snapshot.active = false;
+            snapshot.stage = MaintenanceStage::Finished;
+            snapshot.status = MaintenanceStatus::Failed;
+            snapshot.failure_kind = Some(MaintenanceFailureKind::SafetyBackup);
+            snapshot.user_message = Some("无法创建升级前安全副本，数据库尚未修改".into());
+            snapshot.technical_detail = Some(sanitize_detail(&format!("{error:#}")));
+            snapshot.updated_at = Utc::now().timestamp();
+            write_snapshot(&paths, &snapshot)?;
+            let _ = FileExt::unlock(&writer);
+            let _ = FileExt::unlock(&owner);
+            return Err(error);
+        }
+    };
+    snapshot.safety_backup = Some(safety.path);
     snapshot.stage = MaintenanceStage::Executing;
     snapshot.updated_at = Utc::now().timestamp();
     write_snapshot(&paths, &snapshot)?;
@@ -328,16 +579,17 @@ pub(crate) fn run_schema_migration<T>(
 }
 
 #[derive(Debug)]
-pub(crate) struct WriterPermit {
+struct WriterPermit {
     file: Option<File>,
     paths: CoordinationPaths,
     epoch: String,
+    intent: WriteIntent,
 }
 
 impl WriterPermit {
-    pub(crate) fn validate(&self) -> Result<()> {
+    fn validate(&self) -> Result<()> {
         let state = read_state(&self.paths)?;
-        if state.active {
+        if state.active && self.intent == WriteIntent::Mutation {
             bail!("MAINTENANCE_IN_PROGRESS: local library is temporarily read-only");
         }
         if state.epoch != self.epoch {
@@ -345,6 +597,13 @@ impl WriterPermit {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteIntent {
+    Mutation,
+    LinearizedMutation,
+    MaintenanceDrain,
 }
 
 impl Drop for WriterPermit {
@@ -1079,13 +1338,14 @@ mod tests {
     #[test]
     fn writer_opened_before_run_is_stale_after_epoch_changes() {
         let (path, _) = temp_paths("stale");
-        Db::open_for_maintenance(&path).unwrap();
-        let gate = WriterGate::open(&path).unwrap();
-        let old = gate.opened_epoch().to_owned();
+        let raw = Db::open_for_maintenance(&path).unwrap();
+        let witness = MaintenanceFence::witness(&path).unwrap();
+        let old = witness.opened_epoch().to_owned();
         let snapshot = begin_run(&path, MaintenanceOperation::Compact).unwrap();
         assert_eq!(snapshot.epoch, old);
         assert!(
-            gate.permit()
+            witness
+                .begin_write(&raw.conn)
                 .unwrap_err()
                 .to_string()
                 .contains("MAINTENANCE")
@@ -1097,7 +1357,8 @@ mod tests {
         terminal.status = MaintenanceStatus::Failed;
         write_snapshot(&CoordinationPaths::for_database(&path), &terminal).unwrap();
         assert!(
-            gate.permit()
+            witness
+                .begin_write(&raw.conn)
                 .unwrap_err()
                 .to_string()
                 .contains("STALE_LIBRARY_EPOCH")
@@ -1105,22 +1366,66 @@ mod tests {
     }
 
     #[test]
-    fn permit_validation_reports_active_maintenance_before_epoch_staleness() {
+    fn fenced_commit_rechecks_maintenance_and_rolls_back() {
         let (path, _) = temp_paths("validate-active");
-        Db::open_for_maintenance(&path).unwrap();
-        let gate = WriterGate::open(&path).unwrap();
-        let permit = gate.permit().unwrap();
+        let raw = Db::open_for_maintenance(&path).unwrap();
+        let witness = MaintenanceFence::witness(&path).unwrap();
+        let tx = witness.begin_write(&raw.conn).unwrap();
+        tx.execute(
+            "INSERT INTO feeds(url,next_fetch) VALUES('https://late.example/feed',1)",
+            [],
+        )
+        .unwrap();
         let mut snapshot = begin_run(&path, MaintenanceOperation::Compact).unwrap();
 
-        let error = permit.validate().unwrap_err().to_string();
+        assert!(MaintenanceFence::observe(&path).unwrap().is_active());
+        let error = tx.commit().unwrap_err().to_string();
         assert!(error.contains("MAINTENANCE_IN_PROGRESS"), "{error}");
         assert!(!error.contains("STALE_LIBRARY_EPOCH"), "{error}");
 
-        drop(permit);
         snapshot.active = false;
         snapshot.stage = MaintenanceStage::Finished;
         snapshot.status = MaintenanceStatus::Failed;
         write_snapshot(&CoordinationPaths::for_database(&path), &snapshot).unwrap();
+        let rows: i64 = raw
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM feeds WHERE url='https://late.example/feed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn linearized_mutation_acquired_before_maintenance_can_drain() {
+        let (path, _) = temp_paths("linearized-drain");
+        let mut db = Db::open(&path).unwrap();
+        let tx = db.fenced_linearized_immediate_transaction().unwrap();
+        tx.execute(
+            "INSERT INTO feeds(url,next_fetch) VALUES('https://linearized.example/feed',1)",
+            [],
+        )
+        .unwrap();
+        let mut snapshot = begin_run(&path, MaintenanceOperation::Compact).unwrap();
+
+        assert!(MaintenanceFence::observe(&path).unwrap().is_active());
+        tx.commit().unwrap();
+
+        snapshot.active = false;
+        snapshot.stage = MaintenanceStage::Finished;
+        snapshot.status = MaintenanceStatus::Failed;
+        write_snapshot(&CoordinationPaths::for_database(&path), &snapshot).unwrap();
+        let rows: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM feeds WHERE url='https://linearized.example/feed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
     }
 
     #[test]
@@ -1204,7 +1509,12 @@ mod tests {
         let state = read_state(&CoordinationPaths::for_database(&path)).unwrap();
         assert!(!state.active);
         assert_ne!(state.epoch, old_epoch);
-        assert_eq!(state.run.unwrap().status, MaintenanceStatus::Succeeded);
+        let run = state.run.unwrap();
+        assert_eq!(run.status, MaintenanceStatus::Succeeded);
+        let safety = run
+            .safety_backup
+            .expect("schema migration records its pre-write safety copy");
+        assert!(safety.exists());
     }
 
     #[test]
@@ -1264,7 +1574,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            WriterGate::open(&path)
+            MaintenanceFence::witness(&path)
                 .unwrap_err()
                 .to_string()
                 .contains("NEWER")

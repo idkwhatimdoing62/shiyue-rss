@@ -55,6 +55,9 @@ pub(crate) fn presentation(kind: ModalKind) -> ModalPresentation {
         WriteThought => {
             modal("写想法", "modal-write-thought", true, PrimaryField).with_default_width(460.0)
         }
+        DeleteExcerpt => {
+            modal("删除摘录", "modal-delete-excerpt", false, None).with_default_width(440.0)
+        }
         SaveWebPage => modal("保存网页", "modal-save-web-page", true, PrimaryField)
             .reader()
             .with_default_width(620.0)
@@ -242,12 +245,13 @@ mod tests {
 
     use super::*;
 
-    const ALL_KINDS: [ModalKind; 12] = [
+    const ALL_KINDS: [ModalKind; 13] = [
         ModalKind::AddFeed,
         ModalKind::DeleteFeed,
         ModalKind::Search,
         ModalKind::EditTags,
         ModalKind::WriteThought,
+        ModalKind::DeleteExcerpt,
         ModalKind::SaveWebPage,
         ModalKind::DeleteWebPage,
         ModalKind::AddResource,
@@ -275,6 +279,7 @@ mod tests {
             (ModalKind::Search, true, InitialFocus::PrimaryField),
             (ModalKind::EditTags, false, InitialFocus::PrimaryField),
             (ModalKind::WriteThought, true, InitialFocus::PrimaryField),
+            (ModalKind::DeleteExcerpt, false, InitialFocus::None),
             (ModalKind::SaveWebPage, true, InitialFocus::PrimaryField),
             (ModalKind::DeleteWebPage, false, InitialFocus::None),
             (ModalKind::AddResource, false, InitialFocus::PrimaryField),
@@ -331,6 +336,7 @@ mod tests {
     fn destructive_modals_never_request_primary_focus() {
         for kind in [
             ModalKind::DeleteFeed,
+            ModalKind::DeleteExcerpt,
             ModalKind::DeleteWebPage,
             ModalKind::DeleteResource,
             ModalKind::RestoreBackup,

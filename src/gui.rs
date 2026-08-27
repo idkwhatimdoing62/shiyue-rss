@@ -5,28 +5,35 @@
 //! 表达意图和 snapshot。后台模块只在短事务期间打开数据库，并通过 notice 请求 repaint。
 
 use anyhow::Result;
-use chrono::Utc;
-use eframe::egui::{self, ViewportCommand};
+use eframe::egui;
 use std::collections::{HashMap, HashSet};
-use std::error::Error as _;
-use std::hash::{Hash, Hasher};
-use std::io::Read as _;
 use std::ops::{Deref, DerefMut, Range};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
+use crate::article_document_presentation::{
+    ArticleDocumentPresenter, ArticleDocumentSource, PresentOutcome, PresentRequest,
+    PresentationIntent, RestoreSelection, SelectedQuote, article_visible_text,
+};
 use crate::article_library_lifecycle::{
     ArticleBatchAction, ArticleLibraryLifecycle, ArticleLibraryProjection, ArticleLifecycleChange,
     ChangeDisposition as ArticleChangeDisposition, LifecycleFailure, ProjectionScope,
 };
 use crate::backup::{BackupEntry, BackupProtection, BackupStore, DEFAULT_BACKUP_KEEP};
-use crate::config::{Config, Paths};
+use crate::config::Config;
 use crate::db::Db;
+use crate::desktop_library_projection::{
+    DesktopLibraryProjection, DesktopProjectionDemand, DesktopProjectionFact,
+    DesktopProjectionFrame, ProjectionFreshness, ResourceProjectionDemand,
+};
+use crate::desktop_runtime::{DesktopIntent, DesktopSession, Paths, SettingsChange};
+use crate::excerpt_thought_lifecycle::{
+    ArticleOrigin as ExcerptArticleOrigin, ExcerptCapture, ExcerptIdentityKind, ExcerptTarget,
+    ExcerptThoughtChange, ExcerptThoughtLifecycle, ExcerptThoughtProjection, ExcerptView,
+    ProjectionScope as ExcerptProjectionScope, SYSTEM_CLOCK,
+};
 use crate::feed_subscription::{
     ChangeDisposition, FeedSubscriptions, InitialRefreshOutcome, SubscriptionChange,
 };
@@ -41,207 +48,42 @@ use crate::knowledge_workflow::{
     ConnectionState, KnowledgeEngine, KnowledgeNotice, TaskKey, TaskKind as KnowledgeTaskKind,
     TaskSnapshot, TaskStage as KnowledgeTaskStage, TaskStatus as KnowledgeTaskStatus,
 };
+use crate::library_search::{
+    LibrarySearch, LibrarySearchResult, PrimaryIdentity, ResultType, SearchOrigin, SearchOutcome,
+    SearchRequest, SearchScope,
+};
 use crate::local_data_maintenance::{
     MaintenanceEngine, MaintenanceNotice, MaintenanceParticipant, MaintenanceRequest,
     MaintenanceSnapshot, MaintenanceStage, MaintenanceStatus,
 };
-use crate::model::{
-    Article, ArticleSelection, Feed, SearchHistoryEntry, SearchHit, SearchHitKind, TextAnchor,
-    resolve_excerpt_anchor,
-};
-use crate::notify;
+use crate::model::{Article, ArticleSelection, Feed, SearchHistoryEntry, TextAnchor};
 use crate::rss_refresh_workflow::{
     RefreshNotice, RefreshRunStatus, RefreshWorkflowStatus, RssRefreshWorkflow, RunId,
 };
-use crate::text::{self, Block};
+use crate::web_clipping_lifecycle::{
+    CancelDisposition, CaptureFailureKind, CaptureId, CaptureLease, CaptureRequest,
+    CaptureSnapshot, CaptureState, DeleteRequest as DeleteWebClippingRequest, WebClippingLifecycle,
+};
 
-const WINDOW_TITLE: &str = "拾阅 · RSS 阅读器";
 const FEED_PANEL_WIDTH: f32 = 240.0;
 const ARTICLE_PANEL_WIDTH: f32 = 340.0;
 const ARTICLE_MAX_WIDTH: f32 = 820.0;
-const IMAGE_WORKER_COUNT: usize = 4;
-const IMAGE_MAX_ATTEMPTS: u8 = 3;
-const IMAGE_MAX_BYTES: u64 = 25 * 1024 * 1024;
-
-pub fn run(paths: Paths, cfg: Config) -> Result<()> {
-    let native = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(WINDOW_TITLE)
-            .with_app_id("rrss-reading-optimized")
-            // The two navigation columns are intentionally fixed-width; give
-            // the reader enough initial room for a 780 px text measure.
-            .with_inner_size([1440.0, 860.0])
-            .with_min_inner_size([1120.0, 680.0]),
-        ..Default::default()
-    };
-    eframe::run_native(
-        WINDOW_TITLE,
-        native,
-        Box::new(move |cc| {
-            install_cjk_font(&cc.egui_ctx);
-            egui_extras::install_image_loaders(&cc.egui_ctx);
-            install_style(&cc.egui_ctx);
-            GuiApp::new(cc, &paths, cfg)
-                .map(|a| Box::new(a) as Box<dyn eframe::App>)
-                .map_err(Into::into)
-        }),
-    )
-    .map_err(|e| anyhow::anyhow!("egui 启动失败: {e}"))
-}
-
-// ---------- 后台模块适配 ----------
-
-/// GUI-only signals that are not part of RSS workflow state.
-struct Shared {
-    /// 窗口是否聚焦（UI 每帧写）；聚焦时不弹 toast。
-    focused: AtomicBool,
-}
-
-// ---------- 托盘 ----------
-
-fn build_tray() -> Result<(TrayIcon, MenuId, MenuId, MenuId)> {
-    let menu = Menu::new();
-    let toggle = MenuItem::new("显示 / 隐藏", true, None);
-    let fetch = MenuItem::new("抓取一次", true, None);
-    let quit = MenuItem::new("退出", true, None);
-    menu.append(&toggle)?;
-    menu.append(&fetch)?;
-    menu.append(&quit)?;
-    let tray = TrayIconBuilder::new()
-        .with_menu(Box::new(menu))
-        .with_tooltip("拾阅")
-        .with_icon(make_icon())
-        .build()?;
-    Ok((
-        tray,
-        toggle.id().clone(),
-        fetch.id().clone(),
-        quit.id().clone(),
-    ))
-}
-
-/// 代码里生成一个纯色托盘图标，免得塞资源文件。ponytail: 够用，想要好看再换 png。
-fn make_icon() -> Icon {
-    let (w, h) = (32u32, 32u32);
-    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-    for _ in 0..(w * h) {
-        rgba.extend_from_slice(&[0xE9, 0x5A, 0x2B, 0xFF]); // RSS 橙
-    }
-    Icon::from_rgba(rgba, w, h).expect("生成托盘图标失败")
-}
-
-const JB_MONO_REGULAR: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf");
-const JB_MONO_BOLD: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Bold.ttf");
-const LXGW_WENKAI_REGULAR: &[u8] = include_bytes!("../assets/fonts/LXGWWenKaiLite-Regular.ttf");
-const LXGW_WENKAI_MEDIUM: &[u8] = include_bytes!("../assets/fonts/LXGWWenKaiLite-Medium.ttf");
-
-/// Match the markdown editor's portable font stack: JetBrains Mono owns the
-/// Latin glyphs and LXGW WenKai Lite supplies Chinese. The files are embedded
-/// in the executable, so the layout no longer depends on the host machine.
-fn install_cjk_font(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-    for (name, bytes) in [
-        ("jb-mono", JB_MONO_REGULAR),
-        ("jb-mono-bold", JB_MONO_BOLD),
-        ("lxgw-wenkai", LXGW_WENKAI_REGULAR),
-        ("lxgw-wenkai-medium", LXGW_WENKAI_MEDIUM),
-    ] {
-        fonts.font_data.insert(
-            name.to_owned(),
-            egui::FontData::from_owned(bytes.to_vec()).into(),
-        );
-    }
-    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        let names = fonts.families.entry(family).or_default();
-        names.insert(0, "lxgw-wenkai".to_owned());
-        names.insert(0, "jb-mono".to_owned());
-    }
-    fonts.families.insert(
-        egui::FontFamily::Name("cjk-bold".into()),
-        vec!["jb-mono-bold".to_owned(), "lxgw-wenkai-medium".to_owned()],
-    );
-    ctx.set_fonts(fonts);
-}
-
-fn install_style(ctx: &egui::Context) {
-    let theme = ReaderTheme::sspai();
-    ctx.all_styles_mut(|style| {
-        style.text_styles.insert(
-            egui::TextStyle::Body,
-            egui::FontId::new(16.0, egui::FontFamily::Proportional),
-        );
-        style.text_styles.insert(
-            egui::TextStyle::Button,
-            egui::FontId::new(13.0, egui::FontFamily::Proportional),
-        );
-        style.text_styles.insert(
-            egui::TextStyle::Small,
-            egui::FontId::new(12.0, egui::FontFamily::Proportional),
-        );
-        style.spacing.item_spacing = egui::vec2(8.0, 7.0);
-        style.spacing.button_padding = egui::vec2(9.0, 5.0);
-        style.visuals.window_fill = theme.canvas;
-        style.visuals.panel_fill = theme.panel;
-        style.visuals.extreme_bg_color = theme.code_bg;
-        style.visuals.faint_bg_color = theme.code_bg;
-        style.visuals.hyperlink_color = theme.link;
-        style.visuals.override_text_color = Some(theme.text);
-        style.visuals.widgets.noninteractive.bg_stroke.color = theme.border;
-        style.visuals.widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
-        style.visuals.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
-        style.visuals.widgets.hovered.weak_bg_fill = theme.accent.gamma_multiply(0.08);
-        style.visuals.widgets.active.weak_bg_fill = theme.accent.gamma_multiply(0.16);
-        style.visuals.selection.bg_fill = theme.accent.gamma_multiply(0.22);
-        style.visuals.selection.stroke.color = theme.text;
-        for widget in [
-            &mut style.visuals.widgets.noninteractive,
-            &mut style.visuals.widgets.inactive,
-            &mut style.visuals.widgets.hovered,
-            &mut style.visuals.widgets.active,
-            &mut style.visuals.widgets.open,
-        ] {
-            widget.corner_radius = egui::CornerRadius::same(5);
-        }
-        // Only the article body opts into selection. This keeps sidebar,
-        // metadata and saved-quote labels out of a cross-widget drag.
-        style.interaction.selectable_labels = false;
-        style.interaction.multi_widget_text_select = true;
-    });
-}
 
 // ---------- App ----------
 
-struct GuiApp {
-    db: DbSlot,
+pub(crate) struct GuiApp {
     db_path: PathBuf,
-    shared: Arc<Shared>,
     rss_refresh: RssRefreshWorkflow,
     rss_last_terminal_notice: Option<RunId>,
-    notifications_enabled: bool,
-    _tray: TrayIcon, // 持有，drop 即销毁托盘
-    tray_toggle: MenuId,
-    tray_fetch: MenuId,
-    tray_quit: MenuId,
-    feeds: Vec<(Feed, i64)>,
-    articles: Vec<Article>,
-    article_tags: HashMap<i64, Vec<String>>,
-    /// 中栏当前展示普通订阅文章，还是统一的文章收藏库。
-    /// 收藏库中的本地网页快照 id。用集合缓存，避免 UI 每帧逐条查库。
-    web_clipping_ids: HashSet<i64>,
-    saved_article_count: usize,
-    read_later_count: usize,
+    feeds: Vec<Feed>,
     batch_mode: bool,
     batch_selection: HashSet<i64>,
     // 选中态存 id 而非下标，后台刷新重排后也不跳（ADR-14）。
     sel_article_id: Option<i64>,
     article_route_memory: HashMap<ArticleCollection, ArticleRouteMemory>,
     current_body_scroll: f32,
-    hidden: bool,
-    quitting: bool,
     body_article_id: Option<i64>,
-    image_cache: HashMap<String, ImageState>,
-    image_job_tx: std_mpsc::Sender<String>,
-    image_event_rx: std_mpsc::Receiver<ImageEvent>,
+    article_document: ArticleDocumentPresenter,
     image_store: Arc<ImageStore>,
     backup_store: BackupStore,
     maintenance_engine: MaintenanceEngine,
@@ -252,32 +94,39 @@ struct GuiApp {
     route_storage_key: Option<String>,
     storage_overview: Option<StorageOverview>,
     storage_message: Option<String>,
-    formula_cache: HashMap<String, FormulaState>,
-    formula_job_tx: std_mpsc::Sender<FormulaJob>,
-    formula_event_rx: std_mpsc::Receiver<FormulaEvent>,
-    /// 左栏入口显示的有效摘录数量；写入或删除后立即刷新。
-    saved_selection_count: usize,
-    /// 已归档文章数量。
-    archived_article_count: usize,
     pending_selection_anchor: Option<ArticleSelection>,
+    pending_excerpt_selection_id: Option<(i64, i64)>,
     pending_body_scroll: Option<(i64, f32)>,
     /// 快捷操作浮层中当前等待处理的选区。
     selection_popup_geometry: Option<SelectionPopupGeometry>,
     /// 每次新选区使用不同的浮层 id，避免旧浮层的点击关闭事件误伤新浮层。
     selection_popup_generation: u64,
     /// 跨标题、正文、列表和图片的文章级拖选状态。
-    article_selection_drag: Option<ArticleSelectionDrag>,
-    web_clip_event_tx: std_mpsc::Sender<WebClipEvent>,
-    web_clip_event_rx: std_mpsc::Receiver<WebClipEvent>,
-    web_clip_request_generation: u64,
+    web_clipping_lifecycle: WebClippingLifecycle,
+    consumed_web_clipping_terminal: Option<(CaptureId, u64)>,
+    search_event_tx: std_mpsc::Sender<SearchEvent>,
+    search_event_rx: std_mpsc::Receiver<SearchEvent>,
+    search_request_generation: u64,
     resource_query: String,
     resource_filter: ResourceFilter,
-    resource_search_results: Vec<serde_json::Value>,
+    resource_search_results: Vec<LibrarySearchResult>,
+    resource_searching: bool,
+    resource_search_request: Option<u64>,
     resource_search_error: Option<String>,
     ai_api_key_draft: String,
     ai_settings_message: Option<String>,
+    desktop_projection: DesktopLibraryProjection,
+    desktop_projection_frame: DesktopProjectionFrame,
     knowledge_engine: KnowledgeEngine,
+    knowledge_watch: HashSet<TaskKey>,
+    pending_knowledge_notices: Vec<TaskKey>,
     connection_state: Option<ConnectionState>,
+    /// Declared after every background workflow so their Drop implementations
+    /// stop accepting work before the long-lived UI database handle closes.
+    db: DbSlot,
+    /// Declared last so native desktop resources are released after the
+    /// workflow engines and their database participants.
+    desktop: DesktopSession,
 }
 
 struct DbSlot(Option<Db>);
@@ -381,37 +230,15 @@ fn projection_scope_for_route(route: Route) -> Option<ProjectionScope> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn adopt_article_projection_data(
-    projection: ArticleLibraryProjection,
-    articles: &mut Vec<Article>,
-    article_tags: &mut HashMap<i64, Vec<String>>,
-    fixed_bookmark_ids: &mut HashSet<i64>,
-    saved_count: &mut usize,
-    read_later_count: &mut usize,
-    archived_count: &mut usize,
-    feeds: &mut [(Feed, i64)],
-) -> ProjectionScope {
-    let ArticleLibraryProjection {
-        scope,
-        articles: projected_articles,
-        tags,
-        fixed_bookmark_ids: projected_fixed_ids,
-        counts,
-        feed_unread,
-    } = projection;
-    *articles = projected_articles;
-    *article_tags = tags;
-    *fixed_bookmark_ids = projected_fixed_ids;
-    *saved_count = counts.bookmarks;
-    *read_later_count = counts.read_later;
-    *archived_count = counts.archived;
-    for (feed_id, unread) in feed_unread {
-        if let Some((_, current)) = feeds.iter_mut().find(|(feed, _)| feed.id == feed_id) {
-            *current = i64::try_from(unread).unwrap_or(i64::MAX);
-        }
-    }
-    scope
+fn reconcile_article_selection(
+    selected: Option<i64>,
+    remembered: Option<i64>,
+    articles: &[Article],
+) -> Option<i64> {
+    let present = |id| articles.iter().any(|article| article.id == id);
+    selected
+        .filter(|id| present(*id))
+        .or_else(|| remembered.filter(|id| present(*id)))
 }
 
 #[derive(Debug)]
@@ -438,6 +265,7 @@ impl Default for ResourceAddDialog {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResourceEditDialog {
     id: i64,
+    hydrated: bool,
     title: String,
     purpose_zh: String,
     note: String,
@@ -471,10 +299,28 @@ struct ResourceImportDialog {
 struct SearchDialog {
     query: String,
     searched_query: String,
-    results: Vec<SearchHit>,
+    results: Vec<LibrarySearchResult>,
     error: Option<String>,
     focus_input: bool,
     history: Vec<SearchHistoryEntry>,
+    searching: bool,
+    active_request: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchTarget {
+    Modal,
+    ResourceRoute,
+}
+
+struct SearchEvent {
+    request_id: u64,
+    target: SearchTarget,
+    result: Result<SearchOutcome, String>,
+}
+
+fn accepts_search_response(active_request: Option<u64>, incoming_request: u64) -> bool {
+    active_request == Some(incoming_request)
 }
 
 #[derive(Debug, Clone)]
@@ -492,8 +338,7 @@ struct WebClipDialog {
     title: String,
     /// 粘贴 HTML 时用于解析相对链接；网址抓取模式会自动使用最终地址。
     base_url: String,
-    fetching: bool,
-    active_request: Option<u64>,
+    capture: Option<CaptureLease>,
     error: Option<String>,
     focus_input: bool,
 }
@@ -504,19 +349,11 @@ impl Default for WebClipDialog {
             source: String::new(),
             title: String::new(),
             base_url: String::new(),
-            fetching: false,
-            active_request: None,
+            capture: None,
             error: None,
             focus_input: true,
         }
     }
-}
-
-enum WebClipEvent {
-    Complete {
-        request_id: u64,
-        result: Result<crate::web_clip::FetchedWebClip, String>,
-    },
 }
 
 #[derive(Debug, Clone)]
@@ -525,21 +362,48 @@ struct DeleteWebClipDialog {
     title: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SelectedQuote {
-    article_id: i64,
-    text: String,
-    start_offset: Option<i64>,
-    end_offset: Option<i64>,
-    anchor_prefix: String,
-    anchor_suffix: String,
+impl SelectedQuote {
+    fn capture(&self) -> ExcerptCapture {
+        ExcerptCapture {
+            article_id: self.article_id,
+            selected_text: self.text.clone(),
+            anchor: TextAnchor {
+                start_offset: self.start_offset,
+                end_offset: self.end_offset,
+                prefix: self.anchor_prefix.clone(),
+                suffix: self.anchor_suffix.clone(),
+            },
+        }
+    }
+
+    fn from_excerpt(excerpt: &ExcerptView) -> Self {
+        Self {
+            article_id: excerpt.article_id,
+            text: excerpt.selected_text.clone(),
+            start_offset: excerpt.anchor.start_offset,
+            end_offset: excerpt.anchor.end_offset,
+            anchor_prefix: excerpt.anchor.prefix.clone(),
+            anchor_suffix: excerpt.anchor.suffix.clone(),
+        }
+    }
 }
 
+#[derive(Debug, Clone)]
 struct CommentDialog {
     quote: SelectedQuote,
+    target: ExcerptTarget,
     draft: String,
+    original: String,
     error: Option<String>,
     focus_input: bool,
+}
+
+#[derive(Debug, Clone)]
+struct DeleteExcerptDialog {
+    excerpt_id: i64,
+    selected_text: String,
+    has_thought: bool,
+    refresh_scope: ExcerptProjectionScope,
 }
 
 enum ModalState {
@@ -548,6 +412,7 @@ enum ModalState {
     Search(SearchDialog),
     EditTags(TagDialog),
     WriteThought(CommentDialog),
+    DeleteExcerpt(DeleteExcerptDialog),
     SaveWebPage(WebClipDialog),
     DeleteWebPage(DeleteWebClipDialog),
     AddResource(ResourceAddDialog),
@@ -565,6 +430,7 @@ impl ModalPayload for ModalState {
             Self::Search(_) => ModalKind::Search,
             Self::EditTags(_) => ModalKind::EditTags,
             Self::WriteThought(_) => ModalKind::WriteThought,
+            Self::DeleteExcerpt(_) => ModalKind::DeleteExcerpt,
             Self::SaveWebPage(_) => ModalKind::SaveWebPage,
             Self::DeleteWebPage(_) => ModalKind::DeleteWebPage,
             Self::AddResource(_) => ModalKind::AddResource,
@@ -580,18 +446,19 @@ impl ModalPayload for ModalState {
             Self::AddFeed(dialog) => !dialog.url.trim().is_empty(),
             Self::Search(_) => false,
             Self::EditTags(dialog) => dialog.draft != dialog.original,
-            Self::WriteThought(dialog) => !dialog.draft.trim().is_empty(),
+            Self::WriteThought(dialog) => dialog.draft != dialog.original,
             Self::SaveWebPage(dialog) => {
                 !dialog.source.trim().is_empty()
                     || !dialog.title.trim().is_empty()
                     || !dialog.base_url.trim().is_empty()
-                    || dialog.fetching
+                    || dialog.capture.is_some()
             }
             Self::AddResource(dialog) => {
                 !dialog.url.trim().is_empty() || !dialog.note.trim().is_empty() || dialog.private
             }
             Self::ImportResources(dialog) => dialog.selected != dialog.initial_selected,
             Self::DeleteFeed { .. }
+            | Self::DeleteExcerpt(_)
             | Self::DeleteWebPage(_)
             | Self::DeleteResource { .. }
             | Self::RestoreBackup(_)
@@ -599,9 +466,10 @@ impl ModalPayload for ModalState {
         }
     }
 
+    #[cfg(test)]
     fn active_request_id(&self) -> Option<u64> {
         match self {
-            Self::SaveWebPage(dialog) => dialog.active_request,
+            Self::Search(dialog) => dialog.active_request,
             _ => None,
         }
     }
@@ -697,109 +565,6 @@ fn discard_guard_controls(ui: &mut egui::Ui, visible: bool) -> Option<DiscardDec
     decision
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ArticleDocCursor {
-    span_index: usize,
-    local_char: usize,
-    char_index: usize,
-}
-
-#[derive(Debug, Clone)]
-struct ArticleSelectionDrag {
-    article_id: i64,
-    anchor: ArticleDocCursor,
-    focus: ArticleDocCursor,
-}
-
-struct RenderedArticleSpan {
-    chars: Range<usize>,
-    galley: Arc<egui::Galley>,
-    global_from_galley: egui::emath::TSTransform,
-    global_rect: egui::Rect,
-    source_layer: egui::LayerId,
-    /// Cursor calculated by egui while this row owns the pointer.  Keeping
-    /// this local hit-test result avoids DPI/viewport transform differences
-    /// between `Context::pointer_interact_pos` and a nested scroll layer.
-    pointer_local_char: Option<usize>,
-}
-
-#[derive(Default)]
-struct ArticleSelectionFrame {
-    plain_text: String,
-    char_len: usize,
-    spans: Vec<RenderedArticleSpan>,
-}
-
-impl ArticleSelectionFrame {
-    fn push_span(&mut self, text: &str, mut span: RenderedArticleSpan) {
-        if text.is_empty() {
-            return;
-        }
-
-        // Keep each rendered block as a distinct paragraph in the article
-        // selection model.  The separator is deliberately kept outside the
-        // span range so a drag ending at either edge never returns an
-        // unexpected leading/trailing newline.
-        if !self.plain_text.is_empty() {
-            self.plain_text.push_str("\n\n");
-            self.char_len += 2;
-        }
-
-        let start = self.char_len;
-        self.plain_text.push_str(text);
-        self.char_len += text.chars().count();
-        span.chars = start..self.char_len;
-        self.spans.push(span);
-    }
-}
-
-struct ArticleSelectionResult {
-    popup_request: Option<SelectionPopupRequest>,
-    drag_started: bool,
-}
-
-/// A byte range in an article run that came from an HTML anchor.
-///
-/// Keeping this separate from `Block::Link` lets one rendered label retain
-/// link styling while the article-level selection model treats it as plain
-/// text for copying and quoting.
-#[derive(Clone, Debug)]
-struct ArticleLinkRange {
-    range: Range<usize>,
-    url: String,
-}
-
-#[derive(Debug)]
-struct ImageFailure {
-    message: String,
-    detail: String,
-    attempts: u8,
-    retryable: bool,
-}
-
-enum ImageEvent {
-    Progress {
-        uri: String,
-        attempt: u8,
-    },
-    Complete {
-        uri: String,
-        result: Result<Arc<[u8]>, ImageFailure>,
-    },
-}
-
-enum ImageState {
-    Loading {
-        started: Instant,
-        attempt: u8,
-    },
-    Ready {
-        bytes: Arc<[u8]>,
-        dimensions: Option<(u32, u32)>,
-    },
-    Failed(ImageFailure),
-}
-
 #[derive(Debug, Clone)]
 struct StorageOverview {
     database_bytes: u64,
@@ -819,26 +584,6 @@ enum StorageAction {
     OpenFolder,
     RequestRestore(BackupEntry),
     ConfirmRestore(BackupEntry),
-}
-
-#[derive(Clone)]
-struct FormulaJob {
-    key: String,
-    source: String,
-    display: bool,
-}
-
-enum FormulaEvent {
-    Complete {
-        key: String,
-        result: Result<Arc<[u8]>, String>,
-    },
-}
-
-enum FormulaState {
-    Loading,
-    Ready(Arc<[u8]>),
-    Failed(String),
 }
 
 impl GuiApp {
@@ -862,24 +607,9 @@ impl GuiApp {
                     self.sel_article_id = None;
                     self.body_article_id = None;
                     self.current_body_scroll = 0.0;
-                    self.article_selection_drag = None;
                     self.clear_selection_popover();
-                    match to {
-                        Route::Articles(_) => self.load_articles(),
-                        Route::Archive => self.load_articles(),
-                        Route::Storage => self.refresh_storage_overview(),
-                        Route::Resources | Route::Excerpts => {}
-                    }
-                    if let Some(collection) = to.article_collection()
-                        && let Some(memory) = self.article_route_memory.get(&collection).copied()
-                        && memory
-                            .selected_article_id
-                            .is_some_and(|id| self.articles.iter().any(|article| article.id == id))
-                    {
-                        self.sel_article_id = memory.selected_article_id;
-                        self.pending_body_scroll = memory
-                            .selected_article_id
-                            .map(|id| (id, memory.body_scroll));
+                    if to == Route::Storage {
+                        self.refresh_storage_overview();
                     }
                 }
                 UiEffect::PersistRoute(key) => self.route_storage_key = Some(key),
@@ -1040,7 +770,12 @@ impl GuiApp {
         }
     }
 
-    fn new(cc: &eframe::CreationContext, paths: &Paths, cfg: Config) -> Result<Self> {
+    pub(crate) fn new(
+        cc: &eframe::CreationContext,
+        paths: &Paths,
+        cfg: Config,
+        desktop: DesktopSession,
+    ) -> Result<Self> {
         let backup_store = BackupStore::open(&paths.backup_dir)?;
         // Crash recovery must run before this process opens any long-lived
         // database connection, otherwise its own shared writer lease would
@@ -1054,56 +789,29 @@ impl GuiApp {
         let resource_enrichment_config = cfg.resource_enrichment.clone();
         let knowledge_engine =
             KnowledgeEngine::start(paths.db_file.clone(), resource_enrichment_config.clone())?;
-        let shared = Arc::new(Shared {
-            focused: AtomicBool::new(true),
-        });
+        let desktop_projection = DesktopLibraryProjection::start(
+            paths.db_file.clone(),
+            knowledge_engine.projection_observer(),
+            cc.egui_ctx.clone(),
+        )?;
         let repaint = cc.egui_ctx.clone();
         let rss_refresh =
             RssRefreshWorkflow::start_scheduled(paths.db_file.clone(), cfg.clone(), move || {
                 repaint.request_repaint()
             })?;
 
-        let (tray, tray_toggle, tray_fetch, tray_quit) = build_tray()?;
-        let (image_job_tx, image_job_rx) = std_mpsc::channel();
-        let (image_event_tx, image_event_rx) = std_mpsc::channel();
-        let (formula_job_tx, formula_job_rx) = std_mpsc::channel();
-        let (formula_event_tx, formula_event_rx) = std_mpsc::channel();
-        let (web_clip_event_tx, web_clip_event_rx) = std_mpsc::channel();
-        let image_client = reqwest::blocking::Client::builder()
-            // A single article can expose many CDN images at once. HTTP/1.1
-            // plus a small worker pool is markedly steadier than opening an
-            // unbounded number of HTTP/2 streams on flaky desktop networks.
-            .http1_only()
-            .connect_timeout(Duration::from_secs(8))
-            .timeout(Duration::from_secs(30))
-            .pool_idle_timeout(Duration::from_secs(30))
-            .pool_max_idle_per_host(IMAGE_WORKER_COUNT)
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                if attempt.previous().len() > 10 {
-                    return attempt.error("图片重定向次数过多");
-                }
-                if let Err(message) = crate::web_clip::validate_public_url(attempt.url()) {
-                    return attempt.error(message);
-                }
-                attempt.follow()
-            }))
-            .user_agent(concat!("Shiyue/", env!("CARGO_PKG_VERSION")))
-            .build()?;
+        let (search_event_tx, search_event_rx) = std_mpsc::channel();
         let image_store = Arc::new(ImageStore::open(&paths.image_cache_dir)?);
         let _ = image_store.prune_to(DEFAULT_LIMIT_BYTES);
+        let web_clipping_lifecycle = WebClippingLifecycle::start(paths.db_file.clone());
         let participants: Vec<Arc<dyn MaintenanceParticipant>> = vec![
             rss_refresh.maintenance_participant(),
             knowledge_engine.maintenance_participant(),
+            desktop_projection.maintenance_participant(),
+            web_clipping_lifecycle.maintenance_participant(),
         ];
         let maintenance_engine =
             MaintenanceEngine::start(paths.db_file.clone(), backup_store.clone(), participants)?;
-        spawn_image_workers(
-            image_client,
-            image_job_rx,
-            image_event_tx,
-            image_store.clone(),
-        );
-        spawn_formula_worker(formula_job_rx, formula_event_tx);
         let restored_route = cc
             .storage
             .and_then(|storage| storage.get_string("shiyue.desktop.route"))
@@ -1112,33 +820,17 @@ impl GuiApp {
         let mut ui_state = InteractionState::default();
         ui_state.initialize_route(restored_route);
         let mut app = GuiApp {
-            db: DbSlot(Some(db)),
             db_path: paths.db_file.clone(),
-            shared,
             rss_refresh,
             rss_last_terminal_notice: None,
-            notifications_enabled: cfg.notifications,
-            _tray: tray,
-            tray_toggle,
-            tray_fetch,
-            tray_quit,
             feeds: Vec::new(),
-            articles: Vec::new(),
-            article_tags: HashMap::new(),
-            web_clipping_ids: HashSet::new(),
-            saved_article_count: 0,
-            read_later_count: 0,
             batch_mode: false,
             batch_selection: HashSet::new(),
             sel_article_id: None,
             article_route_memory: HashMap::new(),
             current_body_scroll: 0.0,
-            hidden: false,
-            quitting: false,
             body_article_id: None,
-            image_cache: HashMap::new(),
-            image_job_tx,
-            image_event_rx,
+            article_document: ArticleDocumentPresenter::new(image_store.clone())?,
             image_store,
             backup_store,
             maintenance_engine,
@@ -1149,83 +841,116 @@ impl GuiApp {
             route_storage_key: restored_route.stable_key(),
             storage_overview: None,
             storage_message: None,
-            formula_cache: HashMap::new(),
-            formula_job_tx,
-            formula_event_rx,
-            saved_selection_count: 0,
-            archived_article_count: 0,
             pending_selection_anchor: None,
+            pending_excerpt_selection_id: None,
             pending_body_scroll: None,
             selection_popup_geometry: None,
             selection_popup_generation: 0,
-            article_selection_drag: None,
-            web_clip_event_tx,
-            web_clip_event_rx,
-            web_clip_request_generation: 0,
+            web_clipping_lifecycle,
+            consumed_web_clipping_terminal: None,
+            search_event_tx,
+            search_event_rx,
+            search_request_generation: 0,
             resource_query: String::new(),
             resource_filter: ResourceFilter::Active,
             resource_search_results: Vec::new(),
+            resource_searching: false,
+            resource_search_request: None,
             resource_search_error: None,
             ai_api_key_draft: String::new(),
             ai_settings_message: None,
+            desktop_projection,
+            desktop_projection_frame: DesktopProjectionFrame::default(),
             knowledge_engine,
+            knowledge_watch: HashSet::new(),
+            pending_knowledge_notices: Vec::new(),
             connection_state: None,
+            db: DbSlot(Some(db)),
+            desktop,
         };
         app.reload();
-        app.refresh_saved_selection_count();
         Ok(app)
     }
 
-    fn refresh_saved_selection_count(&mut self) {
-        self.saved_selection_count = self.db.saved_selection_count().unwrap_or_default();
+    fn current_excerpt_projection_scope(&self) -> ExcerptProjectionScope {
+        match self.ui_state.route() {
+            Route::Excerpts => ExcerptProjectionScope::Library,
+            Route::Articles(_) => self
+                .sel_article_id
+                .map(ExcerptProjectionScope::Article)
+                .unwrap_or(ExcerptProjectionScope::Library),
+            _ => ExcerptProjectionScope::Library,
+        }
     }
 
-    fn refresh_article_library_metadata(&mut self) {
-        let scope = self
-            .current_article_projection_scope()
-            .unwrap_or(ProjectionScope::ArticleBookmarks);
-        match ArticleLibraryLifecycle::new(&self.db).project(scope) {
-            Ok(projection) => self.adopt_article_library_metadata(&projection),
-            Err(error) => self.report_article_library_failure("刷新文章资料", error),
-        }
+    fn desktop_article_projection_scope(&self) -> ProjectionScope {
+        self.current_article_projection_scope()
+            .unwrap_or(ProjectionScope::ArticleBookmarks)
+    }
+
+    fn article_projection(&self, scope: ProjectionScope) -> Option<Arc<ArticleLibraryProjection>> {
+        self.desktop_projection_frame
+            .article(scope)
+            .filter(|view| !matches!(view.freshness, ProjectionFreshness::Maintenance))
+            .and_then(|view| view.data.clone())
+    }
+
+    fn current_article_projection(&self) -> Option<Arc<ArticleLibraryProjection>> {
+        self.article_projection(self.desktop_article_projection_scope())
+    }
+
+    fn current_article_freshness(&self) -> Option<ProjectionFreshness> {
+        self.desktop_projection_frame
+            .article(self.desktop_article_projection_scope())
+            .map(|view| view.freshness.clone())
+    }
+
+    fn excerpt_projection(
+        &self,
+        scope: ExcerptProjectionScope,
+    ) -> Option<Arc<ExcerptThoughtProjection>> {
+        self.desktop_projection_frame
+            .excerpt(scope)
+            .filter(|view| !matches!(view.freshness, ProjectionFreshness::Maintenance))
+            .and_then(|view| view.data.clone())
+    }
+
+    fn current_excerpt_projection(&self) -> Option<Arc<ExcerptThoughtProjection>> {
+        self.excerpt_projection(self.current_excerpt_projection_scope())
+    }
+
+    fn excerpt_count(&self) -> usize {
+        self.current_excerpt_projection()
+            .as_deref()
+            .map_or(0, |projection| projection.counts.library_excerpts)
+    }
+
+    fn report_excerpt_failure(
+        &mut self,
+        action: &str,
+        error: crate::excerpt_thought_lifecycle::LifecycleFailure,
+    ) {
+        tracing::warn!(
+            kind = ?error.kind,
+            operation = ?error.operation,
+            detail = %error.technical_detail,
+            "excerpt/thought lifecycle failed"
+        );
+        self.notice(format!("{action}失败：{}", error.user_message));
     }
 
     fn current_article_projection_scope(&self) -> Option<ProjectionScope> {
         projection_scope_for_route(self.ui_state.route())
     }
 
-    fn adopt_article_library_metadata(&mut self, projection: &ArticleLibraryProjection) {
-        self.saved_article_count = projection.counts.bookmarks;
-        self.read_later_count = projection.counts.read_later;
-        self.archived_article_count = projection.counts.archived;
-        for (feed_id, unread) in &projection.feed_unread {
-            if let Some((_, current)) = self.feeds.iter_mut().find(|(feed, _)| feed.id == *feed_id)
-            {
-                *current = i64::try_from(*unread).unwrap_or(i64::MAX);
-            }
-        }
+    fn accept_article_projection(&mut self, projection: ArticleLibraryProjection) {
+        self.desktop_projection
+            .accept(DesktopProjectionFact::adopt_article(projection));
     }
 
-    fn adopt_article_library_projection(&mut self, projection: ArticleLibraryProjection) {
-        let _scope = adopt_article_projection_data(
-            projection,
-            &mut self.articles,
-            &mut self.article_tags,
-            &mut self.web_clipping_ids,
-            &mut self.saved_article_count,
-            &mut self.read_later_count,
-            &mut self.archived_article_count,
-            &mut self.feeds,
-        );
-        if self
-            .sel_article_id
-            .is_some_and(|id| !self.articles.iter().any(|article| article.id == id))
-        {
-            self.sel_article_id = None;
-            self.body_article_id = None;
-            self.clear_selection_popover();
-            self.article_selection_drag = None;
-        }
+    fn accept_excerpt_projection(&mut self, projection: ExcerptThoughtProjection) {
+        self.desktop_projection
+            .accept(DesktopProjectionFact::adopt_excerpt(projection));
     }
 
     fn report_article_library_failure(&mut self, action: &str, error: LifecycleFailure) {
@@ -1249,7 +974,7 @@ impl GuiApp {
         })?;
         let outcome = ArticleLibraryLifecycle::new(&self.db).apply(change, scope)?;
         let disposition = outcome.disposition;
-        self.adopt_article_library_projection(outcome.projection);
+        self.accept_article_projection(outcome.projection);
         Ok(disposition)
     }
 
@@ -1276,6 +1001,8 @@ impl GuiApp {
         if !self.db.is_open() {
             anyhow::bail!("MAINTENANCE_IN_PROGRESS: 资料维护已经在进行中");
         }
+        self.desktop_projection
+            .accept(DesktopProjectionFact::MaintenanceStarted);
         self.db.close();
         match self.maintenance_engine.request(request) {
             Ok(snapshot) => {
@@ -1316,7 +1043,8 @@ impl GuiApp {
             }
         }
 
-        let active = crate::local_data_maintenance::WriterGate::maintenance_active(&self.db_path)
+        let active = crate::local_data_maintenance::MaintenanceFence::observe(&self.db_path)
+            .map(|availability| availability.is_active())
             .unwrap_or(true);
         if active
             && self
@@ -1332,7 +1060,6 @@ impl GuiApp {
             match self.db.reopen(&self.db_path) {
                 Ok(()) => {
                     self.reload();
-                    self.refresh_saved_selection_count();
                     self.storage_overview = None;
                 }
                 Err(error) => {
@@ -1369,11 +1096,9 @@ impl GuiApp {
                         self.reload();
                     }
                     let feeds_with_new = completed.feeds_with_new_articles();
-                    if completed.new_article_count > 0
-                        && self.notifications_enabled
-                        && !self.shared.focused.load(Ordering::Relaxed)
-                    {
-                        notify::notify_new(feeds_with_new, completed.new_article_count);
+                    if completed.new_article_count > 0 {
+                        self.desktop
+                            .notify_new_articles(feeds_with_new, completed.new_article_count);
                     }
                     match completed.status {
                         RefreshRunStatus::Degraded => self.notice(format!(
@@ -1512,6 +1237,35 @@ impl GuiApp {
             .show(root_ui, |ui| {
                 ui.heading("资料库与离线缓存");
                 ui.label("资料默认保存在本机；图片缓存和备份均可独立清理。所有恢复都会先创建安全副本。");
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("界面显示").strong());
+                let previous_scale = self.desktop.settings().ui_scale_percent;
+                let mut selected_scale = previous_scale;
+                ui.horizontal(|ui| {
+                    ui.label("界面缩放");
+                    egui::ComboBox::from_id_salt("ui-scale-percent")
+                        .selected_text(format!("{}%", selected_scale))
+                        .show_ui(ui, |ui| {
+                            for &percent in self.desktop.ui_scale_options() {
+                                ui.selectable_value(
+                                    &mut selected_scale,
+                                    percent,
+                                    format!("{percent}%"),
+                                );
+                            }
+                        });
+                    ui.label("字号和控件会立即按比例调整");
+                });
+                if selected_scale != previous_scale {
+                    self.storage_message = Some(match self
+                        .desktop
+                        .apply(SettingsChange::UiScale(selected_scale), &ctx)
+                    {
+                        Ok(()) => format!("界面缩放已设为 {selected_scale}%"),
+                        Err(error) => format!("界面缩放未修改：{error:#}"),
+                    });
+                }
+                ui.separator();
                 ui.add_space(8.0);
                 if let Some(overview) = &overview {
                     egui::Grid::new("storage-usage").num_columns(2).show(ui, |ui| {
@@ -1749,7 +1503,7 @@ impl GuiApp {
 
     fn reload(&mut self) {
         match FeedSubscriptions::session(self.db_path.clone(), &self.rss_refresh).list() {
-            Ok(feeds) => self.feeds = feeds,
+            Ok(feeds) => self.feeds = feeds.into_iter().map(|(feed, _)| feed).collect(),
             Err(error) => {
                 tracing::warn!(detail = %error.technical_detail, "reload subscriptions failed");
                 self.notice(error.user_message);
@@ -1758,10 +1512,10 @@ impl GuiApp {
         if let Some(ArticleCollection::Feed(selected)) = self.ui_state.route().article_collection()
         {
             let selected_is_valid =
-                selected.is_some_and(|id| self.feeds.iter().any(|(feed, _)| feed.id == id));
+                selected.is_some_and(|id| self.feeds.iter().any(|feed| feed.id == id));
             if !selected_is_valid {
                 let route = Route::Articles(ArticleCollection::Feed(
-                    self.feeds.first().map(|(feed, _)| feed.id),
+                    self.feeds.first().map(|feed| feed.id),
                 ));
                 let effects = self
                     .ui_state
@@ -1769,7 +1523,6 @@ impl GuiApp {
                 self.apply_ui_effects(effects);
             }
         }
-        self.load_articles();
     }
 
     fn show_feed_dialogs(&mut self, ctx: &egui::Context) {
@@ -1899,54 +1652,29 @@ impl GuiApp {
         }
     }
 
-    fn load_articles(&mut self) {
-        let Some(scope) = self.current_article_projection_scope() else {
-            self.articles.clear();
-            self.article_tags.clear();
-            self.web_clipping_ids.clear();
-            self.refresh_article_library_metadata();
-            return;
-        };
-        match ArticleLibraryLifecycle::new(&self.db).project(scope) {
-            Ok(projection) => self.adopt_article_library_projection(projection),
-            Err(error) => {
-                self.articles.clear();
-                self.article_tags.clear();
-                self.web_clipping_ids.clear();
-                self.report_article_library_failure("读取文章资料", error);
-            }
-        }
-    }
-
     fn select_feed(&mut self, id: i64) {
         let route = Route::Articles(ArticleCollection::Feed(Some(id)));
-        if self.ui_state.route() == route {
-            self.load_articles();
-        } else {
+        if self.ui_state.route() != route {
             self.navigate(route);
         }
     }
 
     fn select_saved_articles(&mut self) {
         let route = Route::Articles(ArticleCollection::Saved);
-        if self.ui_state.route() == route {
-            self.load_articles();
-        } else {
+        if self.ui_state.route() != route {
             self.navigate(route);
         }
     }
 
     fn select_read_later(&mut self) {
         let route = Route::Articles(ArticleCollection::ReadLater);
-        if self.ui_state.route() == route {
-            self.load_articles();
-        } else {
+        if self.ui_state.route() != route {
             self.navigate(route);
         }
     }
 
     fn open_search(&mut self) {
-        let history = self.db.search_history(12).unwrap_or_default();
+        let history = LibrarySearch::new(&self.db).history(12).unwrap_or_default();
         if self.search_dialog().is_none() {
             self.open_modal(ModalState::Search(SearchDialog::default()));
         }
@@ -1958,66 +1686,194 @@ impl GuiApp {
         self.clear_selection_popover();
     }
 
-    fn run_search(&mut self) {
+    fn run_search(&mut self, ctx: &egui::Context) {
         let Some(dialog) = self.search_dialog() else {
             return;
         };
         let query = dialog.query.trim().to_owned();
-        let result = if query.is_empty() {
-            None
-        } else {
-            Some(self.db.search_library(&query, 200))
-        };
-        let Some(dialog) = self.search_dialog_mut() else {
-            return;
-        };
-        dialog.searched_query = query.clone();
-        dialog.error = None;
-        dialog.results.clear();
         if query.is_empty() {
-            return;
-        }
-        match result.expect("non-empty search has a result") {
-            Ok(results) => dialog.results = results,
-            Err(error) => dialog.error = Some(format!("搜索失败：{error}")),
-        }
-    }
-
-    fn open_search_result(&mut self, hit: &SearchHit) {
-        let anchored_selection = hit
-            .selection_id
-            .and_then(|selection_id| self.db.get_selection(selection_id).ok());
-        if hit.archived {
-            self.navigate(Route::Articles(ArticleCollection::SearchResult(
-                hit.article_id,
-            )));
-            if self
-                .articles
-                .iter()
-                .any(|article| article.id == hit.article_id)
-            {
-                self.sel_article_id = Some(hit.article_id);
-                self.body_article_id = None;
-                self.clear_selection_popover();
-                self.article_selection_drag = None;
-                self.pending_selection_anchor = anchored_selection;
-                self.complete_modal();
-                self.notice("正在查看已归档文章（未恢复）");
+            if let Some(dialog) = self.search_dialog_mut() {
+                dialog.searched_query.clear();
+                dialog.error = None;
+                dialog.results.clear();
+                dialog.searching = false;
+                dialog.active_request = None;
             }
             return;
         }
+        let request_id = self.start_search_job(
+            SearchRequest {
+                query: query.clone(),
+                scope: SearchScope::Curated,
+                result_type: ResultType::All,
+                origin: SearchOrigin::Human,
+                limit: 50,
+            },
+            SearchTarget::Modal,
+            ctx,
+        );
+        if let Some(dialog) = self.search_dialog_mut() {
+            dialog.searched_query = query;
+            dialog.error = None;
+            dialog.results.clear();
+            dialog.searching = true;
+            dialog.active_request = Some(request_id);
+        }
+    }
 
-        if matches!(hit.kind, SearchHitKind::WebClipping)
-            || self.db.is_web_clipping(hit.article_id).unwrap_or(false)
-        {
+    fn start_search_job(
+        &mut self,
+        request: SearchRequest,
+        target: SearchTarget,
+        ctx: &egui::Context,
+    ) -> u64 {
+        self.search_request_generation = self.search_request_generation.wrapping_add(1);
+        let request_id = self.search_request_generation;
+        let db_path = self.db_path.clone();
+        let event_tx = self.search_event_tx.clone();
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let result = Db::open(&db_path)
+                .map_err(|error| format!("无法打开资料库：{error}"))
+                .and_then(|db| {
+                    LibrarySearch::new(&db).search(request).map_err(|failure| {
+                        format!("{}（{}）", failure.user_message, failure.technical_detail)
+                    })
+                });
+            let _ = event_tx.send(SearchEvent {
+                request_id,
+                target,
+                result,
+            });
+            repaint.request_repaint();
+        });
+        request_id
+    }
+
+    fn receive_search_events(&mut self, _ctx: &egui::Context) {
+        while let Ok(event) = self.search_event_rx.try_recv() {
+            match event.target {
+                SearchTarget::Modal => {
+                    let mut warning = false;
+                    let refreshed_history = event
+                        .result
+                        .as_ref()
+                        .ok()
+                        .map(|_| LibrarySearch::new(&self.db).history(12).unwrap_or_default());
+                    if let Some(dialog) = self.search_dialog_mut()
+                        && accepts_search_response(dialog.active_request, event.request_id)
+                    {
+                        dialog.searching = false;
+                        dialog.active_request = None;
+                        match event.result {
+                            Ok(outcome) => {
+                                warning = !outcome.warnings.is_empty();
+                                dialog.results = outcome.results;
+                                dialog.history = refreshed_history.unwrap_or_default();
+                            }
+                            Err(error) => {
+                                dialog.results.clear();
+                                dialog.error = Some(error);
+                            }
+                        }
+                    }
+                    if warning {
+                        self.notice("搜索完成，但搜索历史没有保存");
+                    }
+                }
+                SearchTarget::ResourceRoute => {
+                    if accepts_search_response(self.resource_search_request, event.request_id) {
+                        self.resource_searching = false;
+                        self.resource_search_request = None;
+                        match event.result {
+                            Ok(outcome) => {
+                                self.resource_search_results = outcome.results;
+                                self.resource_search_error = None;
+                            }
+                            Err(error) => {
+                                self.resource_search_results.clear();
+                                self.resource_search_error = Some(error);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn open_search_result(&mut self, hit: &LibrarySearchResult) {
+        if let PrimaryIdentity::Resource(resource_id) = hit.primary {
+            self.navigate(Route::Resources);
+            self.open_resource_panel(resource_id);
+            self.complete_modal();
+            self.notice("已打开资源详情");
+            return;
+        }
+        let Some(target) = hit.article_targets.first() else {
+            self.notice("搜索结果没有可打开的文章位置");
+            return;
+        };
+        self.pending_excerpt_selection_id = target
+            .selection_id
+            .map(|selection_id| (target.article_id, selection_id));
+        if target.archived {
+            self.navigate(Route::Articles(ArticleCollection::SearchResult(
+                target.article_id,
+            )));
+            self.sel_article_id = Some(target.article_id);
+            self.body_article_id = None;
+            self.clear_selection_popover();
+            self.complete_modal();
+            self.notice("正在查看已归档文章（未恢复）");
+            return;
+        }
+
+        if target.web_clipping {
             self.select_saved_articles();
         } else {
-            self.select_feed(hit.feed_id);
+            self.select_feed(target.feed_id);
         }
-        self.select_article(hit.article_id);
-        self.pending_selection_anchor = anchored_selection;
+        self.select_article(target.article_id);
         self.complete_modal();
         self.notice("已打开搜索结果");
+    }
+
+    fn open_resource_panel(&mut self, resource_id: i64) {
+        let resource = self
+            .desktop_projection_frame
+            .resource(ResourceProjectionDemand::Detail(resource_id))
+            .and_then(|view| view.data.as_ref())
+            .and_then(|projection| projection.detail.as_ref())
+            .map(|detail| detail.resource.clone());
+        let hydrated = resource.is_some();
+        let values = ResourceEditValues {
+            title: resource
+                .as_ref()
+                .and_then(|value| value.title.clone())
+                .unwrap_or_default(),
+            purpose_zh: resource
+                .as_ref()
+                .and_then(|value| value.purpose_zh.clone())
+                .unwrap_or_default(),
+            note: resource
+                .as_ref()
+                .and_then(|value| value.private_note.clone())
+                .unwrap_or_default(),
+            private: resource.as_ref().is_some_and(|value| {
+                value.privacy == crate::resource_library_lifecycle::ResourcePrivacy::Private
+            }),
+            rating: resource.and_then(|value| value.manual_rating).unwrap_or(0),
+        };
+        self.set_resource_panel(Some(ResourceEditDialog {
+            id: resource_id,
+            hydrated,
+            title: values.title.clone(),
+            purpose_zh: values.purpose_zh.clone(),
+            note: values.note.clone(),
+            private: values.private,
+            rating: values.rating,
+            original: values,
+        }));
     }
 
     /// 点开即已读（ADR-16），未读数同步减一。
@@ -2026,13 +1882,12 @@ impl GuiApp {
             self.body_article_id = None;
             self.current_body_scroll = 0.0;
             self.clear_selection_popover();
-            self.article_selection_drag = None;
         }
         self.sel_article_id = Some(id);
-        if self
-            .articles
-            .iter()
-            .find(|article| article.id == id)
+        let projection = self.current_article_projection();
+        if projection
+            .as_deref()
+            .and_then(|projection| projection.articles.iter().find(|article| article.id == id))
             .is_some_and(|article| !article.is_read)
             && let Err(error) = self.apply_article_library_change(ArticleLifecycleChange::SetRead {
                 article_id: id,
@@ -2044,10 +1899,10 @@ impl GuiApp {
     }
 
     fn mark_unread(&mut self, id: i64) {
-        if self
-            .articles
-            .iter()
-            .find(|article| article.id == id)
+        let projection = self.current_article_projection();
+        if projection
+            .as_deref()
+            .and_then(|projection| projection.articles.iter().find(|article| article.id == id))
             .is_none_or(|article| !article.is_read)
         {
             return;
@@ -2061,10 +1916,10 @@ impl GuiApp {
     }
 
     fn toggle_star(&mut self, id: i64) {
-        let Some(was_starred) = self
-            .articles
-            .iter()
-            .find(|article| article.id == id)
+        let projection = self.current_article_projection();
+        let Some(was_starred) = projection
+            .as_deref()
+            .and_then(|projection| projection.articles.iter().find(|article| article.id == id))
             .map(|article| article.starred)
         else {
             return;
@@ -2093,10 +1948,10 @@ impl GuiApp {
     }
 
     fn toggle_read_later(&mut self, id: i64) {
-        let current = self
-            .articles
-            .iter()
-            .find(|article| article.id == id)
+        let projection = self.current_article_projection();
+        let current = projection
+            .as_deref()
+            .and_then(|projection| projection.articles.iter().find(|article| article.id == id))
             .map(|article| article.read_later);
         let Some(current) = current else {
             return;
@@ -2141,23 +1996,12 @@ impl GuiApp {
     }
 
     fn open_tag_dialog(&mut self, article_id: i64) {
-        let tags = if let Some(tags) = self.article_tags.get(&article_id) {
-            tags.clone()
-        } else {
-            match ArticleLibraryLifecycle::new(&self.db)
-                .project(ProjectionScope::Article(article_id))
-            {
-                Ok(projection) => projection
-                    .tags
-                    .get(&article_id)
-                    .cloned()
-                    .unwrap_or_default(),
-                Err(error) => {
-                    self.report_article_library_failure("读取标签", error);
-                    return;
-                }
-            }
-        };
+        let projection = self.current_article_projection();
+        let tags = projection
+            .as_deref()
+            .and_then(|projection| projection.tags.get(&article_id))
+            .cloned()
+            .unwrap_or_default();
         let draft = tags.join(", ");
         self.open_modal(ModalState::EditTags(TagDialog {
             article_id,
@@ -2231,11 +2075,6 @@ impl GuiApp {
         }
     }
 
-    fn selected_article(&self) -> Option<&Article> {
-        let id = self.sel_article_id?;
-        self.articles.iter().find(|a| a.id == id)
-    }
-
     fn open_web_clip_dialog(&mut self) {
         if self.ui_state.modal_kind() != Some(ModalKind::SaveWebPage) {
             self.open_modal(ModalState::SaveWebPage(WebClipDialog::default()));
@@ -2244,122 +2083,141 @@ impl GuiApp {
     }
 
     fn begin_web_clip_import(&mut self, ctx: &egui::Context) {
-        self.web_clip_request_generation = self.web_clip_request_generation.wrapping_add(1);
-        let next_request_id = self.web_clip_request_generation;
         let Some(dialog) = self.web_clip_dialog_mut() else {
             return;
         };
-        if dialog.fetching {
-            return;
-        }
-        let source = dialog.source.trim().to_owned();
-        if source.is_empty() {
-            dialog.error = Some("请粘贴网页地址或 HTML".to_owned());
-            return;
-        }
-        dialog.error = None;
-
-        if let Some(fetch_source) = normalized_web_url(&source) {
-            let request_id = next_request_id;
-            dialog.fetching = true;
-            dialog.active_request = Some(request_id);
-            let event_tx = self.web_clip_event_tx.clone();
-            let repaint = ctx.clone();
-            std::thread::spawn(move || {
-                let result = crate::web_clip::client()
-                    .and_then(|client| crate::web_clip::fetch_html(&client, &fetch_source))
-                    .map_err(|error| error.to_string());
-                let _ = event_tx.send(WebClipEvent::Complete { request_id, result });
-                repaint.request_repaint();
-            });
-            return;
-        }
-        if !source.trim_start().starts_with('<')
-            && source.lines().count() == 1
-            && (source.contains("://") || source.to_ascii_lowercase().starts_with("http:"))
+        if dialog
+            .capture
+            .as_ref()
+            .is_some_and(|capture| !capture.snapshot().state.is_terminal())
         {
-            dialog.error = Some("网页地址格式不正确，只支持 http:// 或 https://".to_owned());
             return;
         }
-
-        let title_override = non_empty_owned(&dialog.title);
-        let explicit_base = non_empty_owned(&dialog.base_url);
-        match prepare_pasted_web_clip(&source, explicit_base.as_deref()) {
-            Ok((snapshot_title, content)) => {
-                let title = title_override
-                    .or(snapshot_title)
-                    .unwrap_or_else(|| "未命名网页".to_owned());
-                self.finish_web_clip_save(None, &title, &content);
+        let request = CaptureRequest {
+            source: dialog.source.clone(),
+            title_override: non_empty_owned(&dialog.title),
+            pasted_html_base_url: non_empty_owned(&dialog.base_url),
+            refresh_scope: ProjectionScope::ArticleBookmarks,
+        };
+        dialog.error = None;
+        match self.web_clipping_lifecycle.begin_capture(request) {
+            Ok(capture) => {
+                if let Some(dialog) = self.web_clip_dialog_mut() {
+                    dialog.capture = Some(capture);
+                }
+                ctx.request_repaint_after(Duration::from_millis(80));
             }
-            Err(error) => dialog.error = Some(error),
+            Err(error) => {
+                tracing::warn!(
+                    kind = ?error.failure.kind,
+                    detail = %error.failure.technical_detail,
+                    "web clipping capture admission failed"
+                );
+                if let Some(dialog) = self.web_clip_dialog_mut() {
+                    dialog.error = Some(error.user_message);
+                }
+            }
         }
     }
 
-    fn receive_web_clip_events(&mut self, ctx: &egui::Context) {
-        while let Ok(event) = self.web_clip_event_rx.try_recv() {
-            let WebClipEvent::Complete { request_id, result } = event;
-            if !self
-                .ui_state
-                .accepts_modal_event(ModalKind::SaveWebPage, request_id)
-            {
-                continue;
+    fn receive_web_clipping_updates(&mut self, ctx: &egui::Context) {
+        let modal_snapshot = match self.ui_state.modal() {
+            Some(ModalState::SaveWebPage(dialog)) => {
+                dialog.capture.as_ref().map(CaptureLease::snapshot)
             }
-            let Some(dialog) = self.web_clip_dialog_mut() else {
-                continue;
-            };
-            dialog.fetching = false;
-            dialog.active_request = None;
-            match result {
-                Ok(fetched) => {
-                    let snapshot = text::prepare_html_snapshot(&fetched.html);
-                    if snapshot.content.trim().is_empty() {
-                        dialog.error = Some("网页抓取成功，但没有识别到可阅读正文".to_owned());
-                        continue;
+            _ => None,
+        };
+        if modal_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot.state.is_terminal())
+        {
+            ctx.request_repaint_after(Duration::from_millis(80));
+        }
+        let terminal = modal_snapshot
+            .filter(|snapshot| snapshot.state.is_terminal())
+            .or_else(|| self.web_clipping_lifecycle.recent_terminal());
+        let Some(snapshot) = terminal else {
+            return;
+        };
+        let key = (snapshot.id, snapshot.revision);
+        if self.consumed_web_clipping_terminal == Some(key) {
+            return;
+        }
+        self.consumed_web_clipping_terminal = Some(key);
+        self.apply_web_clipping_terminal(snapshot);
+        ctx.request_repaint();
+    }
+
+    fn apply_web_clipping_terminal(&mut self, snapshot: CaptureSnapshot) {
+        let modal_owns_capture = matches!(
+            self.ui_state.modal(),
+            Some(ModalState::SaveWebPage(dialog))
+                if dialog.capture.as_ref().is_some_and(|capture| capture.id() == snapshot.id)
+        );
+        match snapshot.state {
+            CaptureState::Succeeded(success) => {
+                if modal_owns_capture {
+                    self.complete_modal();
+                }
+                let article_id = success.clipping.article_id;
+                self.navigate(Route::Articles(ArticleCollection::Saved));
+                self.accept_article_projection(success.projection);
+                self.select_article(article_id);
+                tracing::info!(
+                    capture_id = snapshot.id.value(),
+                    article_id,
+                    provenance = ?success.provenance,
+                    "web clipping capture succeeded"
+                );
+                self.notice("正文快照已保存到本机；网页图片仍需联网加载");
+            }
+            CaptureState::Failed(failure) => {
+                tracing::warn!(
+                    capture_id = snapshot.id.value(),
+                    kind = ?failure.kind,
+                    detail = %failure.technical_detail,
+                    "web clipping capture failed"
+                );
+                if modal_owns_capture {
+                    if let Some(dialog) = self.web_clip_dialog_mut() {
+                        dialog.capture = None;
+                        dialog.error = Some(failure.user_message);
                     }
-                    let title = non_empty_owned(&dialog.title)
-                        .or(snapshot.title)
-                        .unwrap_or_else(|| fetched.original_url.clone());
-                    let effective_base = snapshot
-                        .base_href
-                        .as_deref()
-                        .and_then(|base| resolve_http_url(base, Some(&fetched.final_url)))
-                        .or_else(|| Some(fetched.final_url.clone()));
-                    let content = with_html_base(&snapshot.content, effective_base.as_deref());
-                    self.finish_web_clip_save(Some(&fetched.original_url), &title, &content);
-                }
-                Err(error) => {
-                    dialog.error = Some(format!("抓取失败：{error}"));
+                } else {
+                    self.notice(failure.user_message);
                 }
             }
-            ctx.request_repaint();
+            CaptureState::Cancelled(failure) => {
+                tracing::info!(
+                    capture_id = snapshot.id.value(),
+                    kind = ?failure.kind,
+                    detail = %failure.technical_detail,
+                    "web clipping capture cancelled"
+                );
+                if modal_owns_capture {
+                    if failure.kind == CaptureFailureKind::Maintenance {
+                        if let Some(dialog) = self.web_clip_dialog_mut() {
+                            dialog.capture = None;
+                            dialog.error = Some(failure.user_message);
+                        }
+                    } else {
+                        self.complete_modal();
+                    }
+                } else if failure.kind == CaptureFailureKind::Maintenance {
+                    self.notice(failure.user_message);
+                }
+            }
+            CaptureState::Fetching | CaptureState::Preparing | CaptureState::Committing => {}
         }
     }
 
     fn receive_knowledge_updates(&mut self, ctx: &egui::Context) {
         let notices = self.knowledge_engine.try_notices().collect::<Vec<_>>();
+        let received_notice = !notices.is_empty();
         for notice in notices {
             match notice {
                 KnowledgeNotice::Changed(key) => {
-                    let snapshot = self.knowledge_engine.snapshot(key).ok().flatten();
-                    let notice = snapshot
-                        .as_ref()
-                        .and_then(|snapshot| match snapshot.status {
-                            KnowledgeTaskStatus::Succeeded => match snapshot.key.kind {
-                                KnowledgeTaskKind::ResourceCompletion => {
-                                    Some("资源抓取和 AI 整理已完成".to_owned())
-                                }
-                                KnowledgeTaskKind::ArticleSummary => {
-                                    Some("AI 总结和中文翻译已保存".to_owned())
-                                }
-                            },
-                            KnowledgeTaskStatus::Failed | KnowledgeTaskStatus::Interrupted => {
-                                snapshot.user_message.clone()
-                            }
-                            KnowledgeTaskStatus::Queued | KnowledgeTaskStatus::Running => None,
-                        });
-                    if let Some(notice) = notice {
-                        self.notice(notice);
-                    }
+                    self.pending_knowledge_notices.push(key);
                 }
                 KnowledgeNotice::ConnectionChanged(state) => {
                     self.ai_settings_message = Some(match &state {
@@ -2378,23 +2236,195 @@ impl GuiApp {
                 }
             }
         }
-        ctx.request_repaint();
+        if received_notice {
+            ctx.request_repaint();
+        } else {
+            // The workflow can change on its background executor. Poll at a
+            // low idle cadence without forcing the desktop into a permanent
+            // maximum-rate repaint loop.
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+    }
+
+    fn publish_pending_knowledge_notices(&mut self) {
+        let keys = std::mem::take(&mut self.pending_knowledge_notices);
+        for key in keys.into_iter().collect::<HashSet<_>>() {
+            let Some(view) = self.desktop_projection_frame.knowledge(key) else {
+                continue;
+            };
+            if matches!(view.freshness, ProjectionFreshness::Loading) {
+                self.pending_knowledge_notices.push(key);
+                continue;
+            }
+            let terminal = view
+                .data
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.status.is_terminal());
+            let notice = view
+                .data
+                .as_ref()
+                .and_then(|snapshot| match snapshot.status {
+                    KnowledgeTaskStatus::Succeeded => match snapshot.key.kind {
+                        KnowledgeTaskKind::ResourceCompletion => {
+                            Some("资源抓取和 AI 整理已完成".to_owned())
+                        }
+                        KnowledgeTaskKind::ArticleSummary => {
+                            Some("AI 总结和中文翻译已保存".to_owned())
+                        }
+                    },
+                    KnowledgeTaskStatus::Failed | KnowledgeTaskStatus::Interrupted => {
+                        snapshot.user_message.clone()
+                    }
+                    KnowledgeTaskStatus::Queued | KnowledgeTaskStatus::Running => None,
+                });
+            if let Some(notice) = notice {
+                self.notice(notice);
+            }
+            if terminal {
+                self.knowledge_watch.remove(&key);
+            }
+        }
     }
 
     fn knowledge_task(&self, kind: KnowledgeTaskKind, target_id: i64) -> Option<TaskSnapshot> {
-        self.knowledge_engine
-            .snapshot(TaskKey::new(kind, target_id))
-            .ok()
-            .flatten()
+        let key = TaskKey::new(kind, target_id);
+        self.desktop_projection_frame
+            .knowledge(key)
+            .and_then(|view| {
+                (!matches!(view.freshness, ProjectionFreshness::Maintenance))
+                    .then(|| view.data.clone())
+                    .flatten()
+            })
     }
 
-    fn retry_resource_task(&mut self, resource_id: i64, _ctx: &egui::Context) {
-        let result = self.knowledge_engine.request(TaskKey::new(
-            KnowledgeTaskKind::ResourceCompletion,
-            resource_id,
-        ));
+    fn refresh_desktop_projection_frame(&mut self) {
+        use crate::resource_library_lifecycle::ResourceCollection;
+        let mut demand = DesktopProjectionDemand::default();
+        let article_scope = self.desktop_article_projection_scope();
+        demand.articles.push(article_scope);
+        let excerpt_scope = self.current_excerpt_projection_scope();
+        demand.excerpts.push(excerpt_scope);
+        if self.ui_state.route() == Route::Resources {
+            let collection = match self.resource_filter {
+                ResourceFilter::Active => ResourceCollection::Active,
+                ResourceFilter::PendingReview => ResourceCollection::PendingReview,
+                ResourceFilter::Broken => ResourceCollection::Broken,
+                ResourceFilter::Archived => ResourceCollection::Archived,
+            };
+            demand
+                .resources
+                .push(ResourceProjectionDemand::Collection(collection));
+            if let Some(resource_id) = self.resource_dialog().map(|dialog| dialog.id) {
+                demand
+                    .resources
+                    .push(ResourceProjectionDemand::Detail(resource_id));
+                demand.knowledge.push(TaskKey::new(
+                    KnowledgeTaskKind::ResourceCompletion,
+                    resource_id,
+                ));
+            }
+        }
+        if self.ui_state.route().article_collection().is_some()
+            && let Some(article_id) = self.sel_article_id
+        {
+            demand
+                .knowledge
+                .push(TaskKey::new(KnowledgeTaskKind::ArticleSummary, article_id));
+        }
+        demand
+            .knowledge
+            .extend(self.knowledge_watch.iter().copied());
+        self.desktop_projection_frame = self.desktop_projection.frame(demand);
+
+        let article_projection = self.article_projection(article_scope);
+        if let Some(projection) = article_projection {
+            let remembered = self
+                .ui_state
+                .route()
+                .article_collection()
+                .and_then(|collection| self.article_route_memory.get(&collection))
+                .and_then(|memory| memory.selected_article_id);
+            let reconciled =
+                reconcile_article_selection(self.sel_article_id, remembered, &projection.articles);
+            if self.sel_article_id.is_some() && reconciled != self.sel_article_id {
+                self.sel_article_id = None;
+                self.body_article_id = None;
+                self.clear_selection_popover();
+            }
+            if self.sel_article_id.is_none()
+                && let Some(restored) = reconciled
+                && let Some(collection) = self.ui_state.route().article_collection()
+                && let Some(memory) = self.article_route_memory.get(&collection).copied()
+            {
+                self.sel_article_id = Some(restored);
+                self.pending_body_scroll = Some((restored, memory.body_scroll));
+            }
+        }
+
+        if let Some(projection) = self.excerpt_projection(excerpt_scope)
+            && let Some((article_id, excerpt_id)) = self.pending_excerpt_selection_id
+            && projection.scope == ExcerptProjectionScope::Article(article_id)
+        {
+            self.pending_selection_anchor = projection
+                .excerpt(excerpt_id)
+                .map(ExcerptView::as_article_selection);
+            self.pending_excerpt_selection_id = None;
+        }
+    }
+
+    fn current_total_unread(&self) -> usize {
+        self.current_article_projection()
+            .as_deref()
+            .map(|projection| {
+                projection
+                    .feed_unread
+                    .iter()
+                    .map(|(_, unread)| *unread)
+                    .sum()
+            })
+            .unwrap_or_default()
+    }
+
+    fn current_article_counts(&self) -> (usize, usize, usize) {
+        self.current_article_projection()
+            .as_deref()
+            .map(|projection| {
+                (
+                    projection.counts.bookmarks,
+                    projection.counts.read_later,
+                    projection.counts.archived,
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    fn remove_saved_article(&mut self, id: i64) {
+        let projection = self.current_article_projection();
+        let is_web_clipping = projection
+            .as_deref()
+            .is_some_and(|projection| projection.fixed_bookmark_ids.contains(&id));
+        if is_web_clipping {
+            let title = projection
+                .as_deref()
+                .and_then(|projection| projection.articles.iter().find(|article| article.id == id))
+                .and_then(|article| article.title.clone())
+                .unwrap_or_else(|| "未命名网页".to_owned());
+            self.open_modal(ModalState::DeleteWebPage(DeleteWebClipDialog {
+                article_id: id,
+                title,
+            }));
+        } else {
+            self.toggle_star(id);
+        }
+    }
+
+    fn retry_resource_task(&mut self, resource_id: i64, ctx: &egui::Context) {
+        let key = TaskKey::new(KnowledgeTaskKind::ResourceCompletion, resource_id);
+        let result = self.knowledge_engine.request(key);
         match result {
             Ok(_) => {
+                self.knowledge_watch.insert(key);
+                ctx.request_repaint();
                 self.notice("已重新加入后台处理队列");
             }
             Err(error) => {
@@ -2417,84 +2447,71 @@ impl GuiApp {
         }
     }
 
-    fn begin_article_ai(&mut self, article_id: i64, _ctx: &egui::Context) {
-        let result = self
-            .knowledge_engine
-            .request(TaskKey::new(KnowledgeTaskKind::ArticleSummary, article_id));
+    fn begin_article_ai(&mut self, article_id: i64, ctx: &egui::Context) {
+        let key = TaskKey::new(KnowledgeTaskKind::ArticleSummary, article_id);
+        let result = self.knowledge_engine.request(key);
         match result {
-            Ok(_) => {}
+            Ok(_) => {
+                self.knowledge_watch.insert(key);
+                ctx.request_repaint();
+            }
             Err(error) => {
                 self.notice(format!("无法提交文章 AI 任务：{error:#}"));
             }
         }
     }
 
-    fn finish_web_clip_save(&mut self, source_url: Option<&str>, title: &str, content: &str) {
-        match self
-            .db
-            .save_web_clipping(source_url, Some(title), content, Utc::now().timestamp())
-        {
-            Ok(article_id) => {
-                self.complete_modal();
-                self.select_saved_articles();
-                self.select_article(article_id);
-                self.notice("正文快照已保存到本机；网页图片仍需联网加载");
-            }
-            Err(error) => {
-                if let Some(dialog) = self.web_clip_dialog_mut() {
-                    dialog.error = Some(format!("保存失败：{error}"));
-                } else {
-                    self.notice(format!("网页保存失败：{error}"));
-                }
-            }
-        }
-    }
-
-    fn remove_saved_article(&mut self, id: i64) {
-        if self.web_clipping_ids.contains(&id) {
-            let title = self
-                .articles
-                .iter()
-                .find(|article| article.id == id)
-                .and_then(|article| article.title.clone())
-                .unwrap_or_else(|| "未命名网页".to_owned());
-            self.open_modal(ModalState::DeleteWebPage(DeleteWebClipDialog {
-                article_id: id,
-                title,
-            }));
-        } else {
-            self.toggle_star(id);
-        }
-    }
-
     fn save_favorite_quote(&mut self, quote: SelectedQuote) {
-        let anchor = TextAnchor {
-            start_offset: quote.start_offset,
-            end_offset: quote.end_offset,
-            prefix: quote.anchor_prefix.clone(),
-            suffix: quote.anchor_suffix.clone(),
-        };
-        let result = self.db.add_favorite_selection_with_anchor(
-            quote.article_id,
-            &quote.text,
-            &anchor,
-            Utc::now().timestamp(),
+        let article_id = quote.article_id;
+        let result = ExcerptThoughtLifecycle::new(&self.db, &SYSTEM_CLOCK).apply(
+            ExcerptThoughtChange::EnsureExcerpt {
+                capture: quote.capture(),
+            },
+            ExcerptProjectionScope::Article(article_id),
         );
         match result {
-            Ok(_) => {
-                self.refresh_saved_selection_count();
+            Ok(outcome) => {
+                self.accept_excerpt_projection(outcome.projection);
                 self.notice("已摘录，可在左侧「摘录与想法」查看");
             }
-            Err(error) => {
-                self.notice(format!("摘录失败：{error}"));
-            }
+            Err(error) => self.report_excerpt_failure("摘录", error),
         }
     }
 
     fn begin_comment(&mut self, quote: SelectedQuote) {
+        let capture = quote.capture();
+        let projection = self.current_excerpt_projection();
+        let existing = projection
+            .as_ref()
+            .and_then(|projection| projection.match_capture(&capture));
+        let target = existing
+            .map(|excerpt| ExcerptTarget::Existing(excerpt.id))
+            .unwrap_or_else(|| ExcerptTarget::Captured(capture));
+        let draft = existing
+            .and_then(|excerpt| excerpt.thought.as_ref())
+            .map(|thought| thought.content.clone())
+            .unwrap_or_default();
         self.open_modal(ModalState::WriteThought(CommentDialog {
             quote,
-            draft: String::new(),
+            target,
+            original: draft.clone(),
+            draft,
+            error: None,
+            focus_input: true,
+        }));
+    }
+
+    fn begin_edit_thought(&mut self, excerpt: &ExcerptView) {
+        let draft = excerpt
+            .thought
+            .as_ref()
+            .map(|thought| thought.content.clone())
+            .unwrap_or_default();
+        self.open_modal(ModalState::WriteThought(CommentDialog {
+            quote: SelectedQuote::from_excerpt(excerpt),
+            target: ExcerptTarget::Existing(excerpt.id),
+            original: draft.clone(),
+            draft,
             error: None,
             focus_input: true,
         }));
@@ -2504,7 +2521,8 @@ impl GuiApp {
         let Some(ModalState::WriteThought(dialog)) = self.ui_state.modal() else {
             return;
         };
-        let quote = dialog.quote.clone();
+        let article_id = dialog.quote.article_id;
+        let target = dialog.target.clone();
         let draft = dialog.draft.clone();
         if draft.trim().is_empty() {
             if let Some(dialog) = self.comment_dialog_mut() {
@@ -2512,30 +2530,62 @@ impl GuiApp {
             }
             return;
         }
-        let anchor = TextAnchor {
-            start_offset: quote.start_offset,
-            end_offset: quote.end_offset,
-            prefix: quote.anchor_prefix.clone(),
-            suffix: quote.anchor_suffix.clone(),
-        };
-        let result = self.db.add_comment_with_anchor(
-            quote.article_id,
-            &quote.text,
-            &anchor,
-            &draft,
-            Utc::now().timestamp(),
+        let result = ExcerptThoughtLifecycle::new(&self.db, &SYSTEM_CLOCK).apply(
+            ExcerptThoughtChange::PutThought {
+                target,
+                content: draft,
+            },
+            ExcerptProjectionScope::Article(article_id),
         );
         match result {
-            Ok(_) => {
+            Ok(outcome) => {
                 self.complete_modal();
-                self.refresh_saved_selection_count();
+                self.accept_excerpt_projection(outcome.projection);
                 self.notice("想法已保存，可在左侧「摘录与想法」查看");
             }
             Err(error) => {
                 if let Some(dialog) = self.comment_dialog_mut() {
-                    dialog.error = Some(format!("想法保存失败：{error}"));
+                    dialog.error = Some(format!("想法保存失败：{}", error.user_message));
                 }
+                tracing::warn!(detail = %error.technical_detail, "put thought failed");
             }
+        }
+    }
+
+    fn remove_thought(&mut self, excerpt_id: i64, scope: ExcerptProjectionScope) {
+        match ExcerptThoughtLifecycle::new(&self.db, &SYSTEM_CLOCK)
+            .apply(ExcerptThoughtChange::RemoveThought { excerpt_id }, scope)
+        {
+            Ok(outcome) => {
+                self.accept_excerpt_projection(outcome.projection);
+                self.notice("想法已删除，摘录仍然保留");
+            }
+            Err(error) => self.report_excerpt_failure("删除想法", error),
+        }
+    }
+
+    fn request_delete_excerpt(&mut self, excerpt: &ExcerptView, scope: ExcerptProjectionScope) {
+        if excerpt.thought.is_some() {
+            self.open_modal(ModalState::DeleteExcerpt(DeleteExcerptDialog {
+                excerpt_id: excerpt.id,
+                selected_text: excerpt.selected_text.clone(),
+                has_thought: true,
+                refresh_scope: scope,
+            }));
+        } else {
+            self.delete_excerpt(excerpt.id, scope);
+        }
+    }
+
+    fn delete_excerpt(&mut self, excerpt_id: i64, scope: ExcerptProjectionScope) {
+        match ExcerptThoughtLifecycle::new(&self.db, &SYSTEM_CLOCK)
+            .apply(ExcerptThoughtChange::DeleteExcerpt { excerpt_id }, scope)
+        {
+            Ok(outcome) => {
+                self.accept_excerpt_projection(outcome.projection);
+                self.notice("摘录已删除");
+            }
+            Err(error) => self.report_excerpt_failure("删除摘录", error),
         }
     }
 
@@ -2555,7 +2605,7 @@ impl GuiApp {
                 ui.add(
                     egui::Label::new(
                         egui::RichText::new(&dialog.quote.text)
-                            .size(15.0)
+                            .size(17.0)
                             .color(ui.visuals().weak_text_color()),
                     )
                     .wrap(),
@@ -2593,6 +2643,45 @@ impl GuiApp {
         }
     }
 
+    fn show_delete_excerpt_dialog(&mut self, ctx: &egui::Context) {
+        if self.ui_state.modal_kind() != Some(ModalKind::DeleteExcerpt) {
+            return;
+        }
+        let Some(ModalState::DeleteExcerpt(dialog)) = self.ui_state.modal() else {
+            return;
+        };
+        let dialog = dialog.clone();
+        let mut confirm = false;
+        let mut cancel = false;
+        let response = gui_modal::show(ctx, ModalKind::DeleteExcerpt, false, |ui, _| {
+            ui.label("确定删除这条摘录吗？");
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.add(egui::Label::new(&dialog.selected_text).wrap());
+            });
+            if dialog.has_thought {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    "附在这条摘录上的想法也会一起删除，此操作无法撤销。",
+                );
+            }
+            ui.horizontal(|ui| {
+                if ui.button("删除摘录").clicked() {
+                    confirm = true;
+                }
+                if ui.button("取消").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        self.apply_modal_host_action(response.action);
+        if cancel {
+            self.close_modal();
+        } else if confirm {
+            self.complete_modal();
+            self.delete_excerpt(dialog.excerpt_id, dialog.refresh_scope);
+        }
+    }
+
     fn show_web_clip_dialog(&mut self, ctx: &egui::Context) {
         if self.ui_state.modal_kind() != Some(ModalKind::SaveWebPage) {
             return;
@@ -2601,25 +2690,29 @@ impl GuiApp {
         let Some(dialog) = self.web_clip_dialog_mut() else {
             return;
         };
+        let capture_snapshot = dialog.capture.as_ref().map(CaptureLease::snapshot);
+        let capture_active = capture_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot.state.is_terminal());
         let theme = ReaderTheme::sspai();
         let mut import = false;
         let mut cancel = false;
         let response = gui_modal::show(ctx, ModalKind::SaveWebPage, show_discard, |ui, focus| {
             ui.label(
                 egui::RichText::new("粘贴网页地址，或直接粘贴 HTML 源码")
-                    .size(15.0)
+                    .size(17.0)
                     .color(theme.text),
             );
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new("正文会作为本地快照保存；网页中的远程图片仍需要联网加载。")
-                    .size(12.0)
+                    .size(13.0)
                     .color(theme.muted),
             );
             ui.add_space(12.0);
             ui.label("网页地址 / HTML");
             let source_response = ui.add_enabled(
-                !dialog.fetching,
+                !capture_active,
                 egui::TextEdit::multiline(&mut dialog.source)
                     .desired_rows(10)
                     .desired_width(f32::INFINITY)
@@ -2636,7 +2729,7 @@ impl GuiApp {
             ui.horizontal(|ui| {
                 ui.label("标题（可选）");
                 ui.add_enabled(
-                    !dialog.fetching,
+                    !capture_active,
                     egui::TextEdit::singleline(&mut dialog.title)
                         .desired_width(ui.available_width())
                         .hint_text("留空则从 HTML 自动识别"),
@@ -2645,7 +2738,7 @@ impl GuiApp {
             ui.horizontal(|ui| {
                 ui.label("基础网址（可选）");
                 ui.add_enabled(
-                    !dialog.fetching,
+                    !capture_active,
                     egui::TextEdit::singleline(&mut dialog.base_url)
                         .desired_width(ui.available_width())
                         .hint_text("仅粘贴 HTML 时，用于解析相对图片和链接"),
@@ -2653,18 +2746,19 @@ impl GuiApp {
             });
             if let Some(error) = &dialog.error {
                 ui.add_space(6.0);
-                ui.label(egui::RichText::new(error).color(theme.link).size(12.0));
+                ui.label(egui::RichText::new(error).color(theme.link).size(13.0));
             }
             ui.add_space(12.0);
             ui.horizontal(|ui| {
-                let import_label = if dialog.fetching {
-                    "正在抓取网页…"
-                } else {
-                    "保存网页"
+                let import_label = match capture_snapshot.as_ref().map(|snapshot| &snapshot.state) {
+                    Some(CaptureState::Fetching) => "正在抓取…",
+                    Some(CaptureState::Preparing) => "正在整理…",
+                    Some(CaptureState::Committing) => "正在保存…",
+                    _ => "保存网页",
                 };
                 if ui
                     .add_enabled(
-                        !dialog.fetching,
+                        !capture_active,
                         egui::Button::new(import_label)
                             .fill(theme.accent)
                             .stroke(egui::Stroke::NONE),
@@ -2673,10 +2767,10 @@ impl GuiApp {
                 {
                     import = true;
                 }
-                if dialog.fetching {
+                if capture_active {
                     ui.spinner();
                 }
-                let cancel_label = if dialog.fetching {
+                let cancel_label = if capture_active {
                     "关闭窗口"
                 } else {
                     "取消"
@@ -2688,7 +2782,19 @@ impl GuiApp {
         });
         self.apply_modal_host_action(response.action);
         if cancel {
-            self.close_modal();
+            if let Some(capture) = self
+                .web_clip_dialog_mut()
+                .and_then(|dialog| dialog.capture.as_ref())
+            {
+                let disposition = capture.request_cancel();
+                if disposition == CancelDisposition::CommitAlreadyStarted {
+                    tracing::info!(
+                        capture_id = capture.id().value(),
+                        "web clipping modal closed while commit completes"
+                    );
+                }
+            }
+            self.complete_modal();
         } else if import {
             self.begin_web_clip_import(ctx);
         }
@@ -2719,21 +2825,35 @@ impl GuiApp {
         });
         self.apply_modal_host_action(response.action);
         if confirm {
-            match self.db.delete_web_clipping(dialog.article_id) {
-                Ok(changed) if changed > 0 => {
+            let refresh_scope = self
+                .current_article_projection_scope()
+                .unwrap_or(ProjectionScope::ArticleBookmarks);
+            match self
+                .web_clipping_lifecycle
+                .delete(DeleteWebClippingRequest {
+                    article_id: dialog.article_id,
+                    refresh_scope,
+                }) {
+                Ok(outcome) => {
                     if self.sel_article_id == Some(dialog.article_id) {
                         self.sel_article_id = None;
                         self.body_article_id = None;
                     }
-                    self.load_articles();
-                    self.refresh_saved_selection_count();
+                    self.accept_article_projection(outcome.projection);
+                    tracing::info!(
+                        article_id = outcome.deleted.article_id,
+                        detached_resources = ?outcome.detached_resource_ids,
+                        "web clipping deleted"
+                    );
                     self.notice("本地网页已永久删除");
                 }
-                Ok(_) => {
-                    self.notice("网页不存在或已经删除");
-                }
                 Err(error) => {
-                    self.notice(format!("删除失败：{error}"));
+                    tracing::warn!(
+                        kind = ?error.kind,
+                        detail = %error.technical_detail,
+                        "web clipping delete failed"
+                    );
+                    self.notice(error.user_message);
                 }
             }
             self.complete_modal();
@@ -2757,24 +2877,34 @@ impl GuiApp {
             ResourceFilter::Broken => ResourceCollection::Broken,
             ResourceFilter::Archived => ResourceCollection::Archived,
         };
-        let projection =
-            ResourceLibraryLifecycle::new(&self.db, &self.knowledge_engine, &SystemClock).project(
-                crate::resource_library_lifecycle::ProjectionScope::collection(collection),
-            );
-        let (rows, counts, projection_error) = match projection {
-            Ok(projection) => (projection.resources, projection.counts, None),
-            Err(error) => (
-                Vec::new(),
-                crate::resource_library_lifecycle::ResourceLibraryCounts::default(),
-                Some(error.to_string()),
-            ),
-        };
+        let demand = ResourceProjectionDemand::Collection(collection);
+        let projection_view = self.desktop_projection_frame.resource(demand);
+        let (rows, counts) = projection_view
+            .and_then(|view| view.data.as_ref())
+            .map(|projection| (projection.resources.clone(), projection.counts))
+            .unwrap_or_default();
+        let projection_error = projection_view.and_then(|view| match &view.freshness {
+            ProjectionFreshness::Failed { technical_detail } => Some(technical_detail.clone()),
+            _ => None,
+        });
+        let projection_loading = projection_view.is_none_or(|view| {
+            view.data.is_none()
+                && matches!(
+                    view.freshness,
+                    ProjectionFreshness::Loading | ProjectionFreshness::Refreshing
+                )
+        });
+        let has_more = projection_view.is_some_and(|view| view.has_more);
+        let loading_more = projection_view.is_some_and(|view| {
+            view.data.is_some() && matches!(view.freshness, ProjectionFreshness::Refreshing)
+        });
         enum Action {
             Open(String),
             Edit(Box<crate::resource_library_lifecycle::Resource>),
             Transition(i64, ResourceCurationState),
-            Delete(i64),
+            Delete(i64, String),
             Retry(i64, String),
+            LoadMore,
         }
         let mut action = None;
         let theme = ReaderTheme::sspai();
@@ -2838,22 +2968,23 @@ impl GuiApp {
                             .desired_width(280.0),
                     );
                     if ui.button("搜索资源和文章").clicked() {
-                        match crate::resource_library_lifecycle::legacy_search_json(
-                            &self.db,
-                            &self.resource_query,
-                            true,
-                            true,
-                            false,
-                            20,
-                        ) {
-                            Ok(results) => {
-                                self.resource_search_results = results;
-                                self.resource_search_error = None;
-                            }
-                            Err(error) => {
-                                self.resource_search_results.clear();
-                                self.resource_search_error = Some(error.to_string());
-                            }
+                        let query = self.resource_query.trim().to_owned();
+                        if !query.is_empty() {
+                            let request_id = self.start_search_job(
+                                SearchRequest {
+                                    query,
+                                    scope: SearchScope::Curated,
+                                    result_type: ResultType::All,
+                                    origin: SearchOrigin::Human,
+                                    limit: 50,
+                                },
+                                SearchTarget::ResourceRoute,
+                                ui.ctx(),
+                            );
+                            self.resource_search_results.clear();
+                            self.resource_search_error = None;
+                            self.resource_searching = true;
+                            self.resource_search_request = Some(request_id);
                         }
                     }
                 });
@@ -2886,26 +3017,41 @@ impl GuiApp {
                 }
                 if let Some(error) = &projection_error {
                     ui.colored_label(egui::Color32::RED, format!("读取资源失败：{error}"));
+                    if ui.button("重试读取").clicked() {
+                        self.desktop_projection
+                            .accept(DesktopProjectionFact::RetryResource(demand));
+                    }
+                }
+                if projection_loading {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.weak("正在读取资源…");
+                    });
                 }
                 if !self.resource_query.trim().is_empty() {
+                    if self.resource_searching {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Spinner::new());
+                            ui.label("正在搜索资料库…");
+                        });
+                    }
                     ui.weak(format!(
                         "与 CLI 相同的统一搜索结果：{} 条",
                         self.resource_search_results.len()
                     ));
                     for result in &self.resource_search_results {
-                        let kind = if result["result_type"] == "article" {
-                            "收藏文章"
-                        } else {
-                            "网站资源"
+                        let kind = match result.primary {
+                            PrimaryIdentity::Resource(_) => "网站资源",
+                            PrimaryIdentity::Article(_) => "收藏文章",
                         };
                         ui.horizontal_wrapped(|ui| {
                             ui.label(format!("[{kind}]"));
-                            ui.strong(result["title"].as_str().unwrap_or("未命名"));
-                            if let Some(url) = result["url"].as_str() {
+                            ui.strong(result.title.as_deref().unwrap_or("未命名"));
+                            if let Some(url) = result.url.as_deref() {
                                 ui.hyperlink_to("打开", url);
                             }
-                            if let Some(purpose) = result["purpose_zh"].as_str() {
-                                ui.weak(purpose);
+                            if let Some(evidence) = result.evidence.first() {
+                                ui.weak(&evidence.text);
                             }
                         });
                     }
@@ -3007,13 +3153,28 @@ impl GuiApp {
                                         | ResourceCurationState::Archived
                                 ) && ui.button("永久删除").clicked()
                                 {
-                                    action = Some(Action::Delete(resource.id));
+                                    action = Some(Action::Delete(
+                                        resource.id,
+                                        resource.title.clone().unwrap_or_else(|| {
+                                            format!("Resource #{}", resource.id)
+                                        }),
+                                    ));
                                 }
                             });
                         });
                         ui.add_space(6.0);
                     }
-                    if rows.is_empty() {
+                    if has_more {
+                        ui.horizontal(|ui| {
+                            if loading_more {
+                                ui.spinner();
+                                ui.weak("正在加载更多资源…");
+                            } else if ui.button("加载更多").clicked() {
+                                action = Some(Action::LoadMore);
+                            }
+                        });
+                    }
+                    if rows.is_empty() && !projection_loading {
                         ui.weak(
                             "这里还没有资源。可以先添加常用网站，例如图标、设计素材或开发工具站。",
                         );
@@ -3034,6 +3195,7 @@ impl GuiApp {
                 };
                 self.set_resource_panel(Some(ResourceEditDialog {
                     id: resource.id,
+                    hydrated: true,
                     title: values.title.clone(),
                     purpose_zh: values.purpose_zh.clone(),
                     note: values.note.clone(),
@@ -3051,25 +3213,24 @@ impl GuiApp {
                     },
                     crate::resource_library_lifecycle::ProjectionScope::collection(collection),
                 ) {
-                    Ok(_) => {
+                    Ok(outcome) => {
+                        self.desktop_projection
+                            .accept(DesktopProjectionFact::adopt_resource(outcome.projection));
                         self.notice("资源状态已更新");
                     }
                     Err(e) => self.notice(format!("操作失败：{e}")),
                 }
             }
-            Some(Action::Delete(id)) => {
-                let title =
-                    ResourceLibraryLifecycle::new(&self.db, &self.knowledge_engine, &SystemClock)
-                        .project(crate::resource_library_lifecycle::ProjectionScope::Resource(id))
-                        .ok()
-                        .and_then(|projection| projection.detail)
-                        .and_then(|detail| detail.resource.title)
-                        .unwrap_or_else(|| format!("资源 #{id}"));
+            Some(Action::Delete(id, title)) => {
                 self.open_modal(ModalState::DeleteResource { id, title });
             }
             Some(Action::Retry(id, url)) => {
                 let _ = url;
                 self.retry_resource_task(id, &ctx);
+            }
+            Some(Action::LoadMore) => {
+                self.desktop_projection
+                    .accept(DesktopProjectionFact::LoadMoreResources(collection));
             }
             None => {}
         }
@@ -3137,7 +3298,9 @@ impl GuiApp {
                         ResourceCollection::Active,
                     ),
                 ) {
-                Ok(_) => {
+                Ok(outcome) => {
+                    self.desktop_projection
+                        .accept(DesktopProjectionFact::adopt_resource(outcome.projection));
                     self.complete_modal();
                     self.notice("资源网址已保存；断网也不会丢失");
                 }
@@ -3152,21 +3315,46 @@ impl GuiApp {
 
     fn show_resource_editor(&mut self, ui: &mut egui::Ui) {
         let show_discard = self.ui_state.discard_owner() == Some(DiscardOwner::Panel);
-        let task = self.resource_dialog().and_then(|dialog| {
-            self.knowledge_task(KnowledgeTaskKind::ResourceCompletion, dialog.id)
+        let task_resource_id = self.resource_dialog().map(|dialog| dialog.id);
+        let task = task_resource_id.and_then(|resource_id| {
+            self.knowledge_task(KnowledgeTaskKind::ResourceCompletion, resource_id)
         });
         let details = self.resource_dialog().and_then(|dialog| {
-            let service = crate::resource_library_lifecycle::ResourceLibraryLifecycle::new(
-                &self.db,
-                &self.knowledge_engine,
-                &crate::resource_library_lifecycle::SystemClock,
-            );
-            service
-                .project(crate::resource_library_lifecycle::ProjectionScope::Resource(dialog.id))
-                .ok()
-                .and_then(|projection| projection.detail)
-                .map(|detail| (detail.resource, detail.categories, detail.tags))
+            self.desktop_projection_frame
+                .resource(ResourceProjectionDemand::Detail(dialog.id))
+                .and_then(|view| view.data.as_ref())
+                .and_then(|projection| projection.detail.as_ref())
+                .map(|detail| {
+                    (
+                        detail.resource.clone(),
+                        detail.categories.clone(),
+                        detail.tags.clone(),
+                    )
+                })
         });
+        if let Some((resource, _, _)) = &details
+            && self
+                .resource_dialog()
+                .is_some_and(|dialog| !dialog.hydrated)
+        {
+            let values = ResourceEditValues {
+                title: resource.title.clone().unwrap_or_default(),
+                purpose_zh: resource.purpose_zh.clone().unwrap_or_default(),
+                note: resource.private_note.clone().unwrap_or_default(),
+                private: resource.privacy
+                    == crate::resource_library_lifecycle::ResourcePrivacy::Private,
+                rating: resource.manual_rating.unwrap_or(0),
+            };
+            if let Some(dialog) = self.resource_dialog_mut() {
+                dialog.title = values.title.clone();
+                dialog.purpose_zh = values.purpose_zh.clone();
+                dialog.note = values.note.clone();
+                dialog.private = values.private;
+                dialog.rating = values.rating;
+                dialog.original = values;
+                dialog.hydrated = true;
+            }
+        }
         let Some(dialog) = self.resource_dialog_mut() else {
             return;
         };
@@ -3322,7 +3510,10 @@ impl GuiApp {
             );
         });
         ui.add_space(8.0);
-        if ui.button("保存修改").clicked() {
+        if ui
+            .add_enabled(details.is_some(), egui::Button::new("保存修改"))
+            .clicked()
+        {
             save = true;
         }
         let update = save.then(|| {
@@ -3351,21 +3542,21 @@ impl GuiApp {
             };
             let lifecycle =
                 ResourceLibraryLifecycle::new(&self.db, &self.knowledge_engine, &SystemClock);
-            let result = lifecycle
-                .project(crate::resource_library_lifecycle::ProjectionScope::Resource(id))
-                .and_then(|projection| {
-                    let detail = projection.detail.ok_or_else(|| LifecycleFailure {
-                        kind: FailureKind::Storage,
-                        user_message: "资源详情读取失败".into(),
-                        technical_detail: format!("RESOURCE_DETAIL_MISSING: {id}"),
-                    })?;
+            let result = details
+                .clone()
+                .ok_or_else(|| LifecycleFailure {
+                    kind: FailureKind::Storage,
+                    user_message: "资源详情读取失败".into(),
+                    technical_detail: format!("RESOURCE_DETAIL_MISSING: {id}"),
+                })
+                .and_then(|(resource, categories, tags)| {
                     lifecycle
                         .apply(
                             ResourceLifecycleChange::CompleteManualEdit(CompleteManualEdit {
                                 resource_id: id,
                                 title,
                                 purpose_zh: purpose,
-                                use_when_zh: detail.resource.use_when_zh,
+                                use_when_zh: resource.use_when_zh,
                                 private_note: note,
                                 privacy: if private {
                                     ResourcePrivacy::Private
@@ -3373,15 +3564,17 @@ impl GuiApp {
                                     ResourcePrivacy::Public
                                 },
                                 manual_rating: rating,
-                                categories: detail.categories,
-                                tags: detail.tags,
+                                categories,
+                                tags,
                             }),
                             crate::resource_library_lifecycle::ProjectionScope::Resource(id),
                         )
-                        .map(|_| ())
+                        .map(|outcome| outcome.projection)
                 });
             match result {
-                Ok(_) => {
+                Ok(projection) => {
+                    self.desktop_projection
+                        .accept(DesktopProjectionFact::adopt_resource(projection));
                     self.ui_state.finish_panel();
                     self.notice("资源已更新");
                 }
@@ -3553,7 +3746,11 @@ impl GuiApp {
                     crate::resource_library_lifecycle::ResourceCollection::Archived,
                 ),
             ) {
-                Ok(_) => self.notice("资源已永久删除"),
+                Ok(outcome) => {
+                    self.desktop_projection
+                        .accept(DesktopProjectionFact::adopt_resource(outcome.projection));
+                    self.notice("资源已永久删除");
+                }
                 Err(error) => self.notice(format!("删除失败：{error}")),
             }
             self.complete_modal();
@@ -3630,6 +3827,8 @@ impl GuiApp {
                 ),
             ) {
                 Ok(outcome) => {
+                    self.desktop_projection
+                        .accept(DesktopProjectionFact::adopt_resource(outcome.projection));
                     self.notice(format!(
                         "已导入 {} 个资源，正在后台补全描述",
                         outcome.affected_resource_ids.len()
@@ -3645,14 +3844,29 @@ impl GuiApp {
         if self.ui_state.route() != Route::Excerpts {
             return;
         }
-
         let theme = ReaderTheme::sspai();
-        let (rows, load_error) = match self.db.saved_selections() {
-            Ok(rows) => (rows, None),
-            Err(error) => (Vec::new(), Some(error.to_string())),
-        };
-        let mut open_article = None;
-        let mut delete_selection = None;
+        let projection = self.excerpt_projection(ExcerptProjectionScope::Library);
+        let loading = projection.is_none()
+            && self
+                .desktop_projection_frame
+                .excerpt(ExcerptProjectionScope::Library)
+                .is_some_and(|view| {
+                    matches!(
+                        view.freshness,
+                        ProjectionFreshness::Loading | ProjectionFreshness::Refreshing
+                    )
+                });
+        let rows = projection
+            .as_ref()
+            .map(|projection| projection.excerpts.clone())
+            .unwrap_or_default();
+        let thought_count = projection
+            .as_ref()
+            .map_or(0, |projection| projection.counts.library_thoughts);
+        let mut open_article: Option<ExcerptView> = None;
+        let mut edit_thought: Option<ExcerptView> = None;
+        let mut remove_thought = None;
+        let mut delete_excerpt: Option<ExcerptView> = None;
 
         egui::CentralPanel::default()
             .frame(
@@ -3670,31 +3884,37 @@ impl GuiApp {
                 );
                 ui.add_space(4.0);
                 ui.label(
-                    egui::RichText::new("摘录用于保留原文片段；想法是附在摘录上的个人笔记。")
-                        .size(13.0)
+                    egui::RichText::new(format!(
+                        "摘录用于保留原文片段；其中 {thought_count} 条附有个人想法。"
+                    ))
+                        .size(15.0)
                         .color(theme.muted),
                 );
                 ui.add_space(8.0);
                 ui.separator();
                 ui.add_space(6.0);
 
-                if let Some(error) = &load_error {
-                    ui.colored_label(ui.visuals().error_fg_color, format!("读取失败：{error}"));
+                if loading {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(80.0);
+                        ui.label(egui::RichText::new("正在加载摘录与想法…").color(theme.muted));
+                    });
                     return;
                 }
+
                 if rows.is_empty() {
                     ui.vertical_centered(|ui| {
                         ui.add_space(80.0);
                         ui.label(
                             egui::RichText::new("还没有摘录或想法")
-                                .size(18.0)
+                                .size(20.0)
                                 .color(theme.text)
                                 .family(egui::FontFamily::Name("cjk-bold".into())),
                         );
                         ui.add_space(8.0);
                         ui.label(
                             egui::RichText::new("在正文中选中文字，然后点击“摘录”或“写想法”。")
-                                .size(13.0)
+                                .size(15.0)
                                 .color(theme.muted),
                         );
                     });
@@ -3704,7 +3924,7 @@ impl GuiApp {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for (selection, feed_id, article_title) in &rows {
+                        for excerpt in &rows {
                             egui::Frame::new()
                                 .fill(theme.code_bg)
                                 .stroke(egui::Stroke::new(1.0, theme.border))
@@ -3713,28 +3933,43 @@ impl GuiApp {
                                 .show(ui, |ui| {
                                     ui.set_width(ui.available_width());
                                     ui.horizontal(|ui| {
-                                        if selection.is_favorite {
-                                            ui.label(
-                                                egui::RichText::new("★ 摘录")
-                                                    .size(12.0)
-                                                    .color(theme.accent),
-                                            );
-                                        }
-                                        if selection.comment.is_some() {
+                                        ui.label(
+                                            egui::RichText::new("★ 摘录")
+                                                .size(13.0)
+                                                .color(theme.accent),
+                                        );
+                                        if excerpt.thought.is_some() {
                                             ui.label(
                                                 egui::RichText::new("✎ 想法")
-                                                    .size(12.0)
+                                                    .size(13.0)
                                                     .color(theme.link),
+                                            );
+                                        }
+                                        if excerpt.identity_kind == ExcerptIdentityKind::Legacy {
+                                            ui.label(
+                                                egui::RichText::new("历史记录")
+                                                    .size(13.0)
+                                                    .color(theme.muted),
+                                            );
+                                        }
+                                        if matches!(
+                                            excerpt.resolution,
+                                            crate::excerpt_thought_lifecycle::ExcerptResolution::Unresolved
+                                        ) {
+                                            ui.label(
+                                                egui::RichText::new("未定位")
+                                                    .size(13.0)
+                                                    .color(theme.muted),
                                             );
                                         }
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
                                                 ui.label(
-                                                    egui::RichText::new(text::fmt_ts(
-                                                        selection.updated_at,
+                                                    egui::RichText::new(format_timestamp(
+                                                        excerpt.updated_at,
                                                     ))
-                                                    .size(11.0)
+                                                    .size(13.0)
                                                     .color(theme.muted),
                                                 );
                                             },
@@ -3745,14 +3980,14 @@ impl GuiApp {
                                         egui::Label::new(
                                             egui::RichText::new(format!(
                                                 "“{}”",
-                                                selection.selected_text
+                                                excerpt.selected_text
                                             ))
-                                            .size(15.0)
+                                            .size(17.0)
                                             .color(theme.text),
                                         )
                                         .wrap(),
                                     );
-                                    if let Some(comment) = &selection.comment {
+                                    if let Some(thought) = &excerpt.thought {
                                         ui.add_space(9.0);
                                         egui::Frame::new()
                                             .fill(theme.selected_bg)
@@ -3761,8 +3996,8 @@ impl GuiApp {
                                             .show(ui, |ui| {
                                                 ui.add(
                                                     egui::Label::new(
-                                                        egui::RichText::new(comment)
-                                                            .size(14.0)
+                                                        egui::RichText::new(&thought.content)
+                                                            .size(15.0)
                                                             .color(theme.text),
                                                     )
                                                     .wrap(),
@@ -3771,14 +4006,16 @@ impl GuiApp {
                                     }
                                     ui.add_space(9.0);
                                     ui.horizontal(|ui| {
-                                        let title = article_title
+                                        let title = excerpt
+                                            .source
+                                            .title
                                             .as_deref()
                                             .filter(|title| !title.trim().is_empty())
                                             .unwrap_or("未命名文章");
                                         ui.add(
                                             egui::Label::new(
                                                 egui::RichText::new(title)
-                                                    .size(12.0)
+                                                    .size(13.0)
                                                     .color(theme.muted),
                                             )
                                             .truncate(),
@@ -3789,32 +4026,56 @@ impl GuiApp {
                                                 if ui
                                                     .add(
                                                         egui::Button::new(
-                                                            egui::RichText::new("删除")
-                                                                .size(12.0)
+                                                            egui::RichText::new("删除摘录")
+                                                                .size(13.0)
                                                                 .color(theme.muted),
                                                         )
                                                         .stroke(egui::Stroke::NONE),
                                                     )
                                                     .clicked()
                                                 {
-                                                    delete_selection = Some(selection.id);
+                                                    delete_excerpt = Some(excerpt.clone());
+                                                }
+                                                if excerpt.thought.is_some()
+                                                    && ui
+                                                        .add(
+                                                            egui::Button::new(
+                                                                egui::RichText::new("删除想法")
+                                                                    .size(13.0)
+                                                                    .color(theme.muted),
+                                                            )
+                                                            .stroke(egui::Stroke::NONE),
+                                                        )
+                                                        .clicked()
+                                                {
+                                                    remove_thought = Some(excerpt.id);
+                                                }
+                                                if excerpt.thought.is_some()
+                                                    && ui
+                                                        .add(
+                                                            egui::Button::new(
+                                                                egui::RichText::new("编辑想法")
+                                                                    .size(13.0)
+                                                                    .color(theme.link),
+                                                            )
+                                                            .stroke(egui::Stroke::NONE),
+                                                        )
+                                                        .clicked()
+                                                {
+                                                    edit_thought = Some(excerpt.clone());
                                                 }
                                                 if ui
                                                     .add(
                                                         egui::Button::new(
                                                             egui::RichText::new("打开文章 ↗")
-                                                                .size(12.0)
+                                                                .size(13.0)
                                                                 .color(theme.link),
                                                         )
                                                         .stroke(egui::Stroke::NONE),
                                                     )
                                                     .clicked()
                                                 {
-                                                    open_article = Some((
-                                                        *feed_id,
-                                                        selection.article_id,
-                                                        selection.clone(),
-                                                    ));
+                                                    open_article = Some(excerpt.clone());
                                                 }
                                             },
                                         );
@@ -3825,27 +4086,21 @@ impl GuiApp {
                     });
             });
 
-        if let Some(selection_id) = delete_selection {
-            match self.db.delete_selection(selection_id) {
-                Ok(_) => {
-                    self.refresh_saved_selection_count();
-                    self.notice("摘录已删除");
-                }
-                Err(error) => {
-                    self.notice(format!("删除失败：{error}"));
-                }
-            }
+        if let Some(excerpt) = edit_thought {
+            self.begin_edit_thought(&excerpt);
+        } else if let Some(excerpt_id) = remove_thought {
+            self.remove_thought(excerpt_id, ExcerptProjectionScope::Library);
+        } else if let Some(excerpt) = delete_excerpt {
+            self.request_delete_excerpt(&excerpt, ExcerptProjectionScope::Library);
         }
-        if let Some((feed_id, article_id, selection)) = open_article {
-            if self.web_clipping_ids.contains(&article_id)
-                || self.db.is_web_clipping(article_id).unwrap_or(false)
-            {
+        if let Some(excerpt) = open_article {
+            if excerpt.source.origin == ExcerptArticleOrigin::WebClipping {
                 self.select_saved_articles();
             } else {
-                self.select_feed(feed_id);
+                self.select_feed(excerpt.source.feed_id);
             }
-            self.select_article(article_id);
-            self.pending_selection_anchor = Some(selection);
+            self.select_article(excerpt.article_id);
+            self.pending_selection_anchor = Some(excerpt.as_article_selection());
             self.notice("已打开原文章，正在定位摘录");
         }
     }
@@ -3856,7 +4111,16 @@ impl GuiApp {
         }
 
         let theme = ReaderTheme::sspai();
-        let articles = self.articles.clone();
+        let projection = self.article_projection(ProjectionScope::Archive);
+        let articles = projection
+            .as_deref()
+            .map(|projection| projection.articles.clone())
+            .unwrap_or_default();
+        let loading = projection.is_none()
+            && matches!(
+                self.current_article_freshness(),
+                Some(ProjectionFreshness::Loading | ProjectionFreshness::Refreshing)
+            );
         let mut restore_article = None;
 
         egui::CentralPanel::default()
@@ -3878,26 +4142,33 @@ impl GuiApp {
                     egui::RichText::new(
                         "归档文章不会出现在订阅列表中，刷新同一订阅源也不会恢复它。",
                     )
-                    .size(13.0)
+                    .size(15.0)
                     .color(theme.muted),
                 );
                 ui.add_space(8.0);
                 ui.separator();
                 ui.add_space(6.0);
 
+                if loading {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(80.0);
+                        ui.label(egui::RichText::new("正在加载归档文章…").color(theme.muted));
+                    });
+                    return;
+                }
                 if articles.is_empty() {
                     ui.vertical_centered(|ui| {
                         ui.add_space(80.0);
                         ui.label(
                             egui::RichText::new("还没有归档文章")
-                                .size(18.0)
+                                .size(20.0)
                                 .color(theme.text)
                                 .family(egui::FontFamily::Name("cjk-bold".into())),
                         );
                         ui.add_space(8.0);
                         ui.label(
                             egui::RichText::new("在文章列表中右键一篇文章即可归档。")
-                                .size(13.0)
+                                .size(15.0)
                                 .color(theme.muted),
                         );
                     });
@@ -3924,7 +4195,7 @@ impl GuiApp {
                                                     .filter(|title| !title.trim().is_empty())
                                                     .unwrap_or("未命名文章"),
                                             )
-                                            .size(15.0)
+                                            .size(17.0)
                                             .color(theme.text)
                                             .family(egui::FontFamily::Name("cjk-bold".into())),
                                         )
@@ -3932,12 +4203,12 @@ impl GuiApp {
                                     );
                                     ui.add_space(6.0);
                                     ui.horizontal(|ui| {
-                                        let date = article
-                                            .published
-                                            .map(text::fmt_ts)
-                                            .unwrap_or_else(|| text::fmt_ts(article.fetched_at));
+                                        let date =
+                                            article.published.map(format_timestamp).unwrap_or_else(
+                                                || format_timestamp(article.fetched_at),
+                                            );
                                         ui.label(
-                                            egui::RichText::new(date).size(11.0).color(theme.muted),
+                                            egui::RichText::new(date).size(13.0).color(theme.muted),
                                         );
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
@@ -3946,7 +4217,7 @@ impl GuiApp {
                                                     .add(
                                                         egui::Button::new(
                                                             egui::RichText::new("恢复并打开")
-                                                                .size(12.0)
+                                                                .size(13.0)
                                                                 .color(theme.link),
                                                         )
                                                         .stroke(egui::Stroke::NONE),
@@ -4010,7 +4281,7 @@ impl GuiApp {
                 if ui
                     .add_sized(
                         egui::vec2(68.0, 34.0),
-                        egui::Button::new(egui::RichText::new("搜索").size(13.0).color(theme.text))
+                        egui::Button::new(egui::RichText::new("搜索").size(15.0).color(theme.text))
                             .fill(theme.selected_bg)
                             .stroke(egui::Stroke::new(1.0, theme.border)),
                     )
@@ -4024,7 +4295,7 @@ impl GuiApp {
                 egui::RichText::new(
                     "支持标题、作者、正文、网址、摘录原文和想法内容；最多显示 200 条。",
                 )
-                .size(12.0)
+                .size(13.0)
                 .color(theme.muted),
             );
             ui.add_space(8.0);
@@ -4035,12 +4306,19 @@ impl GuiApp {
                 ui.colored_label(ui.visuals().error_fg_color, error);
                 return;
             }
+            if dialog.searching {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new());
+                    ui.label("正在搜索资料库…");
+                });
+                return;
+            }
             if dialog.searched_query.is_empty() {
                 if !dialog.history.is_empty() {
                     ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new("最近搜索")
-                                .size(13.0)
+                                .size(15.0)
                                 .color(theme.text)
                                 .family(egui::FontFamily::Name("cjk-bold".into())),
                         );
@@ -4048,7 +4326,7 @@ impl GuiApp {
                             if ui
                                 .add(
                                     egui::Button::new(
-                                        egui::RichText::new("清空").size(12.0).color(theme.muted),
+                                        egui::RichText::new("清空").size(13.0).color(theme.muted),
                                     )
                                     .stroke(egui::Stroke::NONE),
                                 )
@@ -4084,14 +4362,14 @@ impl GuiApp {
                     ui.add_space(55.0);
                     ui.label(
                         egui::RichText::new("在一个入口里找回所有阅读资料")
-                            .size(18.0)
+                            .size(20.0)
                             .color(theme.text)
                             .family(egui::FontFamily::Name("cjk-bold".into())),
                     );
                     ui.add_space(8.0);
                     ui.label(
                         egui::RichText::new("快捷键 Ctrl + F")
-                            .size(13.0)
+                            .size(15.0)
                             .color(theme.muted),
                     );
                 });
@@ -4100,13 +4378,13 @@ impl GuiApp {
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new(format!("找到 {} 条结果", dialog.results.len()))
-                        .size(13.0)
+                        .size(15.0)
                         .color(theme.text)
                         .family(egui::FontFamily::Name("cjk-bold".into())),
                 );
                 ui.label(
                     egui::RichText::new(format!("“{}”", dialog.searched_query))
-                        .size(12.0)
+                        .size(13.0)
                         .color(theme.muted),
                 );
             });
@@ -4118,7 +4396,7 @@ impl GuiApp {
                     ui.add_space(6.0);
                     ui.label(
                         egui::RichText::new("换一个更短或更常见的关键词试试。")
-                            .size(12.0)
+                            .size(13.0)
                             .color(theme.muted),
                     );
                 });
@@ -4129,11 +4407,9 @@ impl GuiApp {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     for hit in &dialog.results {
-                        let (kind, kind_color) = match hit.kind {
-                            SearchHitKind::Article => ("文章", theme.link),
-                            SearchHitKind::WebClipping => ("网页快照", theme.accent),
-                            SearchHitKind::Excerpt => ("摘录", theme.link),
-                            SearchHitKind::Thought => ("想法", theme.accent),
+                        let (kind, kind_color) = match hit.primary {
+                            PrimaryIdentity::Resource(_) => ("资源", theme.accent),
+                            PrimaryIdentity::Article(_) => ("文章", theme.link),
                         };
                         let response = egui::Frame::new()
                             .fill(theme.code_bg)
@@ -4145,29 +4421,29 @@ impl GuiApp {
                                 ui.horizontal(|ui| {
                                     ui.label(
                                         egui::RichText::new(kind)
-                                            .size(11.0)
+                                            .size(13.0)
                                             .color(kind_color)
                                             .background_color(theme.selected_bg),
                                     );
                                     if hit.archived {
                                         ui.label(
                                             egui::RichText::new("已归档")
-                                                .size(11.0)
+                                                .size(13.0)
                                                 .color(theme.muted),
                                         );
                                     }
                                     ui.label(
-                                        egui::RichText::new(text::fmt_ts(hit.timestamp))
-                                            .size(11.0)
+                                        egui::RichText::new(format_timestamp(hit.updated_at))
+                                            .size(13.0)
                                             .color(theme.muted),
                                     );
                                 });
                                 ui.add_space(5.0);
                                 let title = hit
-                                    .article_title
+                                    .title
                                     .as_deref()
                                     .filter(|title| !title.trim().is_empty())
-                                    .unwrap_or("未命名文章");
+                                    .unwrap_or("未命名资料");
                                 ui.add(
                                     egui::Label::new(search_highlight_layout_job(
                                         title,
@@ -4180,8 +4456,13 @@ impl GuiApp {
                                     .wrap(),
                                 );
                                 ui.add_space(5.0);
-                                let preview =
-                                    search_preview(&hit.snippet, &dialog.searched_query, 180);
+                                let preview = hit
+                                    .evidence
+                                    .first()
+                                    .map(|evidence| {
+                                        search_preview(&evidence.text, &dialog.searched_query, 180)
+                                    })
+                                    .unwrap_or_default();
                                 ui.add(
                                     egui::Label::new(search_highlight_layout_job(
                                         &preview,
@@ -4216,7 +4497,7 @@ impl GuiApp {
         self.apply_modal_host_action(response.action);
 
         if clear_history {
-            if let Err(error) = self.db.clear_search_history() {
+            if let Err(error) = LibrarySearch::new(&self.db).clear_history() {
                 self.notice(format!("清空搜索历史失败：{error}"));
             }
             if let Some(dialog) = self.search_dialog_mut() {
@@ -4225,7 +4506,7 @@ impl GuiApp {
         }
 
         if submit {
-            self.run_search();
+            self.run_search(ctx);
         } else if let Some(hit) = selected_hit {
             self.open_search_result(&hit);
         }
@@ -4237,6 +4518,7 @@ impl GuiApp {
             Some(ModalKind::Search) => self.show_search_window(ctx),
             Some(ModalKind::EditTags) => self.show_tag_dialog(ctx),
             Some(ModalKind::WriteThought) => self.show_comment_dialog(ctx),
+            Some(ModalKind::DeleteExcerpt) => self.show_delete_excerpt_dialog(ctx),
             Some(ModalKind::SaveWebPage) => self.show_web_clip_dialog(ctx),
             Some(ModalKind::DeleteWebPage) => self.show_delete_web_clip_dialog(ctx),
             Some(ModalKind::AddResource) => self.show_resource_add_dialog(ctx),
@@ -4284,7 +4566,7 @@ impl GuiApp {
                             );
                             ui.add(
                                 egui::Label::new(
-                                    egui::RichText::new(message).size(13.0).color(theme.text),
+                                    egui::RichText::new(message).size(15.0).color(theme.text),
                                 )
                                 .wrap(),
                             );
@@ -4371,162 +4653,6 @@ impl GuiApp {
             }
         }
     }
-
-    fn update_article_selection(
-        &mut self,
-        ctx: &egui::Context,
-        article_id: i64,
-        frame: &ArticleSelectionFrame,
-    ) -> ArticleSelectionResult {
-        let (pointer_pos, primary_pressed, primary_down, primary_released) = ctx.input(|input| {
-            (
-                input.pointer.interact_pos(),
-                input.pointer.primary_pressed(),
-                input.pointer.primary_down(),
-                input.pointer.primary_released(),
-            )
-        });
-        let mut drag_started = false;
-        let drag_was_active = self.article_selection_drag.is_some();
-
-        if self
-            .article_selection_drag
-            .as_ref()
-            .is_some_and(|drag| drag.article_id != article_id)
-        {
-            self.article_selection_drag = None;
-        }
-
-        // `primary_pressed` is normally enough, but a label-selection drag
-        // can capture the pointer before this panel is visited.  Arm the
-        // article-level state on the first frame with the button down as
-        // well; otherwise egui paints a valid blue selection while we never
-        // receive an anchor from which to open the toolbar on release.
-        if primary_pressed || (primary_down && self.article_selection_drag.is_none()) {
-            if let Some(cursor) =
-                pointer_pos.and_then(|position| article_cursor_for_pointer(frame, position))
-            {
-                self.article_selection_drag = Some(ArticleSelectionDrag {
-                    article_id,
-                    anchor: cursor,
-                    focus: cursor,
-                });
-                drag_started = true;
-            } else if primary_pressed {
-                self.article_selection_drag = None;
-            }
-        }
-
-        if (primary_down || primary_released)
-            && let Some(position) = pointer_pos
-            && let Some(cursor) = article_cursor_nearest(frame, position)
-            && let Some(drag) = self.article_selection_drag.as_mut()
-            && drag.article_id == article_id
-        {
-            drag.focus = cursor;
-        }
-
-        // When the pointer leaves the native window, some backends report the
-        // button transition as `primary_down = false` without a separate
-        // `primary_released` event.  Treat that transition as a release only
-        // when an article drag was already armed; a normal click still yields
-        // an empty quote and therefore no popup.
-        let pointer_finished =
-            primary_released || (drag_was_active && !primary_down && !primary_pressed);
-        let popup_request = if pointer_finished {
-            self.article_selection_drag.take().and_then(|drag| {
-                let quote = selected_quote_from_article_text(
-                    article_id,
-                    &frame.plain_text,
-                    drag.anchor.char_index,
-                    drag.focus.char_index,
-                )?;
-                let (anchor_rect, source_layer) = article_cursor_anchor(frame, drag.focus)?;
-                Some(SelectionPopupRequest {
-                    quote,
-                    anchor_rect,
-                    source_layer,
-                })
-            })
-        } else {
-            None
-        };
-
-        ArticleSelectionResult {
-            popup_request,
-            drag_started,
-        }
-    }
-
-    fn receive_images(&mut self, ctx: &egui::Context) {
-        while let Ok(event) = self.image_event_rx.try_recv() {
-            match event {
-                ImageEvent::Progress { uri, attempt } => {
-                    if let Some(ImageState::Loading {
-                        attempt: current, ..
-                    }) = self.image_cache.get_mut(&uri)
-                    {
-                        *current = attempt;
-                    }
-                }
-                ImageEvent::Complete { uri, result } => {
-                    let state = match result {
-                        Ok(bytes) => match image::load_from_memory(bytes.as_ref()) {
-                            Ok(decoded) => ImageState::Ready {
-                                dimensions: Some((decoded.width(), decoded.height())),
-                                bytes,
-                            },
-                            Err(error) => ImageState::Failed(ImageFailure {
-                                message: "图片格式无法显示".to_owned(),
-                                detail: error.to_string(),
-                                attempts: 1,
-                                retryable: false,
-                            }),
-                        },
-                        Err(error) => ImageState::Failed(error),
-                    };
-                    self.image_cache.insert(uri, state);
-                }
-            }
-            ctx.request_repaint();
-        }
-    }
-
-    fn receive_formulas(&mut self, ctx: &egui::Context) {
-        while let Ok(event) = self.formula_event_rx.try_recv() {
-            match event {
-                FormulaEvent::Complete { key, result } => {
-                    self.formula_cache.insert(
-                        key,
-                        match result {
-                            Ok(bytes) => FormulaState::Ready(bytes),
-                            Err(error) => FormulaState::Failed(error),
-                        },
-                    );
-                }
-            }
-            ctx.request_repaint();
-        }
-    }
-
-    fn handle_tray_events(&mut self, ctx: &egui::Context) {
-        while let Ok(ev) = MenuEvent::receiver().try_recv() {
-            if ev.id == self.tray_toggle {
-                self.hidden = !self.hidden;
-                ctx.send_viewport_cmd(ViewportCommand::Visible(!self.hidden));
-                if !self.hidden {
-                    ctx.send_viewport_cmd(ViewportCommand::Focus);
-                }
-            } else if ev.id == self.tray_fetch {
-                if let Err(error) = self.rss_refresh.request_all() {
-                    self.notice(format!("无法启动订阅刷新：{error}"));
-                }
-            } else if ev.id == self.tray_quit {
-                self.quitting = true;
-                ctx.send_viewport_cmd(ViewportCommand::Close);
-            }
-        }
-    }
 }
 
 impl eframe::App for GuiApp {
@@ -4541,6 +4667,15 @@ impl eframe::App for GuiApp {
     // eframe 0.35：App 入口是 ui(&mut Ui)，panel 在根 Ui 内 show。
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        for intent in self.desktop.poll(&ctx) {
+            match intent {
+                DesktopIntent::RefreshAllFeeds => {
+                    if let Err(error) = self.rss_refresh.request_all() {
+                        self.notice(format!("无法启动订阅刷新：{error}"));
+                    }
+                }
+            }
+        }
         self.receive_maintenance_updates(&ctx);
         self.receive_rss_refresh_updates();
         if !self.db.is_open() {
@@ -4558,25 +4693,15 @@ impl eframe::App for GuiApp {
         {
             self.open_search();
         }
-        self.shared.focused.store(
-            ctx.input(|i| i.viewport().focused.unwrap_or(true)),
-            Ordering::Relaxed,
-        );
-        self.receive_images(&ctx);
-        self.receive_formulas(&ctx);
-        self.receive_web_clip_events(&ctx);
+        self.receive_web_clipping_updates(&ctx);
+        self.receive_search_events(&ctx);
         self.receive_knowledge_updates(&ctx);
-        self.handle_tray_events(&ctx);
-
-        // 关窗 → 隐藏到托盘（除非托盘"退出"已置 quitting，ADR-15）。
-        if !self.quitting && ctx.input(|i| i.viewport().close_requested()) {
-            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
-            self.hidden = true;
-        }
-        // 心跳：即便隐藏/空闲也定期醒来轮询托盘事件。
-        // ponytail: 250ms 轮询够跟手；想省这点空转再上 MenuEvent::set_event_handler + proxy。
-        ctx.request_repaint_after(Duration::from_millis(250));
+        self.refresh_desktop_projection_frame();
+        self.publish_pending_knowledge_notices();
+        let article_projection = self.current_article_projection();
+        let article_freshness = self.current_article_freshness();
+        let (saved_article_count, read_later_count, archived_article_count) =
+            self.current_article_counts();
 
         let rss_snapshot = self.rss_refresh.snapshot();
         let busy = rss_snapshot.current.is_some();
@@ -4598,10 +4723,10 @@ impl eframe::App for GuiApp {
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new("订阅")
-                            .size(18.0)
+                            .size(20.0)
                             .family(egui::FontFamily::Name("cjk-bold".into())),
                     );
-                    let total_unread: i64 = self.feeds.iter().map(|(_, unread)| unread).sum();
+                    let total_unread = self.current_total_unread();
                     if total_unread > 0 {
                         ui.label(
                             egui::RichText::new(total_unread.to_string())
@@ -4622,8 +4747,8 @@ impl eframe::App for GuiApp {
                                 ArticleCollection::Feed(Some(id)) => Some(id),
                                 _ => None,
                             })
-                            .and_then(|id| self.feeds.iter().find(|(feed, _)| feed.id == id))
-                            .map(|(feed, _)| feed.clone());
+                            .and_then(|id| self.feeds.iter().find(|feed| feed.id == id))
+                            .cloned();
                         if ui
                             .add_enabled(selected_feed.is_some(), egui::Button::new("－"))
                             .on_hover_text("删除当前订阅")
@@ -4648,7 +4773,7 @@ impl eframe::App for GuiApp {
                             .add_enabled(
                                 !busy,
                                 egui::Button::new(
-                                    egui::RichText::new(label).size(12.0).color(theme.muted),
+                                    egui::RichText::new(label).size(13.0).color(theme.muted),
                                 )
                                 .stroke(egui::Stroke::NONE),
                             )
@@ -4684,7 +4809,7 @@ impl eframe::App for GuiApp {
                 ui.add_space(4.0);
                 let search_response = ui.add_enabled(
                     !modal_open,
-                    egui::Button::new(egui::RichText::new("⌕ 全文搜索   Ctrl+F").size(13.0).color(
+                    egui::Button::new(egui::RichText::new("⌕ 全文搜索   Ctrl+F").size(15.0).color(
                         if self.ui_state.modal_kind() == Some(ModalKind::Search) {
                             theme.text
                         } else {
@@ -4710,8 +4835,8 @@ impl eframe::App for GuiApp {
                 );
                 let saved_articles_response = ui.add(
                     egui::Button::new(
-                        egui::RichText::new(format!("★ 文章收藏  {}", self.saved_article_count))
-                            .size(13.0)
+                        egui::RichText::new(format!("★ 文章收藏  {saved_article_count}"))
+                            .size(15.0)
                             .color(if saved_articles_visible {
                                 theme.text
                             } else {
@@ -4733,7 +4858,7 @@ impl eframe::App for GuiApp {
                 }
                 ui.add_space(4.0);
                 let resources_response = ui.add(
-                    egui::Button::new(egui::RichText::new("◆ 资源库").size(13.0).color(
+                    egui::Button::new(egui::RichText::new("◆ 资源库").size(15.0).color(
                         if self.ui_state.route() == Route::Resources {
                             theme.text
                         } else {
@@ -4756,8 +4881,8 @@ impl eframe::App for GuiApp {
                 ui.add_space(4.0);
                 let read_later_response = ui.add(
                     egui::Button::new(
-                        egui::RichText::new(format!("◷ 稍后读  {}", self.read_later_count))
-                            .size(13.0)
+                        egui::RichText::new(format!("◷ 稍后读  {read_later_count}"))
+                            .size(15.0)
                             .color(
                                 if matches!(
                                     self.ui_state.route(),
@@ -4790,18 +4915,13 @@ impl eframe::App for GuiApp {
                 ui.add_space(4.0);
                 let library_response = ui.add(
                     egui::Button::new(
-                        egui::RichText::new(format!(
-                            "✦ 摘录与想法  {}",
-                            self.saved_selection_count
-                        ))
-                        .size(13.0)
-                        .color(
-                            if self.ui_state.route() == Route::Excerpts {
+                        egui::RichText::new(format!("✦ 摘录与想法  {}", self.excerpt_count()))
+                            .size(15.0)
+                            .color(if self.ui_state.route() == Route::Excerpts {
                                 theme.text
                             } else {
                                 theme.accent
-                            },
-                        ),
+                            }),
                     )
                     .fill(if self.ui_state.route() == Route::Excerpts {
                         theme.selected_bg
@@ -4819,8 +4939,8 @@ impl eframe::App for GuiApp {
                 ui.add_space(4.0);
                 let archive_response = ui.add(
                     egui::Button::new(
-                        egui::RichText::new(format!("▣ 已归档  {}", self.archived_article_count))
-                            .size(13.0)
+                        egui::RichText::new(format!("▣ 已归档  {archived_article_count}"))
+                            .size(15.0)
                             .color(if self.ui_state.route() == Route::Archive {
                                 theme.text
                             } else {
@@ -4842,7 +4962,7 @@ impl eframe::App for GuiApp {
                 }
                 ui.add_space(4.0);
                 let storage_response = ui.add(
-                    egui::Button::new(egui::RichText::new("⚙ 资料库管理").size(13.0).color(
+                    egui::Button::new(egui::RichText::new("⚙ 资料库管理").size(15.0).color(
                         if self.ui_state.route() == Route::Storage {
                             theme.text
                         } else {
@@ -4871,13 +4991,21 @@ impl eframe::App for GuiApp {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for (fd, unread) in &self.feeds {
+                        for fd in &self.feeds {
+                            let unread = article_projection
+                                .as_deref()
+                                .and_then(|projection| {
+                                    projection.feed_unread.iter().find_map(|(feed_id, unread)| {
+                                        (*feed_id == fd.id).then_some(*unread)
+                                    })
+                                })
+                                .unwrap_or_default();
                             let title = fd.title.clone().unwrap_or_else(|| fd.url.clone());
                             let mark = if fd.disabled {
                                 "✗"
                             } else if fd.fail_count > 0 {
                                 "⚠"
-                            } else if *unread > 0 {
+                            } else if unread > 0 {
                                 "●"
                             } else {
                                 " "
@@ -4892,7 +5020,7 @@ impl eframe::App for GuiApp {
                             let mut response = ui.add(
                                 egui::Button::new(
                                     egui::RichText::new(format!("{mark} {title} ({unread})"))
-                                        .size(13.0)
+                                        .size(15.0)
                                         .color(if sel { theme.text } else { theme.muted }),
                                 )
                                 .fill(fill)
@@ -4976,6 +5104,15 @@ impl eframe::App for GuiApp {
         let mut batch_action = None;
         let article_collection = self.ui_state.route().article_collection();
         let saved_collection = article_collection == Some(ArticleCollection::Saved);
+        let articles = article_projection
+            .as_deref()
+            .map(|projection| projection.articles.as_slice())
+            .unwrap_or_default();
+        let article_loading = article_projection.is_none()
+            && matches!(
+                article_freshness,
+                Some(ProjectionFreshness::Loading | ProjectionFreshness::Refreshing)
+            );
         egui::Panel::left("articles")
             .exact_size(ARTICLE_PANEL_WIDTH)
             .resizable(false)
@@ -4994,12 +5131,12 @@ impl eframe::App for GuiApp {
                             Some(ArticleCollection::SearchResult(_)) => "搜索结果",
                             _ => "文章",
                         })
-                        .size(18.0)
+                        .size(20.0)
                         .family(egui::FontFamily::Name("cjk-bold".into())),
                     );
                     ui.label(
-                        egui::RichText::new(format!("{} 篇", self.articles.len()))
-                            .size(12.0)
+                        egui::RichText::new(format!("{} 篇", articles.len()))
+                            .size(13.0)
                             .color(theme.muted),
                     );
                     if saved_collection {
@@ -5050,12 +5187,17 @@ impl eframe::App for GuiApp {
                     ui.separator();
                 }
                 ui.add_space(4.0);
-                if saved_collection && self.articles.is_empty() {
+                if article_loading {
+                    ui.add_space(26.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(egui::RichText::new("正在加载文章…").color(theme.muted));
+                    });
+                } else if saved_collection && articles.is_empty() {
                     ui.add_space(26.0);
                     ui.vertical_centered(|ui| {
                         ui.label(
                             egui::RichText::new("还没有文章收藏")
-                                .size(15.0)
+                                .size(17.0)
                                 .color(theme.text)
                                 .family(egui::FontFamily::Name("cjk-bold".into())),
                         );
@@ -5064,7 +5206,7 @@ impl eframe::App for GuiApp {
                             egui::RichText::new(
                                 "打开订阅文章，点击正文标题下方「收藏文章」；也可点右上角＋保存网页。",
                             )
-                                .size(12.0)
+                                .size(13.0)
                                 .color(theme.muted),
                         );
                     });
@@ -5072,8 +5214,12 @@ impl eframe::App for GuiApp {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for a in &self.articles {
-                            let is_web_clip = self.web_clipping_ids.contains(&a.id);
+                        for a in articles {
+                            let is_web_clip = article_projection
+                                .as_deref()
+                                .is_some_and(|projection| {
+                                    projection.fixed_bookmark_ids.contains(&a.id)
+                                });
                             let star = if is_web_clip {
                                 "  ◫"
                             } else if a.starred {
@@ -5091,7 +5237,7 @@ impl eframe::App for GuiApp {
                             };
                             let article_button = egui::Button::new(
                                     egui::RichText::new(format!("{dot}{title}{star}"))
-                                        .size(13.0)
+                                        .size(15.0)
                                         .family(if a.is_read {
                                             egui::FontFamily::Proportional
                                         } else {
@@ -5179,16 +5325,16 @@ impl eframe::App for GuiApp {
                             });
                             let meta = match (a.author.as_deref(), a.published) {
                                 (Some(author), Some(ts)) => {
-                                    format!("{author}  ·  {}", text::fmt_ts(ts))
+                                    format!("{author}  ·  {}", format_timestamp(ts))
                                 }
                                 (Some(author), None) => author.to_string(),
-                                (None, Some(ts)) => text::fmt_ts(ts),
+                                (None, Some(ts)) => format_timestamp(ts),
                                 (None, None) => String::new(),
                             };
                             if !meta.is_empty() {
                                 ui.add(
                                     egui::Label::new(
-                                        egui::RichText::new(meta).size(11.0).color(theme.muted),
+                                        egui::RichText::new(meta).size(13.0).color(theme.muted),
                                     )
                                     .wrap(),
                                 );
@@ -5230,7 +5376,21 @@ impl eframe::App for GuiApp {
             self.open_tag_dialog(id);
         }
 
-        // 正文栏
+        // 正文栏：Article/Excerpt 数据直接来自本帧权威 projection；GUI 只保留交互选择。
+        let selected_article = self.sel_article_id.and_then(|article_id| {
+            article_projection
+                .as_deref()
+                .and_then(|projection| {
+                    projection
+                        .articles
+                        .iter()
+                        .find(|article| article.id == article_id)
+                })
+                .cloned()
+        });
+        let selected_excerpt_projection = self.sel_article_id.and_then(|article_id| {
+            self.excerpt_projection(ExcerptProjectionScope::Article(article_id))
+        });
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -5244,47 +5404,66 @@ impl eframe::App for GuiApp {
                 };
                 let reset_body_scroll = self.body_article_id != Some(article_id);
                 self.body_article_id = Some(article_id);
-                let Some(a) = self.selected_article() else {
+                let Some(a) = selected_article.as_ref() else {
                     ui.centered_and_justified(|ui| ui.label("← 选一篇文章"));
                     return;
                 };
                 let title = a.title.clone().unwrap_or_default();
-                let date = a.published.map(text::fmt_ts).unwrap_or_default();
+                let date = a.published.map(format_timestamp).unwrap_or_default();
                 let url = a.url.clone();
                 let author = a.author.clone();
                 let article_starred = a.starred;
                 let article_read_later = a.read_later;
-                let article_tags = self
-                    .article_tags
-                    .get(&article_id)
+                let article_tags = article_projection
+                    .as_deref()
+                    .and_then(|projection| projection.tags.get(&article_id))
                     .cloned()
                     .unwrap_or_default();
-                let article_ai = self.db.article_ai(article_id).unwrap_or_default();
+                let is_web_clipping = article_projection
+                    .as_deref()
+                    .is_some_and(|projection| projection.fixed_bookmark_ids.contains(&article_id));
+                let article_content = a.content.clone().unwrap_or_default();
+                let article_base_url = a.url.clone();
+                let article_ai = article_projection
+                    .as_deref()
+                    .and_then(|projection| projection.article_ai.get(&article_id))
+                    .cloned();
                 let article_ai_task =
                     self.knowledge_task(KnowledgeTaskKind::ArticleSummary, article_id);
-                let article_ai_is_busy = article_ai_task
+                let article_ai_is_busy = article_ai_task.as_ref().is_some_and(|view| {
+                    matches!(
+                        view.status,
+                        KnowledgeTaskStatus::Queued | KnowledgeTaskStatus::Running
+                    )
+                });
+                let saved_excerpts = selected_excerpt_projection
                     .as_ref()
-                    .is_some_and(|view| {
-                        matches!(
-                            view.status,
-                            KnowledgeTaskStatus::Queued | KnowledgeTaskStatus::Running
-                        )
-                    });
-                let is_web_clipping = self.web_clipping_ids.contains(&article_id);
-                let blocks = match a.content.as_deref() {
-                    Some(c) if !c.trim().is_empty() => text::content_blocks(c, a.url.as_deref()),
-                    _ => Vec::new(),
-                };
-                let saved_selections = self
-                    .db
-                    .selections_for_article(article_id)
+                    .map(|projection| projection.excerpts.clone())
                     .unwrap_or_default();
-                let mut delete_selection = None;
+                let mut edit_thought: Option<ExcerptView> = None;
+                let mut remove_thought = None;
+                let mut delete_excerpt: Option<ExcerptView> = None;
                 let mut toggle_article_star = false;
                 let mut toggle_article_read_later = false;
                 let mut edit_article_tags = false;
                 let mut generate_article_ai = false;
-                let mut selection_frame = ArticleSelectionFrame::default();
+                let restore_selection = self
+                    .pending_selection_anchor
+                    .as_ref()
+                    .filter(|selection| selection.article_id == article_id)
+                    .map(|selection| RestoreSelection {
+                        selected_text: selection.selected_text.clone(),
+                        anchor: TextAnchor {
+                            start_offset: selection.start_offset,
+                            end_offset: selection.end_offset,
+                            prefix: selection.anchor_prefix.clone(),
+                            suffix: selection.anchor_suffix.clone(),
+                        },
+                    });
+                if restore_selection.is_some() {
+                    self.pending_selection_anchor = None;
+                }
+                let mut presentation_outcome: Option<PresentOutcome> = None;
                 let mut body_scroll = egui::ScrollArea::vertical()
                     .id_salt(("article-body-v2", article_id))
                     .hscroll(false);
@@ -5313,888 +5492,301 @@ impl eframe::App for GuiApp {
                             |ui| {
                                 ui.set_width(content_width);
                                 ui.add_space(26.0);
-                                let title_response = selectable_text_block_with_style(
+                                let presentation = self.article_document.show(
                                     ui,
-                                    article_id,
-                                    usize::MAX,
-                                    &title,
-                                    &[],
-                                    &[],
-                                    ArticleTextStyle::Title,
-                                    &mut selection_frame,
-                                );
-                                if reset_body_scroll {
-                                    title_response.scroll_to_me(Some(egui::Align::Min));
-                                }
-                                ui.horizontal_wrapped(|ui| {
-                                    if let Some(author) = &author {
-                                        ui.label(
-                                            egui::RichText::new(author)
-                                                .size(12.0)
-                                                .color(theme.muted),
-                                        );
-                                        ui.label(
-                                            egui::RichText::new("·").size(12.0).color(theme.muted),
-                                        );
-                                    }
-                                    ui.label(
-                                        egui::RichText::new(date).size(12.0).color(theme.muted),
-                                    );
-                                    if let Some(u) = &url
-                                        && ui
-                                            .add(
-                                                egui::Button::new(
-                                                    egui::RichText::new("在浏览器中打开 ↗")
-                                                        .size(12.0)
-                                                        .color(theme.link),
-                                                )
-                                                .stroke(egui::Stroke::NONE),
-                                            )
-                                            .clicked()
-                                        {
-                                            open_in_browser(u);
-                                        }
-                                    if is_web_clipping {
-                                        ui.label(
-                                            egui::RichText::new("◫ 已保存网页")
-                                                .size(12.0)
-                                                .color(theme.muted),
-                                        );
-                                    } else {
-                                        let (label, color, fill) = if article_starred {
-                                            ("★ 已收藏", theme.accent, theme.selected_bg)
-                                        } else {
-                                            ("☆ 收藏文章", theme.muted, egui::Color32::TRANSPARENT)
-                                        };
-                                        if ui
-                                            .add(
-                                                egui::Button::new(
-                                                    egui::RichText::new(label)
-                                                        .size(12.0)
-                                                        .color(color),
-                                                )
-                                                .fill(fill)
-                                                .stroke(egui::Stroke::new(1.0, theme.border))
-                                                .corner_radius(egui::CornerRadius::same(4)),
-                                            )
-                                            .clicked()
-                                        {
-                                            toggle_article_star = true;
-                                        }
-                                    }
-                                    let (later_label, later_color, later_fill) =
-                                        if article_read_later {
-                                            ("◷ 已在稍后读", theme.accent, theme.selected_bg)
-                                        } else {
-                                            ("◷ 稍后读", theme.muted, egui::Color32::TRANSPARENT)
-                                        };
-                                    if ui
-                                        .add(
-                                            egui::Button::new(
-                                                egui::RichText::new(later_label)
-                                                    .size(12.0)
-                                                    .color(later_color),
-                                            )
-                                            .fill(later_fill)
-                                            .stroke(egui::Stroke::new(1.0, theme.border)),
-                                        )
-                                        .clicked()
-                                    {
-                                        toggle_article_read_later = true;
-                                    }
-                                    if ui
-                                        .add(
-                                            egui::Button::new(
-                                                egui::RichText::new("标签")
-                                                    .size(12.0)
-                                                    .color(theme.muted),
-                                            )
-                                            .stroke(egui::Stroke::new(1.0, theme.border)),
-                                        )
-                                        .clicked()
-                                    {
-                                        edit_article_tags = true;
-                                    }
-                                    if ui
-                                        .add_enabled(
-                                            !article_ai_is_busy,
-                                            egui::Button::new(if article_ai_is_busy {
-                                                "AI 处理中…"
-                                            } else if article_ai.is_some() {
-                                                "重新总结与翻译"
-                                            } else {
-                                                "AI 总结与翻译"
-                                            }),
-                                        )
-                                        .clicked()
-                                    {
-                                        generate_article_ai = true;
-                                    }
-                                    for tag in &article_tags {
-                                        ui.label(
-                                            egui::RichText::new(format!("#{tag}"))
-                                                .size(11.0)
-                                                .color(theme.link)
-                                                .background_color(theme.selected_bg),
-                                        );
-                                    }
-                                });
-                                ui.separator();
-                                ui.add_space(18.0);
-                                if let Some(task) = &article_ai_task {
-                                    if matches!(
-                                        task.status,
-                                        KnowledgeTaskStatus::Queued | KnowledgeTaskStatus::Running
-                                    ) {
-                                        ui.horizontal(|ui| {
-                                            ui.spinner();
-                                            ui.label("正在生成中文总结与翻译");
-                                        });
-                                        ui.add_space(12.0);
-                                    } else if matches!(
-                                        task.status,
-                                        KnowledgeTaskStatus::Failed
-                                            | KnowledgeTaskStatus::Interrupted
-                                    ) {
-                                        egui::Frame::group(ui.style()).show(ui, |ui| {
-                                            ui.colored_label(
-                                                egui::Color32::RED,
-                                                "上次 AI 处理失败，可点击上方按钮重试",
-                                            );
-                                            ui.collapsing("技术详情", |ui| {
-                                                ui.monospace(
-                                                    task.technical_detail
-                                                        .as_deref()
-                                                        .unwrap_or("未知错误"),
-                                                );
-                                            });
-                                        });
-                                        ui.add_space(12.0);
-                                    }
-                                }
-                                if let Some(ai) = &article_ai {
-                                    egui::Frame::group(ui.style()).show(ui, |ui| {
-                                        ui.heading("AI 总结");
-                                        ui.label(&ai.summary_zh);
-                                        ui.add_space(10.0);
-                                        ui.collapsing("查看中文翻译", |ui| {
-                                            ui.label(&ai.translation_zh);
-                                        });
-                                        ui.weak(format!(
-                                            "{} · {}",
-                                            ai.model,
-                                            text::fmt_ts(ai.updated_at)
-                                        ));
-                                    });
-                                    ui.add_space(18.0);
-                                }
-                                if !saved_selections.is_empty() {
-                                    ui.collapsing(
-                                        format!("已保存摘录（{}）", saved_selections.len()),
-                                        |ui| {
-                                            for saved in &saved_selections {
-                                                egui::Frame::group(ui.style()).show(ui, |ui| {
-                                                    ui.label(&saved.selected_text);
-                                                    ui.horizontal(|ui| {
-                                                        if saved.is_favorite {
-                                                            ui.label("★ 已摘录");
-                                                        }
-                                                        if let Some(comment) = &saved.comment {
-                                                            ui.weak(format!("评论：{comment}"));
-                                                        }
-                                                        if ui.small_button("删除").clicked() {
-                                                            delete_selection = Some(saved.id);
-                                                        }
-                                                    });
-                                                });
-                                                ui.add_space(4.0);
-                                            }
+                                    PresentRequest {
+                                        source: ArticleDocumentSource {
+                                            article_id,
+                                            title: &title,
+                                            html: &article_content,
+                                            base_url: article_base_url.as_deref(),
                                         },
-                                    );
-                                    ui.add_space(10.0);
-                                }
-                                if blocks.is_empty() {
-                                    ui.label("（此源未提供正文，点上方按钮看原文）");
-                                }
-
-                                // Keep ordinary paragraphs in coherent labels so their
-                                // typography remains stable.  The article-level selection
-                                // frame below joins these labels with headings and lists,
-                                // allowing a drag to cross every semantic block.
-                                let mut index = 0;
-                                while index < blocks.len() {
-                                    match &blocks[index] {
-                                        Block::Quote(quote) => {
-                                            let quote_frame = egui::Frame::new()
-                                                .inner_margin(egui::Margin::symmetric(38, 24))
-                                                .show(ui, |ui| {
-                                                    ui.set_width(ui.available_width());
-                                                    selectable_text_block_with_style(
-                                                        ui,
-                                                        article_id,
-                                                        index,
-                                                        quote,
-                                                        &[],
-                                                        &[],
-                                                        ArticleTextStyle::Quote,
-                                                        &mut selection_frame,
-                                                    );
-                                                });
-                                            let decoration = egui::Color32::from_rgb(224, 224, 224);
-                                            ui.painter().text(
-                                                quote_frame.response.rect.left_top()
-                                                    + egui::vec2(8.0, -4.0),
-                                                egui::Align2::LEFT_TOP,
-                                                "“",
-                                                egui::FontId::new(
-                                                    52.0,
-                                                    egui::FontFamily::Name("cjk-bold".into()),
-                                                ),
-                                                decoration,
-                                            );
-                                            ui.painter().text(
-                                                quote_frame.response.rect.right_bottom()
-                                                    + egui::vec2(-8.0, 3.0),
-                                                egui::Align2::RIGHT_BOTTOM,
-                                                "”",
-                                                egui::FontId::new(
-                                                    52.0,
-                                                    egui::FontFamily::Name("cjk-bold".into()),
-                                                ),
-                                                decoration,
-                                            );
-                                            index += 1;
-                                            ui.add_space(15.0);
-                                        }
-                                        Block::Code(code) => {
-                                            egui::Frame::new()
-                                                .fill(theme.code_bg)
-                                                .corner_radius(egui::CornerRadius::same(4))
-                                                .inner_margin(egui::Margin::symmetric(20, 10))
-                                                .show(ui, |ui| {
-                                                    ui.set_width(ui.available_width());
-                                                    selectable_text_block_with_style(
-                                                        ui,
-                                                        article_id,
-                                                        index,
-                                                        code,
-                                                        &[],
-                                                        &[],
-                                                        ArticleTextStyle::Code,
-                                                        &mut selection_frame,
-                                                    );
-                                                });
-                                            index += 1;
-                                            ui.add_space(25.0);
-                                        }
-                                        Block::CodeBlock { text: code, language } => {
-                                            egui::Frame::new()
-                                                .fill(theme.code_bg)
-                                                .corner_radius(egui::CornerRadius::same(4))
-                                                .inner_margin(egui::Margin::symmetric(20, 10))
-                                                .show(ui, |ui| {
-                                                    ui.set_width(ui.available_width());
-                                                    ui.with_layout(
-                                                        egui::Layout::right_to_left(egui::Align::Center),
-                                                        |ui| {
-                                                            ui.label(
-                                                                egui::RichText::new(language.to_uppercase())
-                                                                    .monospace()
-                                                                    .size(11.0)
-                                                                    .color(theme.muted),
-                                                            );
-                                                        },
-                                                    );
-                                                    selectable_text_block_with_style(
-                                                        ui,
-                                                        article_id,
-                                                        index,
-                                                        code,
-                                                        &[],
-                                                        &[],
-                                                        ArticleTextStyle::Code,
-                                                        &mut selection_frame,
-                                                    );
-                                                });
-                                            index += 1;
-                                            ui.add_space(25.0);
-                                        }
-                                        Block::Image(uri) => {
-                                            article_image(
-                                                ui,
-                                                &viewport,
-                                                uri,
-                                                None,
-                                                &mut self.image_cache,
-                                                &self.image_job_tx,
-                                            );
-                                            index += 1;
-                                        }
-                                        Block::LinkedImage { uri, url, alt } => {
-                                            article_image(
-                                                ui,
-                                                &viewport,
-                                                uri,
-                                                Some(url),
-                                                &mut self.image_cache,
-                                                &self.image_job_tx,
-                                            );
-                                            if let Some(alt) = alt {
+                                        viewport,
+                                        restore_selection: restore_selection.clone(),
+                                        scroll_title_into_view: reset_body_scroll,
+                                    },
+                                    |ui| {
+                                        ui.horizontal_wrapped(|ui| {
+                                            if let Some(author) = &author {
                                                 ui.label(
-                                                    egui::RichText::new(alt)
+                                                    egui::RichText::new(author)
                                                         .size(13.0)
                                                         .color(theme.muted),
                                                 );
-                                                ui.add_space(8.0);
+                                                ui.label(
+                                                    egui::RichText::new("·")
+                                                        .size(13.0)
+                                                        .color(theme.muted),
+                                                );
                                             }
-                                            index += 1;
-                                        }
-                                        Block::Caption(caption) => {
-                                            ui.with_layout(
-                                                egui::Layout::top_down(egui::Align::Center),
-                                                |ui| {
-                                                    ui.add(
-                                                        egui::Label::new(
-                                                            egui::RichText::new(caption)
+                                            ui.label(
+                                                egui::RichText::new(date)
+                                                    .size(13.0)
+                                                    .color(theme.muted),
+                                            );
+                                            if let Some(u) = &url
+                                                && ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            egui::RichText::new("在浏览器中打开 ↗")
                                                                 .size(13.0)
-                                                                .color(theme.muted),
+                                                                .color(theme.link),
                                                         )
-                                                        .selectable(true)
-                                                        .wrap(),
+                                                        .stroke(egui::Stroke::NONE),
+                                                    )
+                                                    .clicked()
+                                            {
+                                                open_in_browser(u);
+                                            }
+                                            if is_web_clipping {
+                                                ui.label(
+                                                    egui::RichText::new("◫ 已保存网页")
+                                                        .size(13.0)
+                                                        .color(theme.muted),
+                                                );
+                                            } else {
+                                                let (label, color, fill) = if article_starred {
+                                                    ("★ 已收藏", theme.accent, theme.selected_bg)
+                                                } else {
+                                                    (
+                                                        "☆ 收藏文章",
+                                                        theme.muted,
+                                                        egui::Color32::TRANSPARENT,
+                                                    )
+                                                };
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            egui::RichText::new(label)
+                                                                .size(13.0)
+                                                                .color(color),
+                                                        )
+                                                        .fill(fill)
+                                                        .stroke(egui::Stroke::new(
+                                                            1.0,
+                                                            theme.border,
+                                                        ))
+                                                        .corner_radius(egui::CornerRadius::same(4)),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    toggle_article_star = true;
+                                                }
+                                            }
+                                            let (later_label, later_color, later_fill) =
+                                                if article_read_later {
+                                                    (
+                                                        "◷ 已在稍后读",
+                                                        theme.accent,
+                                                        theme.selected_bg,
+                                                    )
+                                                } else {
+                                                    (
+                                                        "◷ 稍后读",
+                                                        theme.muted,
+                                                        egui::Color32::TRANSPARENT,
+                                                    )
+                                                };
+                                            if ui
+                                                .add(
+                                                    egui::Button::new(
+                                                        egui::RichText::new(later_label)
+                                                            .size(13.0)
+                                                            .color(later_color),
+                                                    )
+                                                    .fill(later_fill)
+                                                    .stroke(egui::Stroke::new(1.0, theme.border)),
+                                                )
+                                                .clicked()
+                                            {
+                                                toggle_article_read_later = true;
+                                            }
+                                            if ui
+                                                .add(
+                                                    egui::Button::new(
+                                                        egui::RichText::new("标签")
+                                                            .size(13.0)
+                                                            .color(theme.muted),
+                                                    )
+                                                    .stroke(egui::Stroke::new(1.0, theme.border)),
+                                                )
+                                                .clicked()
+                                            {
+                                                edit_article_tags = true;
+                                            }
+                                            if ui
+                                                .add_enabled(
+                                                    !article_ai_is_busy,
+                                                    egui::Button::new(if article_ai_is_busy {
+                                                        "AI 处理中…"
+                                                    } else if article_ai.is_some() {
+                                                        "重新总结与翻译"
+                                                    } else {
+                                                        "AI 总结与翻译"
+                                                    }),
+                                                )
+                                                .clicked()
+                                            {
+                                                generate_article_ai = true;
+                                            }
+                                            for tag in &article_tags {
+                                                ui.label(
+                                                    egui::RichText::new(format!("#{tag}"))
+                                                        .size(13.0)
+                                                        .color(theme.link)
+                                                        .background_color(theme.selected_bg),
+                                                );
+                                            }
+                                        });
+                                        ui.separator();
+                                        ui.add_space(18.0);
+                                        if let Some(task) = &article_ai_task {
+                                            if matches!(
+                                                task.status,
+                                                KnowledgeTaskStatus::Queued
+                                                    | KnowledgeTaskStatus::Running
+                                            ) {
+                                                ui.horizontal(|ui| {
+                                                    ui.spinner();
+                                                    ui.label("正在生成中文总结与翻译");
+                                                });
+                                                ui.add_space(12.0);
+                                            } else if matches!(
+                                                task.status,
+                                                KnowledgeTaskStatus::Failed
+                                                    | KnowledgeTaskStatus::Interrupted
+                                            ) {
+                                                egui::Frame::group(ui.style()).show(ui, |ui| {
+                                                    ui.colored_label(
+                                                        egui::Color32::RED,
+                                                        "上次 AI 处理失败，可点击上方按钮重试",
                                                     );
+                                                    ui.collapsing("技术详情", |ui| {
+                                                        ui.monospace(
+                                                            task.technical_detail
+                                                                .as_deref()
+                                                                .unwrap_or("未知错误"),
+                                                        );
+                                                    });
+                                                });
+                                                ui.add_space(12.0);
+                                            }
+                                        }
+                                        if let Some(ai) = &article_ai {
+                                            egui::Frame::group(ui.style()).show(ui, |ui| {
+                                                ui.heading("AI 总结");
+                                                ui.label(&ai.summary_zh);
+                                                ui.add_space(10.0);
+                                                ui.collapsing("查看中文翻译", |ui| {
+                                                    ui.label(&ai.translation_zh);
+                                                });
+                                                ui.weak(format!(
+                                                    "{} · {}",
+                                                    ai.model,
+                                                    format_timestamp(ai.updated_at)
+                                                ));
+                                            });
+                                            ui.add_space(18.0);
+                                        }
+                                        if !saved_excerpts.is_empty() {
+                                            ui.collapsing(
+                                                format!("已保存摘录（{}）", saved_excerpts.len()),
+                                                |ui| {
+                                                    for excerpt in &saved_excerpts {
+                                                        egui::Frame::group(ui.style()).show(
+                                                            ui,
+                                                            |ui| {
+                                                                ui.label(&excerpt.selected_text);
+                                                                ui.horizontal(|ui| {
+                                                                    ui.label("★ 已摘录");
+                                                                    if excerpt.identity_kind
+                                                            == ExcerptIdentityKind::Legacy
+                                                        {
+                                                            ui.weak("历史记录");
+                                                        }
+                                                                    if let Some(thought) =
+                                                                        &excerpt.thought
+                                                                    {
+                                                                        ui.weak(format!(
+                                                                            "想法：{}",
+                                                                            thought.content
+                                                                        ));
+                                                                        if ui
+                                                                            .small_button(
+                                                                                "编辑想法",
+                                                                            )
+                                                                            .clicked()
+                                                                        {
+                                                                            edit_thought = Some(
+                                                                                excerpt.clone(),
+                                                                            );
+                                                                        }
+                                                                        if ui
+                                                                            .small_button(
+                                                                                "删除想法",
+                                                                            )
+                                                                            .clicked()
+                                                                        {
+                                                                            remove_thought =
+                                                                                Some(excerpt.id);
+                                                                        }
+                                                                    }
+                                                                    if ui
+                                                                        .small_button("删除摘录")
+                                                                        .clicked()
+                                                                    {
+                                                                        delete_excerpt =
+                                                                            Some(excerpt.clone());
+                                                                    }
+                                                                });
+                                                            },
+                                                        );
+                                                        ui.add_space(4.0);
+                                                    }
                                                 },
                                             );
-                                            index += 1;
-                                            ui.add_space(16.0);
+                                            ui.add_space(10.0);
                                         }
-                                        Block::DefinitionList(items) => {
-                                            egui::Frame::new()
-                                                .fill(theme.code_bg)
-                                                .stroke(egui::Stroke::new(1.0, theme.border))
-                                                .corner_radius(egui::CornerRadius::same(5))
-                                                .inner_margin(egui::Margin::symmetric(18, 14))
-                                                .show(ui, |ui| {
-                                                    ui.set_width(ui.available_width());
-                                                    for (item_index, item) in items.iter().enumerate() {
-                                                        ui.label(
-                                                            egui::RichText::new(&item.term)
-                                                                .family(egui::FontFamily::Name("cjk-bold".into()))
-                                                                .size(16.0)
-                                                                .color(theme.text),
-                                                        );
-                                                        for definition in &item.definitions {
-                                                            ui.horizontal(|ui| {
-                                                                ui.label(
-                                                                    egui::RichText::new("—")
-                                                                        .color(theme.accent),
-                                                                );
-                                                                ui.add(
-                                                                    egui::Label::new(
-                                                                        egui::RichText::new(definition)
-                                                                            .size(15.0)
-                                                                            .color(theme.text),
-                                                                    )
-                                                                    .selectable(true)
-                                                                    .wrap(),
-                                                                );
-                                                            });
-                                                        }
-                                                        if item_index + 1 < items.len() {
-                                                            ui.add_space(10.0);
-                                                        }
-                                                    }
-                                                });
-                                            index += 1;
-                                            ui.add_space(22.0);
-                                        }
-                                        Block::Table { rows, header_rows, column_count } => {
-                                            egui::Frame::new()
-                                                .stroke(egui::Stroke::new(1.0, theme.border))
-                                                .corner_radius(egui::CornerRadius::same(4))
-                                                .inner_margin(egui::Margin::symmetric(12, 10))
-                                                .show(ui, |ui| {
-                                                    egui::ScrollArea::horizontal()
-                                                        .id_salt(("article-table", article_id, index))
-                                                        .show(ui, |ui| {
-                                                            ui.set_min_width(ui.available_width().max(420.0));
-                                                            let gap = 12.0;
-                                                            let columns = (*column_count).max(1) as f32;
-                                                            let unit = ((ui.available_width()
-                                                                - gap * (columns - 1.0))
-                                                                / columns)
-                                                                .max(90.0);
-                                                            let logical_layout = text::table_cell_columns(rows, *column_count);
-                                                            for (row_index, row) in rows.iter().enumerate() {
-                                                                let fill = if row_index % 2 == 1 {
-                                                                    theme.code_bg
-                                                                } else {
-                                                                    egui::Color32::TRANSPARENT
-                                                                };
-                                                                egui::Frame::new()
-                                                                    .fill(fill)
-                                                                    .inner_margin(egui::Margin::symmetric(8, 8))
-                                                                    .show(ui, |ui| {
-                                                                        ui.horizontal(|ui| {
-                                                                            ui.spacing_mut().item_spacing.x = gap;
-                                                                            let mut current_column = 0usize;
-                                                                            for (column, cell_index) in &logical_layout[row_index] {
-                                                                                if *column > current_column {
-                                                                                    let skipped = *column - current_column;
-                                                                                    ui.add_space(
-                                                                                        unit * skipped as f32
-                                                                                            + gap * skipped.saturating_sub(1) as f32,
-                                                                                    );
-                                                                                }
-                                                                                let cell = &row[*cell_index];
-                                                                                let width = unit * cell.col_span as f32
-                                                                                    + gap * (cell.col_span.saturating_sub(1)) as f32;
-                                                                                ui.allocate_ui_with_layout(
-                                                                                    egui::vec2(width, 0.0),
-                                                                                    egui::Layout::top_down(egui::Align::Min),
-                                                                                    |ui| {
-                                                                                        let text = egui::RichText::new(&cell.text)
-                                                                                            .size(15.0)
-                                                                                            .color(theme.text);
-                                                                                        let text = if row_index < *header_rows || cell.header {
-                                                                                            text.strong()
-                                                                                        } else {
-                                                                                            text
-                                                                                        };
-                                                                                        ui.add(egui::Label::new(text).selectable(true).wrap());
-                                                                                        if cell.row_span > 1 {
-                                                                                            ui.label(
-                                                                                                egui::RichText::new(format!("跨 {} 行", cell.row_span))
-                                                                                                    .size(10.0)
-                                                                                                    .color(theme.muted),
-                                                                                            );
-                                                                                        }
-                                                                                    },
-                                                                                );
-                                                                                current_column = column + cell.col_span;
-                                                                            }
-                                                                        });
-                                                                    });
-                                                            }
-                                                        });
-                                                });
-                                            index += 1;
-                                            ui.add_space(22.0);
-                                        }
-                                        Block::Math { source, display } => {
-                                            formula_block(
-                                                ui,
-                                                source,
-                                                *display,
-                                                &mut self.formula_cache,
-                                                &self.formula_job_tx,
-                                            );
-                                            index += 1;
-                                            ui.add_space(20.0);
-                                        }
-                                        Block::ListItemStart { depth } => {
-                                            let start = index;
-                                            let item_depth = *depth;
-                                            let mut list_text = String::from("▪ ");
-                                            let mut list_strong_ranges = Vec::new();
-                                            let mut list_inline_code_ranges = Vec::new();
-                                            let mut list_link_ranges = Vec::new();
-                                            let mut previous_was_strong = false;
-                                            let mut previous_was_link = false;
-                                            let mut previous_was_inline_code = false;
-                                            let mut previous_link_had_space_after = false;
-                                            let mut list_images: Vec<(
-                                                String,
-                                                Option<String>,
-                                                Option<String>,
-                                            )> = Vec::new();
-                                            index += 1;
-                                            while index < blocks.len() {
-                                                if matches!(
-                                                    &blocks[index],
-                                                    Block::ListItemEnd { depth } if *depth == item_depth
-                                                ) {
-                                                    index += 1;
-                                                    break;
-                                                }
-                                                let block = &blocks[index];
-                                                match block {
-                                                    Block::Image(uri) => {
-                                                        list_images.push((uri.clone(), None, None));
-                                                        index += 1;
-                                                        continue;
-                                                    }
-                                                    Block::LinkedImage { uri, url, alt } => {
-                                                        list_images.push((
-                                                            uri.clone(),
-                                                            Some(url.clone()),
-                                                            alt.clone(),
-                                                        ));
-                                                        index += 1;
-                                                        continue;
-                                                    }
-                                                    _ => {}
-                                                }
-                                                let value = match block {
-                                                    Block::Text(text)
-                                                    | Block::Strong(text)
-                                                    | Block::InlineCode(text)
-                                                    | Block::Link { text, .. } => text,
-                                                    _ => break,
-                                                };
-                                                let next_link_has_prefix = matches!(
-                                                    block,
-                                                    Block::Link { link_start, .. } if *link_start > 0
-                                                );
-                                                if list_text != "▪ " {
-                                                    if previous_link_had_space_after {
-                                                        list_text.push(' ');
-                                                    } else {
-                                                        list_text.push_str(body_fragment_separator(
-                                                            &list_text,
-                                                            value,
-                                                            previous_was_strong,
-                                                            previous_was_link,
-                                                            previous_was_inline_code,
-                                                            matches!(block, Block::Strong(_)),
-                                                            matches!(block, Block::Link { .. }),
-                                                            matches!(block, Block::InlineCode(_)),
-                                                            next_link_has_prefix,
-                                                        ));
-                                                    }
-                                                }
-                                                let value_start = list_text.len();
-                                                list_text.push_str(value);
-                                                if matches!(block, Block::Strong(_)) {
-                                                    list_strong_ranges.push(
-                                                        value_start..value_start + value.len(),
-                                                    );
-                                                }
-                                                if matches!(block, Block::InlineCode(_)) {
-                                                    list_inline_code_ranges.push(
-                                                        value_start..value_start + value.len(),
-                                                    );
-                                                }
-                                                if let Block::Link {
-                                                    url,
-                                                    link_start,
-                                                    ..
-                                                } = block
-                                                {
-                                                    list_link_ranges.push(ArticleLinkRange {
-                                                        range: value_start + *link_start
-                                                            ..value_start + value.len(),
-                                                        url: url.clone(),
-                                                    });
-                                                }
-                                                previous_was_strong =
-                                                    matches!(block, Block::Strong(_));
-                                                previous_was_link =
-                                                    matches!(block, Block::Link { .. });
-                                                previous_was_inline_code =
-                                                    matches!(block, Block::InlineCode(_));
-                                                previous_link_had_space_after = matches!(
-                                                    block,
-                                                    Block::Link {
-                                                        space_after: true,
-                                                        ..
-                                                    }
-                                                );
-                                                index += 1;
-                                            }
-                                            ui.add_space(4.0);
-                                            ui.horizontal(|ui| {
-                                                ui.add_space(
-                                                    22.0 + item_depth.saturating_sub(1) as f32 * 24.0,
-                                                );
-                                                ui.vertical(|ui| {
-                                                    ui.set_width(ui.available_width());
-                                                    if list_text != "▪ " {
-                                                        selectable_text_block_with_inline_style(
-                                                            ui,
-                                                            article_id,
-                                                            start,
-                                                            &list_text,
-                                                            &list_strong_ranges,
-                                                            &list_inline_code_ranges,
-                                                            &list_link_ranges,
-                                                            ArticleTextStyle::List,
-                                                            &mut selection_frame,
-                                                        );
-                                                    }
-                                                    for (uri, link_url, alt) in &list_images {
-                                                        article_image(
-                                                            ui,
-                                                            &viewport,
-                                                            uri,
-                                                            link_url.as_deref(),
-                                                            &mut self.image_cache,
-                                                            &self.image_job_tx,
-                                                        );
-                                                        if let Some(alt) = alt {
-                                                            ui.label(
-                                                                egui::RichText::new(alt)
-                                                                    .size(13.0)
-                                                                    .color(theme.muted),
-                                                            );
-                                                        }
-                                                    }
-                                                });
-                                            });
-                                            ui.add_space(20.0);
-                                        }
-                                        Block::Heading(heading) => {
-                                            selectable_text_block_with_style(
-                                                ui,
-                                                article_id,
-                                                index,
-                                                heading,
-                                                &[],
-                                                &[],
-                                                ArticleTextStyle::Heading,
-                                                &mut selection_frame,
-                                            );
-                                            index += 1;
-                                            ui.add_space(20.0);
-                                        }
-                                        Block::HeadingWithInlineCode {
-                                            text,
-                                            inline_code_ranges,
-                                        } => {
-                                            let inline_code_ranges = inline_code_ranges
-                                                .iter()
-                                                .map(|range| range.start..range.end)
-                                                .collect::<Vec<_>>();
-                                            selectable_text_block_with_inline_style(
-                                                ui,
-                                                article_id,
-                                                index,
-                                                text,
-                                                &[],
-                                                &inline_code_ranges,
-                                                &[],
-                                                ArticleTextStyle::Heading,
-                                                &mut selection_frame,
-                                            );
-                                            index += 1;
-                                            ui.add_space(20.0);
-                                        }
-                                        Block::HeadingLink {
-                                            text,
-                                            links,
-                                        } => {
-                                            let link_ranges = links
-                                                .iter()
-                                                .map(|link| ArticleLinkRange {
-                                                    range: link.start..link.end,
-                                                    url: link.url.clone(),
-                                                })
-                                                .collect::<Vec<_>>();
-                                            selectable_text_block_with_style(
-                                                ui,
-                                                article_id,
-                                                index,
-                                                text,
-                                                &[],
-                                                &link_ranges,
-                                                ArticleTextStyle::Heading,
-                                                &mut selection_frame,
-                                            );
-                                            index += 1;
-                                            ui.add_space(20.0);
-                                        }
-                                        Block::Strong(heading)
-                                            if text::is_numbered_heading(heading) =>
-                                        {
-                                            selectable_text_block_with_style(
-                                                ui,
-                                                article_id,
-                                                index,
-                                                heading,
-                                                &[],
-                                                &[],
-                                                ArticleTextStyle::Heading,
-                                                &mut selection_frame,
-                                            );
-                                            index += 1;
-                                            ui.add_space(20.0);
-                                        }
-                                        Block::ListItemEnd { .. } => {
-                                            index += 1;
-                                        }
-                                        _ => {
-                                            let start = index;
-                                            let mut run = String::new();
-                                            let mut strong_ranges = Vec::new();
-                                            let mut inline_code_ranges = Vec::new();
-                                            let mut link_ranges = Vec::new();
-                                            let mut previous_was_strong = false;
-                                            let mut previous_was_link = false;
-                                            let mut previous_was_inline_code = false;
-                                            let mut previous_link_had_space_after = false;
-                                            while index < blocks.len() {
-                                                let block = &blocks[index];
-                                                if matches!(
-                                                    block,
-                                                    Block::Image(_)
-                                                        | Block::LinkedImage { .. }
-                                                        | Block::Heading(_)
-                                                        | Block::HeadingWithInlineCode { .. }
-                                                        | Block::HeadingLink { .. }
-                                                        | Block::Quote(_)
-                                                        | Block::Code(_)
-                                                        | Block::CodeBlock { .. }
-                                                        | Block::Caption(_)
-                                                        | Block::DefinitionList(_)
-                                                        | Block::Table { .. }
-                                                        | Block::Math { .. }
-                                                        | Block::ListItemStart { .. }
-                                                        | Block::ListItemEnd { .. }
-                                                ) || matches!(
-                                                    block,
-                                                    Block::Text(text) if is_bullet_text(text)
-                                                ) || matches!(
-                                                    block,
-                                                    Block::Strong(text)
-                                                        if text::is_numbered_heading(text)
-                                                ) {
-                                                    break;
-                                                }
-                                                let value = match block {
-                                                    Block::Text(text)
-                                                    | Block::Strong(text)
-                                                    | Block::InlineCode(text)
-                                                    | Block::Link { text, .. } => text,
-                                                    Block::Image(_)
-                                                    | Block::LinkedImage { .. }
-                                                    | Block::Heading(_)
-                                                    | Block::HeadingWithInlineCode { .. }
-                                                    | Block::HeadingLink { .. }
-                                                    | Block::Quote(_)
-                                                    | Block::Code(_)
-                                                    | Block::CodeBlock { .. }
-                                                    | Block::Caption(_)
-                                                    | Block::DefinitionList(_)
-                                                    | Block::Table { .. }
-                                                    | Block::Math { .. }
-                                                    | Block::ListItemStart { .. }
-                                                    | Block::ListItemEnd { .. } => {
-                                                        unreachable!()
-                                                    }
-                                                };
-                                                let next_link_has_prefix = matches!(
-                                                    block,
-                                                    Block::Link { link_start, .. }
-                                                        if *link_start > 0
-                                                );
-                                                if !run.is_empty() {
-                                                    if previous_link_had_space_after {
-                                                        run.push(' ');
-                                                    } else {
-                                                        run.push_str(body_fragment_separator(
-                                                            &run,
-                                                            value,
-                                                            previous_was_strong,
-                                                            previous_was_link,
-                                                            previous_was_inline_code,
-                                                            matches!(block, Block::Strong(_)),
-                                                            matches!(block, Block::Link { .. }),
-                                                            matches!(block, Block::InlineCode(_)),
-                                                            next_link_has_prefix,
-                                                        ));
-                                                    }
-                                                }
-                                                let value_start = run.len();
-                                                run.push_str(value);
-                                                let is_strong = matches!(block, Block::Strong(_));
-                                                let is_link = matches!(block, Block::Link { .. });
-                                                if is_strong {
-                                                    strong_ranges.push(value_start..run.len());
-                                                }
-                                                if matches!(block, Block::InlineCode(_)) {
-                                                    inline_code_ranges.push(value_start..run.len());
-                                                }
-                                                if is_link
-                                                    && let Block::Link {
-                                                        url, link_start, ..
-                                                    } = block
-                                                    {
-                                                        link_ranges.push(ArticleLinkRange {
-                                                            range: value_start + *link_start
-                                                                ..run.len(),
-                                                            url: url.clone(),
-                                                        });
-                                                    }
-                                                previous_was_strong = is_strong;
-                                                previous_was_link = is_link;
-                                                previous_was_inline_code =
-                                                    matches!(block, Block::InlineCode(_));
-                                                previous_link_had_space_after = matches!(
-                                                    block,
-                                                    Block::Link {
-                                                        space_after: true,
-                                                        ..
-                                                    }
-                                                );
-                                                index += 1;
-                                            }
-                                            if !run.trim().is_empty() {
-                                                selectable_text_block_with_inline_style(
-                                                    ui,
-                                                    article_id,
-                                                    start,
-                                                    &run,
-                                                    &strong_ranges,
-                                                    &inline_code_ranges,
-                                                    &link_ranges,
-                                                    ArticleTextStyle::Body,
-                                                    &mut selection_frame,
-                                                );
-                                                ui.add_space(20.0);
-                                            }
-                                        }
-                                    }
-                                }
+                                    },
+                                );
+                                presentation_outcome = Some(presentation);
                             },
                         );
                         ui.add_space(side_margin);
                     });
                 });
-                if self
-                    .pending_selection_anchor
-                    .as_ref()
-                    .is_some_and(|selection| selection.article_id == article_id)
-                    && let Some(selection) = self.pending_selection_anchor.take()
-                {
-                    let anchor = TextAnchor {
-                        start_offset: selection.start_offset,
-                        end_offset: selection.end_offset,
-                        prefix: selection.anchor_prefix.clone(),
-                        suffix: selection.anchor_suffix.clone(),
-                    };
-                    if let Some(range) = resolve_excerpt_anchor(
-                        &selection_frame.plain_text,
-                        &selection.selected_text,
-                        &anchor,
-                    ) {
-                        if let Some(span) = selection_frame.spans.iter().find(|span| {
-                            span.chars.start <= range.start && span.chars.end >= range.start
-                        }) {
-                            let offset = body_scroll_output.state.offset.y
-                                + span.global_rect.top()
-                                - body_scroll_output.inner_rect.top()
-                                - 28.0;
-                            self.pending_body_scroll = Some((article_id, offset.max(0.0)));
-                            self.notice("已定位到摘录原文");
-                            ctx.request_repaint();
-                        }
-                    } else {
+                let presentation_outcome = presentation_outcome.unwrap_or_default();
+                if restore_selection.is_some() {
+                    if let Some(span_top) = presentation_outcome.restored_span_top {
+                        let offset = body_scroll_output.state.offset.y + span_top
+                            - body_scroll_output.inner_rect.top()
+                            - 28.0;
+                        self.pending_body_scroll = Some((article_id, offset.max(0.0)));
+                        self.notice("已定位到摘录原文");
+                        ctx.request_repaint();
+                    } else if presentation_outcome.restore_failed {
                         self.notice("正文已更新，暂时找不到这段摘录");
                     }
                 }
-                let selection_result =
-                    self.update_article_selection(&ctx, article_id, &selection_frame);
-                let selection_drag_started = selection_result.drag_started;
-                let selection_popup_request = selection_result.popup_request;
+                let mut selection_drag_started = false;
+                let mut selection_popup_request = None;
+                for intent in presentation_outcome.intents {
+                    match intent {
+                        PresentationIntent::SelectionStarted => selection_drag_started = true,
+                        PresentationIntent::SelectedQuote {
+                            quote,
+                            anchor_rect,
+                            source_layer,
+                        } => {
+                            selection_popup_request = Some(SelectionPopupRequest {
+                                quote,
+                                anchor_rect,
+                                source_layer,
+                            });
+                        }
+                        PresentationIntent::OpenUrl(url) => open_in_browser(&url),
+                    }
+                }
                 let scroll_offset = body_scroll_output.state.offset;
                 self.current_body_scroll = scroll_offset.y;
                 let popover_matches_article = self
@@ -6202,17 +5794,11 @@ impl eframe::App for GuiApp {
                     .popover()
                     .is_some_and(|popover| popover.quote.article_id == article_id);
                 let popup_moved_away_from_selection = popover_matches_article
-                    && self
-                        .selection_popup_geometry
-                        .as_ref()
-                        .is_some_and(|popup| {
-                            (popup.scroll_offset - scroll_offset).length_sq() > 0.25
-                        });
+                    && self.selection_popup_geometry.as_ref().is_some_and(|popup| {
+                        (popup.scroll_offset - scroll_offset).length_sq() > 0.25
+                    });
                 let popup_layout_changed = popover_matches_article
-                    && self
-                    .selection_popup_geometry
-                    .as_ref()
-                    .is_some_and(|popup| {
+                    && self.selection_popup_geometry.as_ref().is_some_and(|popup| {
                         // Image placeholders are replaced with their natural
                         // aspect ratio asynchronously, so the full article
                         // content size can legitimately change immediately
@@ -6228,10 +5814,11 @@ impl eframe::App for GuiApp {
                     self.selection_popup_generation =
                         self.selection_popup_generation.wrapping_add(1);
                     let generation = self.selection_popup_generation;
-                    self.ui_state.reduce(UiAction::SetPopover(Some(SelectionPopoverState {
-                        quote: request.quote,
-                        generation,
-                    })));
+                    self.ui_state
+                        .reduce(UiAction::SetPopover(Some(SelectionPopoverState {
+                            quote: request.quote,
+                            generation,
+                        })));
                     self.selection_popup_geometry = Some(SelectionPopupGeometry {
                         anchor_rect: request.anchor_rect,
                         source_layer: request.source_layer,
@@ -6240,16 +5827,15 @@ impl eframe::App for GuiApp {
                         generation,
                     });
                 }
-                if let Some(selection_id) = delete_selection {
-                    match self.db.delete_selection(selection_id) {
-                        Ok(_) => {
-                            self.refresh_saved_selection_count();
-                            self.notice("已删除摘录");
-                        }
-                        Err(error) => {
-                            self.notice(format!("删除失败：{error}"));
-                        }
-                    }
+                if let Some(excerpt) = edit_thought {
+                    self.begin_edit_thought(&excerpt);
+                } else if let Some(excerpt_id) = remove_thought {
+                    self.remove_thought(excerpt_id, ExcerptProjectionScope::Article(article_id));
+                } else if let Some(excerpt) = delete_excerpt {
+                    self.request_delete_excerpt(
+                        &excerpt,
+                        ExcerptProjectionScope::Article(article_id),
+                    );
                 }
                 if toggle_article_star {
                     self.toggle_star(article_id);
@@ -6284,42 +5870,14 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+fn format_timestamp(timestamp: i64) -> String {
+    chrono::DateTime::from_timestamp(timestamp, 0)
+        .map(|date| date.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_default()
+}
+
 fn search_preview(source: &str, query: &str, max_chars: usize) -> String {
-    let text = text::content_blocks(source, None)
-        .into_iter()
-        .filter_map(|block| match block {
-            Block::Text(value)
-            | Block::Strong(value)
-            | Block::InlineCode(value)
-            | Block::Heading(value)
-            | Block::Quote(value)
-            | Block::Code(value) => Some(value),
-            Block::CodeBlock { text, .. } | Block::Math { source: text, .. } => Some(text),
-            Block::HeadingWithInlineCode { text, .. }
-            | Block::HeadingLink { text, .. }
-            | Block::Link { text, .. } => Some(text),
-            Block::Table { rows, .. } => Some(
-                rows.into_iter()
-                    .flatten()
-                    .map(|cell| cell.text)
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            ),
-            Block::Caption(value) => Some(value),
-            Block::DefinitionList(items) => Some(
-                items
-                    .into_iter()
-                    .flat_map(|item| std::iter::once(item.term).chain(item.definitions))
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            ),
-            Block::ListItemStart { .. }
-            | Block::ListItemEnd { .. }
-            | Block::Image(_)
-            | Block::LinkedImage { .. } => None,
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
+    let text = article_visible_text(source, None);
     let normalized = if text.trim().is_empty() {
         source.split_whitespace().collect::<Vec<_>>().join(" ")
     } else {
@@ -6458,1348 +6016,27 @@ fn selection_toolbar_button(ui: &mut egui::Ui, icon: &str, label: &str) -> bool 
         egui::pos2(rect.center().x, rect.top() + 12.0),
         egui::Align2::CENTER_CENTER,
         icon,
-        egui::FontId::proportional(15.0),
+        egui::FontId::proportional(17.0),
         icon_color,
     );
     ui.painter().text(
         egui::pos2(rect.center().x, rect.bottom() - 9.0),
         egui::Align2::CENTER_CENTER,
         label,
-        egui::FontId::proportional(11.0),
+        egui::FontId::proportional(13.0),
         label_color,
     );
     response
         .on_hover_cursor(egui::CursorIcon::PointingHand)
         .clicked()
 }
-
-fn article_cursor_under_pointer(
-    frame: &ArticleSelectionFrame,
-    position: egui::Pos2,
-) -> Option<ArticleDocCursor> {
-    if let Some((span_index, span)) = frame
-        .spans
-        .iter()
-        .enumerate()
-        .find(|(_, span)| span.pointer_local_char.is_some())
-    {
-        let local_char = span
-            .pointer_local_char
-            .unwrap_or_default()
-            .min(span.chars.end.saturating_sub(span.chars.start));
-        return Some(ArticleDocCursor {
-            span_index,
-            local_char,
-            char_index: span.chars.start + local_char,
-        });
-    }
-    frame
-        .spans
-        .iter()
-        .enumerate()
-        // Use the transformed interaction rectangle instead of
-        // `Response::contains_pointer`.  The latter can be false while egui's
-        // label-selection plugin is already dragging (the selection paint is
-        // then considered the covering layer), even though the pointer is
-        // still inside the article row.  Requiring it here made the native
-        // blue selection appear without arming our article-level popup.
-        .find(|(_, span)| span.global_rect.contains(position))
-        .map(|(span_index, span)| article_cursor_in_span(span_index, span, position))
-}
-
-fn article_cursor_for_pointer(
-    frame: &ArticleSelectionFrame,
-    position: egui::Pos2,
-) -> Option<ArticleDocCursor> {
-    article_cursor_under_pointer(frame, position).or_else(|| {
-        // A drag may start in the whitespace between two short labels (or on
-        // an image).  Treat the nearest row as the insertion point, but only
-        // inside the article's own bounding box so clicks in the sidebars do
-        // not accidentally start an article selection.
-        let bounds = frame
-            .spans
-            .iter()
-            .map(|span| span.global_rect)
-            .reduce(|left, right| left.union(right))?;
-        if bounds.expand(10.0).contains(position) {
-            article_cursor_nearest(frame, position)
-        } else {
-            None
-        }
-    })
-}
-
-fn article_cursor_nearest(
-    frame: &ArticleSelectionFrame,
-    position: egui::Pos2,
-) -> Option<ArticleDocCursor> {
-    if let Some((span_index, span)) = frame
-        .spans
-        .iter()
-        .enumerate()
-        .find(|(_, span)| span.pointer_local_char.is_some())
-    {
-        let local_char = span
-            .pointer_local_char
-            .unwrap_or_default()
-            .min(span.chars.end.saturating_sub(span.chars.start));
-        return Some(ArticleDocCursor {
-            span_index,
-            local_char,
-            char_index: span.chars.start + local_char,
-        });
-    }
-    frame
-        .spans
-        .iter()
-        .enumerate()
-        .min_by(|(_, left), (_, right)| {
-            vertical_distance(left.global_rect, position)
-                .total_cmp(&vertical_distance(right.global_rect, position))
-                .then_with(|| {
-                    horizontal_distance(left.global_rect, position)
-                        .total_cmp(&horizontal_distance(right.global_rect, position))
-                })
-        })
-        .map(|(span_index, span)| article_cursor_in_span(span_index, span, position))
-}
-
-fn article_cursor_in_span(
-    span_index: usize,
-    span: &RenderedArticleSpan,
-    position: egui::Pos2,
-) -> ArticleDocCursor {
-    let local_position = span.global_from_galley.inverse() * position;
-    let galley_cursor = span.galley.cursor_from_pos(local_position.to_vec2());
-    let span_len = span.chars.end.saturating_sub(span.chars.start);
-    let local_char = usize::from(galley_cursor.index).min(span_len);
-    ArticleDocCursor {
-        span_index,
-        local_char,
-        char_index: span.chars.start + local_char,
-    }
-}
-
-fn article_cursor_anchor(
-    frame: &ArticleSelectionFrame,
-    cursor: ArticleDocCursor,
-) -> Option<(egui::Rect, egui::LayerId)> {
-    let span = frame.spans.get(cursor.span_index)?;
-    let local_char = cursor
-        .local_char
-        .min(span.chars.end.saturating_sub(span.chars.start));
-    let cursor_rect = span
-        .galley
-        .pos_from_cursor(egui::text::CCursor::new(local_char));
-    let global_rect = (span.global_from_galley * cursor_rect).expand(3.0);
-    Some((global_rect, span.source_layer))
-}
-
-fn horizontal_distance(rect: egui::Rect, position: egui::Pos2) -> f32 {
-    if position.x < rect.left() {
-        rect.left() - position.x
-    } else if position.x > rect.right() {
-        position.x - rect.right()
-    } else {
-        0.0
-    }
-}
-
-fn vertical_distance(rect: egui::Rect, position: egui::Pos2) -> f32 {
-    if position.y < rect.top() {
-        rect.top() - position.y
-    } else if position.y > rect.bottom() {
-        position.y - rect.bottom()
-    } else {
-        0.0
-    }
-}
-
-fn selected_quote_from_article_text(
-    article_id: i64,
-    text: &str,
-    start: usize,
-    end: usize,
-) -> Option<SelectedQuote> {
-    let chars: Vec<char> = text.chars().collect();
-    let mut lo = start.min(end).min(chars.len());
-    let mut hi = start.max(end).min(chars.len());
-
-    while lo < hi && chars[lo].is_whitespace() {
-        lo += 1;
-    }
-    while hi > lo && chars[hi - 1].is_whitespace() {
-        hi -= 1;
-    }
-    if lo >= hi {
-        return None;
-    }
-
-    let anchor = TextAnchor::capture(text, lo, hi, 64);
-    Some(SelectedQuote {
-        article_id,
-        text: chars[lo..hi].iter().collect(),
-        start_offset: anchor.start_offset,
-        end_offset: anchor.end_offset,
-        anchor_prefix: anchor.prefix,
-        anchor_suffix: anchor.suffix,
-    })
-}
-
 fn rect_changed(a: egui::Rect, b: egui::Rect) -> bool {
     (a.min - b.min).length_sq() > 0.25 || (a.max - b.max).length_sq() > 0.25
-}
-
-fn is_bullet_text(text: &str) -> bool {
-    matches!(
-        text.trim_start().chars().next(),
-        Some('▪' | '•' | '·' | '‣' | '◦')
-    )
-}
-
-fn body_block_separator(
-    previous: &str,
-    next: &str,
-    previous_was_strong: bool,
-    previous_was_link: bool,
-    next_is_strong: bool,
-    next_is_link: bool,
-    next_link_has_prefix: bool,
-) -> &'static str {
-    // A marker such as `（1）` can be followed by an inline `<strong>` run in
-    // the same HTML paragraph. Keep the marker and its label on one line.
-    if text::is_numbered_marker_only(previous.trim()) {
-        return " ";
-    }
-    // A citation paragraph is often followed by a bare numbered paragraph
-    // (`2、...`, `3、...`) or by another citation paragraph. Those are
-    // separate source paragraphs even though the HTML parser exposes them as
-    // adjacent Link/Text blocks.
-    if next_is_link && !next_link_has_prefix {
-        // A link that starts at offset zero belongs to a new source
-        // paragraph.  This covers citation lists such as
-        // `稳定币的博弈（#357）` followed by `不要看重 Product Hunt（#307）`;
-        // the previous block is the plain suffix `（#357）`, so checking
-        // only `previous_was_link` would incorrectly join the two entries.
-        return "\n\n";
-    }
-    if previous_was_link && text::is_numbered_heading(next) {
-        return "\n\n";
-    }
-    if !previous_was_strong && !previous_was_link && !next_is_strong && !next_is_link {
-        return "\n\n";
-    }
-    let Some(previous_char) = previous.chars().rev().find(|ch| !ch.is_whitespace()) else {
-        return "";
-    };
-    let Some(next_char) = next.chars().find(|ch| !ch.is_whitespace()) else {
-        return "";
-    };
-    // Some sites place only part of a word inside an anchor, e.g.
-    // `<a>modif</a>y`. The link and suffix remain separate semantic blocks so
-    // the click range is exact, but they must render as one visible word.
-    if previous_was_link && is_ascii_word_char(previous_char) && is_ascii_word_char(next_char) {
-        return "";
-    }
-    if is_closing_punctuation(next_char) {
-        return "";
-    }
-    if is_sentence_ending(previous_char) || (previous_was_strong && next_is_strong) {
-        return "\n\n";
-    }
-    // Citation prefixes such as `----` are kept in the same Link block now,
-    // but this also handles an inline link that follows a plain dash prefix.
-    if next_is_link && matches!(previous_char, '-' | '—' | '–') {
-        return " ";
-    }
-    if needs_typographic_space(previous_char, next_char) {
-        " "
-    } else {
-        ""
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn body_fragment_separator(
-    previous: &str,
-    next: &str,
-    previous_was_strong: bool,
-    previous_was_link: bool,
-    previous_was_inline_code: bool,
-    next_is_strong: bool,
-    next_is_link: bool,
-    next_is_inline_code: bool,
-    next_link_has_prefix: bool,
-) -> &'static str {
-    if previous_was_inline_code || next_is_inline_code {
-        let Some(previous_char) = previous.chars().rev().find(|ch| !ch.is_whitespace()) else {
-            return "";
-        };
-        let Some(next_char) = next.chars().find(|ch| !ch.is_whitespace()) else {
-            return "";
-        };
-        if is_closing_punctuation(next_char)
-            || matches!(previous_char, '(' | '[' | '{' | '<' | '/' | '\\')
-        {
-            return "";
-        }
-        if needs_typographic_space(previous_char, next_char)
-            || (previous_was_inline_code && next_char.is_alphanumeric())
-            || (next_is_inline_code && previous_char.is_alphanumeric())
-        {
-            return " ";
-        }
-        return "";
-    }
-    body_block_separator(
-        previous,
-        next,
-        previous_was_strong,
-        previous_was_link,
-        next_is_strong,
-        next_is_link,
-        next_link_has_prefix,
-    )
-}
-
-fn is_ascii_word_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || ch == '_'
-}
-
-fn is_closing_punctuation(ch: char) -> bool {
-    matches!(
-        ch,
-        '。' | '．'
-            | '.'
-            | '，'
-            | ','
-            | '！'
-            | '!'
-            | '？'
-            | '?'
-            | '：'
-            | ':'
-            | '；'
-            | ';'
-            | '、'
-            | ')'
-            | ']'
-            | '}'
-            | '）'
-            | '】'
-            | '》'
-            | '”'
-            | '’'
-    )
-}
-
-fn is_sentence_ending(ch: char) -> bool {
-    matches!(ch, '。' | '．' | '.' | '！' | '!' | '？' | '?')
-}
-
-#[cfg(test)]
-fn is_punctuation_only(text: &str) -> bool {
-    let mut chars = text.trim().chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    is_closing_punctuation(first) && chars.all(is_closing_punctuation)
-}
-
-fn needs_typographic_space(left: char, right: char) -> bool {
-    let left_word = left.is_alphanumeric() || left == '_';
-    let right_word = right.is_alphanumeric() || right == '_';
-    left_word && right_word && (left.is_ascii() || right.is_ascii())
-}
-
-/// 为图片预留稳定空间，只在接近可视区域时才启动 HTTP 请求。
-/// 这样打开包含几十张图片的长文章时，不会瞬间发出全部请求。
-/// Render one semantic text block and register it with egui's cross-label
-/// selection plugin. Each block keeps its own typography while the app-level
-/// selection model makes the whole article behave like one continuous page.
-#[derive(Debug, Clone, Copy)]
-enum ArticleTextStyle {
-    Title,
-    Body,
-    Heading,
-    List,
-    Quote,
-    Code,
-}
-
-#[allow(clippy::too_many_arguments)]
-fn selectable_text_block_with_style(
-    ui: &mut egui::Ui,
-    article_id: i64,
-    block_index: usize,
-    text: &str,
-    strong_ranges: &[Range<usize>],
-    link_ranges: &[ArticleLinkRange],
-    style: ArticleTextStyle,
-    selection_frame: &mut ArticleSelectionFrame,
-) -> egui::Response {
-    selectable_text_block_with_inline_style(
-        ui,
-        article_id,
-        block_index,
-        text,
-        strong_ranges,
-        &[],
-        link_ranges,
-        style,
-        selection_frame,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn selectable_text_block_with_inline_style(
-    ui: &mut egui::Ui,
-    article_id: i64,
-    block_index: usize,
-    text: &str,
-    strong_ranges: &[Range<usize>],
-    inline_code_ranges: &[Range<usize>],
-    link_ranges: &[ArticleLinkRange],
-    style: ArticleTextStyle,
-    selection_frame: &mut ArticleSelectionFrame,
-) -> egui::Response {
-    let heading_inset = if matches!(style, ArticleTextStyle::Heading) {
-        15.0
-    } else {
-        0.0
-    };
-    let available_width = ui.available_width().max(1.0);
-    let job = article_layout_job(
-        style,
-        text,
-        strong_ranges,
-        inline_code_ranges,
-        link_ranges,
-        (available_width - heading_inset).max(1.0),
-    );
-    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
-    let mut selection_sense = egui::Sense::click_and_drag();
-    selection_sense -= egui::Sense::FOCUSABLE;
-    let (row_rect, mut response) = ui
-        .push_id(
-            ("article-selectable-label", article_id, block_index),
-            |ui| {
-                ui.allocate_exact_size(
-                    egui::vec2(available_width, galley.size().y),
-                    selection_sense,
-                )
-            },
-        )
-        .inner;
-    response.set_intrinsic_size(galley.intrinsic_size());
-    let galley_pos = row_rect.left_top() + egui::vec2(heading_inset, 0.0);
-    if matches!(style, ArticleTextStyle::Heading) {
-        let theme = ReaderTheme::sspai();
-        ui.painter().rect_filled(
-            egui::Rect::from_min_size(row_rect.left_top(), egui::vec2(6.0, galley.size().y)),
-            egui::CornerRadius::same(1),
-            theme.accent,
-        );
-    }
-    response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), galley.text())
-    });
-    let layer_to_global = ui
-        .ctx()
-        .layer_transform_to_global(response.layer_id)
-        .unwrap_or_default();
-    let global_from_galley =
-        layer_to_global * egui::emath::TSTransform::from_translation(galley_pos.to_vec2());
-    let global_text_rect =
-        global_from_galley * egui::Rect::from_min_size(egui::Pos2::ZERO, galley.size());
-    let global_rect = layer_to_global * response.interact_rect;
-    let pointer_local_char = response
-        .contains_pointer()
-        .then(|| response.interact_pointer_pos())
-        .flatten()
-        .map(|pointer| {
-            let local = global_from_galley.inverse() * pointer;
-            usize::from(galley.cursor_from_pos(local.to_vec2()).index)
-        });
-
-    // Keep anchors interactive even though the paragraph is rendered through
-    // a selectable label. A plain click on a link opens it; dragging belongs
-    // to LabelSelectionState and never opens a browser tab.
-    if response.clicked()
-        && !response.double_clicked()
-        && !response.triple_clicked()
-        && !link_ranges.is_empty()
-        && let Some(pointer) = response.interact_pointer_pos()
-        && global_text_rect.contains(pointer)
-    {
-        let local = global_from_galley.inverse() * pointer;
-        let cursor = galley.cursor_from_pos(local.to_vec2());
-        let char_index: usize = cursor.index.into();
-        let byte_index = text
-            .char_indices()
-            .nth(char_index)
-            .map(|(offset, _)| offset)
-            .unwrap_or(text.len());
-        let exact = link_ranges
-            .iter()
-            .find(|link| link.range.contains(&byte_index));
-        let link = exact.or_else(|| {
-            (byte_index > 0)
-                .then(|| {
-                    link_ranges
-                        .iter()
-                        .find(|link| link.range.contains(&(byte_index - 1)))
-                })
-                .flatten()
-        });
-        if let Some(link) = link {
-            open_in_browser(&link.url);
-        }
-    }
-
-    // Register every label with the cross-widget selection plugin, including
-    // labels outside the current clip. The painter clips them, while the
-    // plugin still sees both endpoints during long selections.
-    egui::text_selection::LabelSelectionState::label_text_selection(
-        ui,
-        &response,
-        galley_pos,
-        galley.clone(),
-        article_text_color(style),
-        egui::Stroke::NONE,
-    );
-    selection_frame.push_span(
-        text,
-        RenderedArticleSpan {
-            chars: 0..0,
-            galley,
-            global_from_galley,
-            global_rect,
-            source_layer: response.layer_id,
-            pointer_local_char,
-        },
-    );
-    response
-}
-
-fn article_text_color(style: ArticleTextStyle) -> egui::Color32 {
-    let theme = ReaderTheme::sspai();
-    match style {
-        ArticleTextStyle::Title
-        | ArticleTextStyle::Body
-        | ArticleTextStyle::Heading
-        | ArticleTextStyle::List => theme.text,
-        ArticleTextStyle::Quote => theme.muted,
-        ArticleTextStyle::Code => egui::Color32::from_rgb(102, 102, 102),
-    }
-}
-
-fn article_layout_job(
-    style: ArticleTextStyle,
-    text: &str,
-    strong_ranges: &[Range<usize>],
-    inline_code_ranges: &[Range<usize>],
-    link_ranges: &[ArticleLinkRange],
-    wrap_width: f32,
-) -> egui::text::LayoutJob {
-    let mut job = egui::text::LayoutJob::default();
-    let theme = ReaderTheme::sspai();
-    let (font_size, line_height, normal_color) = match style {
-        ArticleTextStyle::Title => (30.0, 38.0, theme.text),
-        ArticleTextStyle::Body => (15.0, 27.0, theme.text),
-        ArticleTextStyle::Heading => (21.0, 29.4, theme.text),
-        ArticleTextStyle::List => (15.0, 27.0, theme.text),
-        ArticleTextStyle::Quote => (15.0, 27.0, theme.muted),
-        ArticleTextStyle::Code => (13.0, 18.6, egui::Color32::from_rgb(102, 102, 102)),
-    };
-    let normal = egui::text::TextFormat {
-        font_id: egui::FontId::new(
-            font_size,
-            if matches!(style, ArticleTextStyle::Code) {
-                egui::FontFamily::Monospace
-            } else {
-                egui::FontFamily::Proportional
-            },
-        ),
-        line_height: Some(line_height),
-        color: normal_color,
-        ..Default::default()
-    };
-    let heading = egui::text::TextFormat {
-        font_id: egui::FontId::new(font_size, egui::FontFamily::Name("cjk-bold".into())),
-        line_height: Some(line_height),
-        color: theme.text,
-        ..normal.clone()
-    };
-    if matches!(style, ArticleTextStyle::Code) {
-        job.append(text, 0.0, normal);
-    } else if matches!(style, ArticleTextStyle::List) {
-        append_list_layout(
-            &mut job,
-            text,
-            strong_ranges,
-            inline_code_ranges,
-            link_ranges,
-            &normal,
-            &heading,
-        );
-    } else if matches!(style, ArticleTextStyle::Title) {
-        job.append(text, 0.0, heading);
-    } else if matches!(style, ArticleTextStyle::Heading) {
-        append_body_layout(
-            &mut job,
-            text,
-            &[],
-            inline_code_ranges,
-            link_ranges,
-            &heading,
-            &heading,
-        );
-    } else {
-        append_body_layout(
-            &mut job,
-            text,
-            strong_ranges,
-            inline_code_ranges,
-            link_ranges,
-            &normal,
-            &heading,
-        );
-    }
-    job.wrap.max_width = wrap_width.max(1.0);
-    job.keep_trailing_whitespace = true;
-    job
-}
-
-fn append_body_layout(
-    job: &mut egui::text::LayoutJob,
-    text: &str,
-    strong_ranges: &[Range<usize>],
-    inline_code_ranges: &[Range<usize>],
-    link_ranges: &[ArticleLinkRange],
-    normal: &egui::text::TextFormat,
-    strong: &egui::text::TextFormat,
-) {
-    let mut boundaries = vec![0, text.len()];
-    boundaries.extend(
-        strong_ranges
-            .iter()
-            .flat_map(|range| [range.start, range.end]),
-    );
-    boundaries.extend(
-        inline_code_ranges
-            .iter()
-            .flat_map(|range| [range.start, range.end]),
-    );
-    boundaries.extend(
-        link_ranges
-            .iter()
-            .flat_map(|link| [link.range.start, link.range.end]),
-    );
-    boundaries.sort_unstable();
-    boundaries.dedup();
-
-    let mut link_format = normal.clone();
-    link_format.color = ReaderTheme::sspai().link;
-    link_format.underline = egui::Stroke::NONE;
-    let mut inline_code_format = normal.clone();
-    inline_code_format.font_id = egui::FontId::new(
-        (normal.font_id.size * 0.92).max(12.0),
-        egui::FontFamily::Monospace,
-    );
-    inline_code_format.background = ReaderTheme::sspai().code_bg;
-
-    for pair in boundaries.windows(2) {
-        let start = pair[0].min(text.len());
-        let end = pair[1].max(start).min(text.len());
-        if start >= end || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
-            continue;
-        }
-        let format = if link_ranges
-            .iter()
-            .any(|link| link.range.start <= start && end <= link.range.end)
-        {
-            link_format.clone()
-        } else if inline_code_ranges
-            .iter()
-            .any(|range| range.start <= start && end <= range.end)
-        {
-            inline_code_format.clone()
-        } else if strong_ranges
-            .iter()
-            .any(|range| range.start <= start && end <= range.end)
-        {
-            strong.clone()
-        } else {
-            normal.clone()
-        };
-        job.append(&text[start..end], 0.0, format);
-    }
-}
-
-fn append_list_layout(
-    job: &mut egui::text::LayoutJob,
-    text: &str,
-    explicit_strong_ranges: &[Range<usize>],
-    inline_code_ranges: &[Range<usize>],
-    link_ranges: &[ArticleLinkRange],
-    normal: &egui::text::TextFormat,
-    strong: &egui::text::TextFormat,
-) {
-    // The value after the final colon is the part users normally scan for in
-    // a comparison list, so give it the installed bold CJK face. Build those
-    // ranges first, then use the same range compositor as body paragraphs so
-    // links retain their blue/underlined treatment inside a list card.
-    let mut strong_ranges = explicit_strong_ranges.to_vec();
-    let mut offset = 0;
-    for line in text.split('\n') {
-        if let Some(colon) = line.rfind(['：', ':']) {
-            let split_at = colon + line[colon..].chars().next().unwrap().len_utf8();
-            if split_at < line.len() {
-                strong_ranges.push(offset + split_at..offset + line.len());
-            }
-        }
-        offset += line.len() + 1;
-    }
-    append_body_layout(
-        job,
-        text,
-        &strong_ranges,
-        inline_code_ranges,
-        link_ranges,
-        normal,
-        strong,
-    );
-}
-
-fn formula_block(
-    ui: &mut egui::Ui,
-    source: &str,
-    display: bool,
-    cache: &mut HashMap<String, FormulaState>,
-    jobs: &std_mpsc::Sender<FormulaJob>,
-) {
-    let theme = ReaderTheme::sspai();
-    let key = format!("{}\n{source}", if display { "display" } else { "inline" });
-    if !cache.contains_key(&key) {
-        let job = FormulaJob {
-            key: key.clone(),
-            source: source.to_owned(),
-            display,
-        };
-        if jobs.send(job).is_ok() {
-            cache.insert(key.clone(), FormulaState::Loading);
-        } else {
-            cache.insert(
-                key.clone(),
-                FormulaState::Failed("公式排版服务没有响应".to_owned()),
-            );
-        }
-    }
-
-    egui::Frame::new()
-        .fill(theme.code_bg)
-        .corner_radius(egui::CornerRadius::same(4))
-        .inner_margin(egui::Margin::symmetric(18, 12))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            match cache.get(&key) {
-                Some(FormulaState::Ready(bytes)) => {
-                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    key.hash(&mut hasher);
-                    let image = egui::Image::from_bytes(
-                        format!("bytes://formula/{:016x}.svg", hasher.finish()),
-                        bytes.clone(),
-                    )
-                    .max_width(ui.available_width())
-                    .max_height(if display { 180.0 } else { 72.0 })
-                    .maintain_aspect_ratio(true)
-                    .show_loading_spinner(false);
-                    if display {
-                        ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
-                            ui.add(image).on_hover_text(format!("TeX：{source}"));
-                        });
-                    } else {
-                        ui.add(image).on_hover_text(format!("TeX：{source}"));
-                    }
-                }
-                Some(FormulaState::Loading) => {
-                    ui.horizontal(|ui| {
-                        ui.add(egui::Spinner::new().size(16.0));
-                        ui.label(
-                            egui::RichText::new("正在排版公式…")
-                                .size(13.0)
-                                .color(theme.muted),
-                        );
-                    });
-                }
-                Some(FormulaState::Failed(error)) => {
-                    ui.label(
-                        egui::RichText::new(source)
-                            .monospace()
-                            .size(if display { 17.0 } else { 15.0 })
-                            .color(theme.text),
-                    )
-                    .on_hover_text(format!("公式排版失败，已保留 TeX 源文本：{error}"));
-                }
-                None => {}
-            }
-        });
-}
-
-fn article_image(
-    ui: &mut egui::Ui,
-    viewport: &egui::Rect,
-    uri: &str,
-    link_url: Option<&str>,
-    cache: &mut HashMap<String, ImageState>,
-    job_tx: &std_mpsc::Sender<String>,
-) {
-    let available_width = ui.available_width();
-    let width = available_width;
-    let theme = ReaderTheme::sspai();
-    let natural_dimensions = cache.get(uri).and_then(|state| match state {
-        ImageState::Ready { dimensions, .. } => *dimensions,
-        _ => None,
-    });
-    let height = natural_dimensions
-        .filter(|(w, h)| *w > 0 && *h > 0)
-        .map(|(w, h)| (width * h as f32 / w as f32).clamp(160.0, 900.0))
-        .unwrap_or_else(|| match cache.get(uri) {
-            Some(ImageState::Failed(_)) => 180.0,
-            _ => (width * 0.42).clamp(200.0, 340.0),
-        });
-    let left_margin = ((available_width - width) * 0.5).max(0.0);
-    let allocated = ui.allocate_ui_with_layout(
-        egui::vec2(available_width, height),
-        egui::Layout::left_to_right(egui::Align::Center),
-        |ui| {
-            ui.add_space(left_margin);
-            ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click())
-        },
-    );
-    let (rect, response) = allocated.inner;
-
-    // 提前一屏开始下载，通常滚动到图片时已经加载完成。
-    let content_origin = ui.max_rect().min;
-    let content_rect = rect.translate(-content_origin.to_vec2());
-    let preload = viewport.expand2(egui::vec2(0.0, 600.0));
-    if content_rect.intersects(preload) {
-        if !cache.contains_key(uri) {
-            if let Err(error) = queue_image_download(uri, job_tx) {
-                cache.insert(uri.to_owned(), ImageState::Failed(error));
-            } else {
-                cache.insert(
-                    uri.to_owned(),
-                    ImageState::Loading {
-                        started: Instant::now(),
-                        attempt: 1,
-                    },
-                );
-            }
-        }
-        match cache.get(uri) {
-            Some(ImageState::Ready { bytes, .. }) => {
-                ui.put(
-                    rect,
-                    egui::Image::from_bytes(format!("bytes://{uri}"), bytes.clone())
-                        .fit_to_exact_size(rect.size())
-                        .maintain_aspect_ratio(true)
-                        .corner_radius(egui::CornerRadius::same(5))
-                        .show_loading_spinner(false),
-                );
-            }
-            Some(ImageState::Failed(error)) => {
-                ui.painter()
-                    .rect_filled(rect, egui::CornerRadius::same(5), theme.code_bg);
-                let attempts = if error.attempts > 1 {
-                    format!("，已自动尝试 {} 次", error.attempts)
-                } else {
-                    String::new()
-                };
-                ui.painter().text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    format!(
-                        "图片暂时无法加载\n{}{}\n单击重新加载 · 右键可在浏览器中打开",
-                        error.message, attempts
-                    ),
-                    egui::FontId::proportional(13.0),
-                    ui.visuals().error_fg_color,
-                );
-                response.clone().on_hover_text(&error.detail);
-            }
-            Some(ImageState::Loading { started, attempt }) => {
-                ui.painter()
-                    .rect_filled(rect, egui::CornerRadius::same(5), theme.code_bg);
-                let spinner_rect =
-                    egui::Rect::from_center_size(rect.center(), egui::vec2(28.0, 28.0));
-                ui.put(spinner_rect, egui::Spinner::new().size(24.0));
-                ui.painter().text(
-                    rect.center() + egui::vec2(0.0, 34.0),
-                    egui::Align2::CENTER_CENTER,
-                    format!(
-                        "{}… {:.0}s",
-                        if *attempt > 1 {
-                            format!("正在自动重试 {attempt}/{IMAGE_MAX_ATTEMPTS}")
-                        } else {
-                            "正在下载".to_owned()
-                        },
-                        started.elapsed().as_secs_f32(),
-                    ),
-                    egui::FontId::proportional(13.0),
-                    ui.visuals().weak_text_color(),
-                );
-            }
-            None => {}
-        }
-    } else {
-        ui.painter()
-            .rect_filled(rect, egui::CornerRadius::same(5), theme.code_bg);
-        ui.painter().text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            "滚动到这里后加载图片",
-            egui::FontId::proportional(14.0),
-            ui.visuals().weak_text_color(),
-        );
-    }
-
-    let mut retry = false;
-    if response.clicked() {
-        if matches!(cache.get(uri), Some(ImageState::Failed(_))) {
-            retry = true;
-        } else if let Some(url) = link_url {
-            open_in_browser(url);
-        }
-    }
-    response.context_menu(|ui| {
-        if ui.button("重新加载图片").clicked() {
-            retry = true;
-            ui.close();
-        }
-        if ui.button("在浏览器中打开图片").clicked() {
-            open_in_browser(uri);
-            ui.close();
-        }
-        if let Some(url) = link_url
-            && ui.button("打开图片链接").clicked()
-        {
-            open_in_browser(url);
-            ui.close();
-        }
-    });
-    if retry {
-        let can_retry = cache
-            .get(uri)
-            .is_some_and(|state| matches!(state, ImageState::Failed(_)));
-        if can_retry {
-            ui.ctx().forget_image(&format!("bytes://{uri}"));
-            if let Err(error) = queue_image_download(uri, job_tx) {
-                cache.insert(uri.to_owned(), ImageState::Failed(error));
-            } else {
-                cache.insert(
-                    uri.to_owned(),
-                    ImageState::Loading {
-                        started: Instant::now(),
-                        attempt: 1,
-                    },
-                );
-            }
-            ui.ctx().request_repaint();
-        }
-    }
-    ui.add_space(15.0);
-}
-
-fn queue_image_download(uri: &str, job_tx: &std_mpsc::Sender<String>) -> Result<(), ImageFailure> {
-    job_tx.send(uri.to_owned()).map_err(|error| ImageFailure {
-        message: "图片下载服务没有响应".to_owned(),
-        detail: error.to_string(),
-        attempts: 0,
-        retryable: true,
-    })
-}
-
-fn spawn_formula_worker(
-    jobs: std_mpsc::Receiver<FormulaJob>,
-    events: std_mpsc::Sender<FormulaEvent>,
-) {
-    std::thread::Builder::new()
-        .name("shiyue-mathjax".to_owned())
-        .spawn(move || {
-            let renderer = match std::panic::catch_unwind(mathjax_svg_rs::MathJax::new) {
-                Ok(renderer) => renderer,
-                Err(_) => {
-                    while let Ok(job) = jobs.recv() {
-                        let _ = events.send(FormulaEvent::Complete {
-                            key: job.key,
-                            result: Err("MathJax 初始化失败".to_owned()),
-                        });
-                    }
-                    return;
-                }
-            };
-            while let Ok(job) = jobs.recv() {
-                let options = mathjax_svg_rs::Options {
-                    font_size: if job.display { 19.0 } else { 16.0 },
-                    horizontal_align: if job.display {
-                        mathjax_svg_rs::HorizontalAlign::Center
-                    } else {
-                        mathjax_svg_rs::HorizontalAlign::Left
-                    },
-                };
-                let result = renderer
-                    .render_tex(&job.source, &options)
-                    .map(|svg| Arc::<[u8]>::from(svg.into_bytes()));
-                let _ = events.send(FormulaEvent::Complete {
-                    key: job.key,
-                    result,
-                });
-            }
-        })
-        .expect("公式排版线程创建失败");
-}
-
-fn spawn_image_workers(
-    client: reqwest::blocking::Client,
-    job_rx: std_mpsc::Receiver<String>,
-    event_tx: std_mpsc::Sender<ImageEvent>,
-    store: Arc<ImageStore>,
-) {
-    let job_rx = Arc::new(Mutex::new(job_rx));
-    for worker in 0..IMAGE_WORKER_COUNT {
-        let client = client.clone();
-        let job_rx = job_rx.clone();
-        let event_tx = event_tx.clone();
-        let store = store.clone();
-        std::thread::Builder::new()
-            .name(format!("shiyue-image-{worker}"))
-            .spawn(move || {
-                loop {
-                    // std::mpsc has one consumer, so only hold the mutex while
-                    // receiving a job. The network request itself remains fully
-                    // concurrent across the bounded worker pool.
-                    let uri = {
-                        let Ok(receiver) = job_rx.lock() else {
-                            return;
-                        };
-                        let Ok(uri) = receiver.recv() else {
-                            return;
-                        };
-                        uri
-                    };
-                    let result = load_cached_or_download_image(&client, &store, &uri, &event_tx);
-                    if event_tx.send(ImageEvent::Complete { uri, result }).is_err() {
-                        return;
-                    }
-                }
-            })
-            .expect("failed to spawn image worker");
-    }
-}
-
-fn load_cached_or_download_image(
-    client: &reqwest::blocking::Client,
-    store: &ImageStore,
-    uri: &str,
-    event_tx: &std_mpsc::Sender<ImageEvent>,
-) -> Result<Arc<[u8]>, ImageFailure> {
-    match store.get(uri) {
-        Ok(Some(bytes)) if image::load_from_memory(&bytes).is_ok() => {
-            return Ok(Arc::from(bytes));
-        }
-        Ok(_) => {}
-        Err(error) => tracing::warn!("读取图片缓存失败：{error:#}"),
-    }
-
-    let bytes = download_image_with_retry(client, uri, event_tx)?;
-    image::load_from_memory(bytes.as_ref()).map_err(|error| ImageFailure {
-        message: "图片格式无法解码".to_owned(),
-        detail: error.to_string(),
-        attempts: 1,
-        retryable: false,
-    })?;
-    if let Err(error) = store.put(uri, bytes.as_ref()) {
-        tracing::warn!("写入图片缓存失败：{error:#}");
-    } else if let Err(error) = store.prune_to(DEFAULT_LIMIT_BYTES) {
-        tracing::warn!("清理图片缓存失败：{error:#}");
-    }
-    Ok(bytes)
-}
-
-fn download_image_with_retry(
-    client: &reqwest::blocking::Client,
-    uri: &str,
-    event_tx: &std_mpsc::Sender<ImageEvent>,
-) -> Result<Arc<[u8]>, ImageFailure> {
-    let mut last_failure = None;
-    for attempt in 1..=IMAGE_MAX_ATTEMPTS {
-        if attempt > 1 {
-            let _ = event_tx.send(ImageEvent::Progress {
-                uri: uri.to_owned(),
-                attempt,
-            });
-            std::thread::sleep(match attempt {
-                2 => Duration::from_millis(500),
-                _ => Duration::from_millis(1_500),
-            });
-        }
-
-        match download_image_once(client, uri, attempt) {
-            Ok(bytes) => return Ok(bytes),
-            Err(failure) => {
-                let should_retry = failure.retryable && attempt < IMAGE_MAX_ATTEMPTS;
-                last_failure = Some(failure);
-                if !should_retry {
-                    break;
-                }
-            }
-        }
-    }
-
-    Err(last_failure.unwrap_or_else(|| ImageFailure {
-        message: "图片下载未完成".to_owned(),
-        detail: "下载任务意外结束".to_owned(),
-        attempts: 0,
-        retryable: true,
-    }))
-}
-
-fn download_image_once(
-    client: &reqwest::blocking::Client,
-    uri: &str,
-    attempt: u8,
-) -> Result<Arc<[u8]>, ImageFailure> {
-    let url = reqwest::Url::parse(uri).map_err(|error| ImageFailure {
-        message: "图片地址无效，已停止加载".to_owned(),
-        detail: error.to_string(),
-        attempts: attempt,
-        retryable: false,
-    })?;
-    crate::web_clip::validate_public_url(&url).map_err(|detail| ImageFailure {
-        message: "为保护本机数据，已阻止加载该图片".to_owned(),
-        detail,
-        attempts: attempt,
-        retryable: false,
-    })?;
-
-    let response = client
-        .get(url)
-        // The bundled decoder supports WebP/PNG/JPEG/GIF. Do not advertise
-        // AVIF: a CDN may otherwise return a healthy image we cannot decode.
-        .header(
-            reqwest::header::ACCEPT,
-            "image/webp,image/png,image/jpeg,image/gif,*/*",
-        )
-        .send()
-        .map_err(|error| image_request_failure(error, attempt))?;
-    if let Some(peer) = response.remote_addr()
-        && !crate::web_clip::is_public_ip(peer.ip())
-    {
-        return Err(ImageFailure {
-            message: "为保护本机数据，已阻止加载该图片".to_owned(),
-            detail: format!("图片服务器连接到了本机或内网地址：{}", peer.ip()),
-            attempts: attempt,
-            retryable: false,
-        });
-    }
-    let response = response
-        .error_for_status()
-        .map_err(|error| image_request_failure(error, attempt))?;
-    if response
-        .content_length()
-        .is_some_and(|length| length > IMAGE_MAX_BYTES)
-    {
-        return Err(ImageFailure {
-            message: "图片文件过大，已停止下载".to_owned(),
-            detail: format!(
-                "图片超过 {} MB 的安全上限：{uri}",
-                IMAGE_MAX_BYTES / 1024 / 1024
-            ),
-            attempts: attempt,
-            retryable: false,
-        });
-    }
-    let mut bytes = Vec::new();
-    response
-        .take(IMAGE_MAX_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| ImageFailure {
-            message: "图片传输中断".to_owned(),
-            detail: error.to_string(),
-            attempts: attempt,
-            retryable: true,
-        })?;
-    if bytes.is_empty() {
-        return Err(ImageFailure {
-            message: "服务器返回了空图片".to_owned(),
-            detail: format!("{uri} returned an empty response body"),
-            attempts: attempt,
-            retryable: true,
-        });
-    }
-    if bytes.len() as u64 > IMAGE_MAX_BYTES {
-        return Err(ImageFailure {
-            message: "图片文件过大，已停止显示".to_owned(),
-            detail: format!(
-                "图片超过 {} MB 的安全上限：{uri}",
-                IMAGE_MAX_BYTES / 1024 / 1024
-            ),
-            attempts: attempt,
-            retryable: false,
-        });
-    }
-    Ok(Arc::from(bytes))
-}
-
-fn image_request_failure(error: reqwest::Error, attempt: u8) -> ImageFailure {
-    let status = error.status();
-    let retryable = !error.is_redirect()
-        && (error.is_timeout()
-        || error.is_connect()
-        // TLS renegotiation and HTTP framing failures are classified as
-        // request errors rather than connect errors by reqwest. Image GETs
-        // are idempotent, so retrying this transport category is safe.
-        || error.is_request()
-        || error.is_body()
-        || status.is_some_and(image_http_status_retryable));
-    let message = if error.is_timeout() {
-        "连接图片服务器超时".to_owned()
-    } else if error.is_connect() {
-        "无法连接图片服务器".to_owned()
-    } else if error.is_redirect() {
-        "图片重定向不安全，已停止加载".to_owned()
-    } else if let Some(status) = status {
-        format!("图片服务器返回 HTTP {}", status.as_u16())
-    } else if error.is_body() {
-        "图片传输中断".to_owned()
-    } else {
-        "网络请求失败".to_owned()
-    };
-    ImageFailure {
-        message,
-        detail: format!(
-            "{}\n请求阶段：{}；可自动重试：{}",
-            reqwest_error_chain(&error),
-            if error.is_builder() {
-                "构造请求"
-            } else if error.is_redirect() {
-                "重定向"
-            } else if error.is_body() {
-                "读取响应"
-            } else {
-                "发送请求"
-            },
-            retryable
-        ),
-        attempts: attempt,
-        retryable,
-    }
-}
-
-fn image_http_status_retryable(status: reqwest::StatusCode) -> bool {
-    matches!(status.as_u16(), 408 | 425 | 429) || status.is_server_error()
-}
-
-fn reqwest_error_chain(error: &reqwest::Error) -> String {
-    let mut messages = vec![error.to_string()];
-    let mut source = error.source();
-    while let Some(cause) = source {
-        let message = cause.to_string();
-        if messages.last().is_none_or(|previous| previous != &message) {
-            messages.push(message);
-        }
-        source = cause.source();
-    }
-    messages.join("\n原因：")
 }
 
 fn non_empty_owned(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_owned())
-}
-
-fn is_http_url(value: &str) -> bool {
-    reqwest::Url::parse(value.trim())
-        .ok()
-        .is_some_and(|url| matches!(url.scheme(), "http" | "https"))
-}
-
-fn normalized_web_url(value: &str) -> Option<String> {
-    let value = value.trim();
-    if is_http_url(value) {
-        return Some(value.to_owned());
-    }
-    if value.is_empty()
-        || value.chars().any(char::is_whitespace)
-        || value.starts_with('<')
-        || value.contains("://")
-    {
-        return None;
-    }
-    let host = value.split(['/', '?', '#']).next().unwrap_or_default();
-    if !host.contains('.') {
-        return None;
-    }
-    let candidate = format!("https://{value}");
-    is_http_url(&candidate).then_some(candidate)
-}
-
-fn resolve_http_url(value: &str, document_url: Option<&str>) -> Option<String> {
-    if let Ok(url) = reqwest::Url::parse(value.trim()) {
-        return matches!(url.scheme(), "http" | "https").then(|| url.to_string());
-    }
-    let document = reqwest::Url::parse(document_url?).ok()?;
-    let joined = document.join(value.trim()).ok()?;
-    matches!(joined.scheme(), "http" | "https").then(|| joined.to_string())
-}
-
-fn escape_html_attribute(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('"', "&quot;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
-fn with_html_base(content: &str, base: Option<&str>) -> String {
-    match base.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(base) => format!(
-            "<base href=\"{}\">\n{}",
-            escape_html_attribute(base),
-            content
-        ),
-        None => content.to_owned(),
-    }
-}
-
-fn prepare_pasted_web_clip(
-    html: &str,
-    explicit_base: Option<&str>,
-) -> std::result::Result<(Option<String>, String), String> {
-    let snapshot = text::prepare_html_snapshot(html);
-    if snapshot.content.trim().is_empty() {
-        return Err("HTML 中没有识别到可阅读正文".to_owned());
-    }
-    let base = explicit_base
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| {
-            resolve_http_url(value, None)
-                .ok_or_else(|| "基础网址必须是 http:// 或 https:// 地址".to_owned())
-        })
-        .transpose()?
-        .or_else(|| {
-            snapshot
-                .base_href
-                .as_deref()
-                .and_then(|value| resolve_http_url(value, None))
-        });
-    Ok((
-        snapshot.title,
-        with_html_base(&snapshot.content, base.as_deref()),
-    ))
 }
 
 /// 用系统默认浏览器打开链接，不经过 shell/cmd 字符串解释。
@@ -7820,24 +6057,15 @@ fn resource_card<R>(
 #[cfg(test)]
 mod tests {
     use super::{
-        ArticleTextStyle, FeedSettingsPanel, IMAGE_MAX_ATTEMPTS, ModalPayload, ModalState,
-        PanelPayload, PanelState, ResourceEditDialog, ResourceEditValues, TagDialog, WebClipDialog,
-        adopt_article_projection_data, article_layout_job, body_block_separator,
-        body_fragment_separator, download_image_with_retry, image_http_status_retryable,
-        is_punctuation_only, load_cached_or_download_image, normalized_web_url,
-        prepare_pasted_web_clip, projection_scope_for_route, resource_card, search_match_ranges,
-        search_preview, selected_quote_from_article_text,
+        CommentDialog, ExcerptTarget, FeedSettingsPanel, ModalPayload, ModalState, PanelPayload,
+        PanelState, ResourceEditDialog, ResourceEditValues, SelectedQuote, TagDialog,
+        WebClipDialog, accepts_search_response, projection_scope_for_route,
+        reconcile_article_selection, resource_card, search_match_ranges, search_preview,
     };
-    use crate::article_library_lifecycle::{
-        ArticleLibraryCounts, ArticleLibraryProjection, ProjectionScope,
-    };
+    use crate::article_library_lifecycle::ProjectionScope;
     use crate::gui_state::{ArticleCollection, Route};
-    use crate::image_store::ImageStore;
-    use crate::model::{Article, Feed};
+    use crate::model::Article;
     use eframe::egui;
-    use std::collections::{HashMap, HashSet};
-    use std::sync::mpsc;
-    use std::time::Duration;
 
     #[test]
     fn desktop_routes_map_to_article_library_scopes() {
@@ -7861,68 +6089,40 @@ mod tests {
     }
 
     #[test]
-    fn successful_projection_replaces_rows_tags_and_authoritative_counts() {
-        let article = Article {
-            id: 11,
+    fn article_selection_keeps_present_choice_restores_memory_and_drops_missing_rows() {
+        let article = |id| Article {
+            id,
             feed_id: 7,
-            entry_id: "entry".into(),
+            entry_id: format!("entry-{id}"),
             url: None,
-            title: Some("Title".into()),
+            title: Some(format!("Article {id}")),
             author: None,
             published: None,
             content: None,
             is_read: false,
-            starred: true,
+            starred: false,
             read_later: false,
             archived: false,
             fetched_at: 1,
         };
-        let projection = ArticleLibraryProjection {
-            scope: ProjectionScope::Feed(7),
-            articles: vec![article],
-            tags: HashMap::from([(11, vec!["Rust".into()])]),
-            fixed_bookmark_ids: HashSet::from([11]),
-            counts: ArticleLibraryCounts {
-                bookmarks: 4,
-                read_later: 2,
-                archived: 1,
-            },
-            feed_unread: vec![(7, 3)],
-        };
-        let mut articles = Vec::new();
-        let mut tags = HashMap::new();
-        let mut fixed = HashSet::new();
-        let (mut saved, mut later, mut archived) = (0, 0, 0);
-        let feed = Feed {
-            id: 7,
-            url: "https://example.com/feed.xml".into(),
-            title: None,
-            interval_secs: None,
-            last_fetch: None,
-            next_fetch: 0,
-            last_error: None,
-            fail_count: 0,
-            disabled: false,
-        };
-        let mut feeds = vec![(feed, 99)];
+        let articles = vec![article(11), article(12)];
 
-        let scope = adopt_article_projection_data(
-            projection,
-            &mut articles,
-            &mut tags,
-            &mut fixed,
-            &mut saved,
-            &mut later,
-            &mut archived,
-            &mut feeds,
+        assert_eq!(
+            reconcile_article_selection(Some(11), Some(12), &articles),
+            Some(11)
         );
-
-        assert_eq!(scope, ProjectionScope::Feed(7));
-        assert_eq!(articles[0].id, 11);
-        assert_eq!(tags[&11], vec!["Rust"]);
-        assert!(fixed.contains(&11));
-        assert_eq!((saved, later, archived), (4, 2, 1));
-        assert_eq!(feeds[0].1, 3);
+        assert_eq!(
+            reconcile_article_selection(Some(99), Some(12), &articles),
+            Some(12)
+        );
+        assert_eq!(
+            reconcile_article_selection(None, Some(12), &articles),
+            Some(12)
+        );
+        assert_eq!(
+            reconcile_article_selection(Some(99), Some(98), &articles),
+            None
+        );
     }
 
     #[test]
@@ -7988,6 +6188,29 @@ mod tests {
             ..Default::default()
         };
         assert!(ModalState::SaveWebPage(web).is_dirty());
+
+        let quote = SelectedQuote {
+            article_id: 7,
+            text: "excerpt".into(),
+            start_offset: Some(0),
+            end_offset: Some(7),
+            anchor_prefix: String::new(),
+            anchor_suffix: String::new(),
+        };
+        let mut thought = CommentDialog {
+            quote,
+            target: ExcerptTarget::Existing(3),
+            draft: "current thought".into(),
+            original: "current thought".into(),
+            error: None,
+            focus_input: false,
+        };
+        assert!(!ModalState::WriteThought(thought.clone()).is_dirty());
+        thought = CommentDialog {
+            draft: "edited thought".into(),
+            ..thought
+        };
+        assert!(ModalState::WriteThought(thought).is_dirty());
     }
 
     #[test]
@@ -8001,6 +6224,7 @@ mod tests {
         };
         let mut dialog = ResourceEditDialog {
             id: 3,
+            hydrated: true,
             title: original.title.clone(),
             purpose_zh: original.purpose_zh.clone(),
             note: original.note.clone(),
@@ -8036,50 +6260,6 @@ mod tests {
         );
         panel.interval_draft = "2h".into();
         assert!(PanelState::FeedSettings(panel).is_dirty());
-    }
-
-    #[test]
-    fn article_quote_uses_unicode_character_offsets_and_trims_edges() {
-        let quote = selected_quote_from_article_text(42, "甲乙\n\n😀丙丁", 1, 6).unwrap();
-        assert_eq!(quote.text, "乙\n\n😀丙");
-        assert_eq!(quote.start_offset, Some(1));
-        assert_eq!(quote.end_offset, Some(6));
-
-        let reverse = selected_quote_from_article_text(42, "  前文 后文  ", 9, 2).unwrap();
-        assert_eq!(reverse.text, "前文 后文");
-        assert_eq!(reverse.start_offset, Some(2));
-        assert_eq!(reverse.end_offset, Some(7));
-    }
-
-    #[test]
-    fn article_quote_rejects_whitespace_only_ranges() {
-        assert!(selected_quote_from_article_text(42, "甲 \n\n 乙", 1, 5).is_none());
-    }
-
-    #[test]
-    fn web_clip_input_accepts_http_and_common_bare_hosts() {
-        assert_eq!(
-            normalized_web_url("https://example.com/a"),
-            Some("https://example.com/a".to_owned())
-        );
-        assert_eq!(
-            normalized_web_url("example.com/a"),
-            Some("https://example.com/a".to_owned())
-        );
-        assert_eq!(normalized_web_url("<p>example.com</p>"), None);
-        assert_eq!(normalized_web_url("一段普通文字"), None);
-    }
-
-    #[test]
-    fn pasted_web_clip_keeps_local_base_without_using_it_as_identity() {
-        let (title, html) = prepare_pasted_web_clip(
-            "<title>保存页</title><article><img src='cover.webp'><p>正文</p></article>",
-            Some("https://example.com/posts/1/"),
-        )
-        .unwrap();
-        assert_eq!(title.as_deref(), Some("保存页"));
-        assert!(html.starts_with("<base href=\"https://example.com/posts/1/\">"));
-        assert!(html.contains("<p>正文</p>"));
     }
 
     #[test]
@@ -8120,229 +6300,9 @@ mod tests {
     }
 
     #[test]
-    fn joins_inline_emphasis_without_breaking_chinese_punctuation() {
-        assert_eq!(
-            body_block_separator("（1）", "is-", false, false, false, true, false),
-            " "
-        );
-        assert_eq!(
-            body_block_separator("RTX", "5090", false, false, true, false, false),
-            " "
-        );
-        assert_eq!(
-            body_block_separator("统一内存", "。它的好处", true, false, false, false, false,),
-            ""
-        );
-        assert_eq!(
-            body_block_separator("这是完整一句。", "下一段", true, false, false, false, false,),
-            "\n\n"
-        );
-        assert_eq!(
-            body_block_separator("第一段。", "第二段。", false, false, false, false, false,),
-            "\n\n"
-        );
-        assert_eq!(
-            body_block_separator("---- 来源", "2、下一段", false, true, false, false, false,),
-            "\n\n"
-        );
-        assert_eq!(
-            body_block_separator("来源一", "来源二", false, true, false, true, false),
-            "\n\n"
-        );
-        assert_eq!(
-            body_block_separator("本杂志开源", "，欢迎投稿", false, true, false, true, true,),
-            ""
-        );
-        assert_eq!(
-            body_block_separator(
-                "harder to modif",
-                "y, leading",
-                false,
-                true,
-                false,
-                false,
-                false
-            ),
-            ""
-        );
-        // `space_after` on Block::Link bypasses this fallback and inserts a
-        // literal space for ordinary `<a>docs</a> and` markup.
-        assert_eq!(
-            body_block_separator(
-                "（#357）",
-                "不要看重 Product Hunt",
-                false,
-                false,
-                false,
-                true,
-                false,
-            ),
-            "\n\n"
-        );
-    }
-
-    #[test]
-    fn inline_code_layout_stays_in_the_sentence_and_uses_monospace() {
-        let text = "Installed via rustup, then update.";
-        let start = text.find("rustup").unwrap();
-        let end = start + "rustup".len();
-        let inline_code_range = start..end;
-        let job = article_layout_job(
-            ArticleTextStyle::Body,
-            text,
-            &[],
-            std::slice::from_ref(&inline_code_range),
-            &[],
-            1200.0,
-        );
-
-        assert_eq!(job.text, text);
-        assert!(!job.text.contains('\n'));
-        assert!(job.sections.iter().any(|section| {
-            usize::from(section.byte_range.start) == start
-                && usize::from(section.byte_range.end) == end
-                && section.format.font_id.family == egui::FontFamily::Monospace
-                && section.format.background != egui::Color32::TRANSPARENT
-        }));
-    }
-
-    #[test]
-    fn inline_code_fragments_do_not_create_paragraph_breaks() {
-        assert_eq!(
-            body_fragment_separator(
-                "If Rust is installed via",
-                "rustup",
-                false,
-                false,
-                false,
-                false,
-                false,
-                true,
-                false,
-            ),
-            " "
-        );
-        assert_eq!(
-            body_fragment_separator(
-                "rustup",
-                ", you can update it",
-                false,
-                false,
-                true,
-                false,
-                false,
-                false,
-                false,
-            ),
-            ""
-        );
-    }
-
-    #[test]
-    fn list_continuation_accepts_only_punctuation() {
-        assert!(is_punctuation_only("。"));
-        assert!(is_punctuation_only("。）"));
-        assert!(!is_punctuation_only("。下一段"));
-    }
-
-    #[test]
-    fn keeps_quote_and_review_entries_on_separate_lines() {
-        let blocks = [
-            ("1、如果你是太阳，我就是黑洞。", false, false, false),
-            ("---- 史蒂芬·霍金", false, true, true),
-            ("2、AI 模型的世界就像一个城市。", false, false, false),
-            ("-- 《奇点越来越近了》", false, true, true),
-            ("3、AI 是一个完全的黑箱。", false, false, false),
-            ("-- 《AI 是一个糟糕的工具》", false, true, true),
-            ("稳定币的博弈", false, true, false),
-            ("（#357）", false, false, false),
-            ("不要看重 Product Hunt", false, true, false),
-            ("（#307）", false, false, false),
-        ];
-        let mut run = String::new();
-        let mut previous_was_strong = false;
-        let mut previous_was_link = false;
-        for (value, is_strong, is_link, link_has_prefix) in blocks {
-            if !run.is_empty() {
-                run.push_str(body_block_separator(
-                    &run,
-                    value,
-                    previous_was_strong,
-                    previous_was_link,
-                    is_strong,
-                    is_link,
-                    link_has_prefix,
-                ));
-            }
-            run.push_str(value);
-            previous_was_strong = is_strong;
-            previous_was_link = is_link;
-        }
-        assert!(run.contains("---- 史蒂芬·霍金\n\n2、"));
-        assert!(run.contains("-- 《奇点越来越近了》\n\n3、"));
-        assert!(run.contains("稳定币的博弈（#357）\n\n不要看重 Product Hunt"));
-    }
-
-    #[test]
-    fn image_retry_policy_only_retries_transient_http_statuses() {
-        assert!(image_http_status_retryable(
-            reqwest::StatusCode::TOO_MANY_REQUESTS
-        ));
-        assert!(image_http_status_retryable(
-            reqwest::StatusCode::REQUEST_TIMEOUT
-        ));
-        assert!(image_http_status_retryable(reqwest::StatusCode::TOO_EARLY));
-        assert!(image_http_status_retryable(
-            reqwest::StatusCode::BAD_GATEWAY
-        ));
-        assert!(!image_http_status_retryable(reqwest::StatusCode::NOT_FOUND));
-        assert!(!image_http_status_retryable(reqwest::StatusCode::FORBIDDEN));
-        assert_eq!(IMAGE_MAX_ATTEMPTS, 3);
-    }
-
-    #[test]
-    fn persistent_image_cache_serves_a_valid_image_without_network() {
-        let root = std::env::temp_dir().join(format!(
-            "shiyue-gui-offline-image-{}-{}",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        let store = ImageStore::open(&root).unwrap();
-        let mut encoded = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::new_rgba8(1, 1)
-            .write_to(&mut encoded, image::ImageFormat::Png)
-            .unwrap();
-        let uri = "https://offline-cache.invalid/image.png";
-        store.put(uri, encoded.get_ref()).unwrap();
-
-        let client = reqwest::blocking::Client::builder().build().unwrap();
-        let (tx, rx) = mpsc::channel();
-        let bytes = load_cached_or_download_image(&client, &store, uri, &tx).unwrap();
-        assert!(image::load_from_memory(bytes.as_ref()).is_ok());
-        assert!(rx.try_recv().is_err(), "缓存命中不应进入网络重试流程");
-
-        drop(store);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    #[ignore = "live CDN smoke test; run explicitly before packaging"]
-    fn downloads_reported_beekka_webp() {
-        let client = reqwest::blocking::Client::builder()
-            .http1_only()
-            .connect_timeout(Duration::from_secs(8))
-            .timeout(Duration::from_secs(30))
-            .build()
-            .unwrap();
-        let (tx, _rx) = mpsc::channel();
-        let bytes = download_image_with_retry(
-            &client,
-            "https://cdn.beekka.com/blogimg/asset/202608/bg2026080619.webp",
-            &tx,
-        )
-        .unwrap();
-        let decoded = image::load_from_memory(bytes.as_ref()).unwrap();
-        assert!(bytes.len() > 100_000);
-        assert!(decoded.width() > 0 && decoded.height() > 0);
+    fn search_adapters_reject_late_background_results() {
+        assert!(accepts_search_response(Some(9), 9));
+        assert!(!accepts_search_response(Some(10), 9));
+        assert!(!accepts_search_response(None, 9));
     }
 }
