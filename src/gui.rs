@@ -37,6 +37,7 @@ use crate::excerpt_thought_lifecycle::{
 use crate::feed_subscription::{
     ChangeDisposition, FeedSubscriptions, InitialRefreshOutcome, SubscriptionChange,
 };
+use crate::gui_icons::{NavigationButton, RemixIcon};
 use crate::gui_modal::{self, InitialFocus, ModalHostAction};
 use crate::gui_state::{
     ArticleCollection, DiscardOwner, ModalKind, ModalPayload, PanelPayload, Route, UiAction,
@@ -4736,7 +4737,13 @@ impl eframe::App for GuiApp {
                         );
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("＋").on_hover_text("添加订阅").clicked() {
+                        if ui
+                            .add(egui::Button::image(
+                                RemixIcon::Add.image(false, theme.text, 18.0),
+                            ))
+                            .on_hover_text("添加订阅")
+                            .clicked()
+                        {
                             self.open_modal(ModalState::AddFeed(FeedAddDialog::default()));
                         }
                         let selected_feed = self
@@ -4750,7 +4757,12 @@ impl eframe::App for GuiApp {
                             .and_then(|id| self.feeds.iter().find(|feed| feed.id == id))
                             .cloned();
                         if ui
-                            .add_enabled(selected_feed.is_some(), egui::Button::new("－"))
+                            .add_enabled(
+                                selected_feed.is_some(),
+                                egui::Button::image(
+                                    RemixIcon::Remove.image(false, theme.text, 18.0),
+                                ),
+                            )
                             .on_hover_text("删除当前订阅")
                             .clicked()
                             && let Some(feed) = selected_feed.as_ref()
@@ -4761,18 +4773,24 @@ impl eframe::App for GuiApp {
                             });
                         }
                         if ui
-                            .add_enabled(selected_feed.is_some(), egui::Button::new("⚙"))
+                            .add_enabled(
+                                selected_feed.is_some(),
+                                egui::Button::image(
+                                    RemixIcon::Settings.image(false, theme.text, 18.0),
+                                ),
+                            )
                             .on_hover_text("当前订阅设置")
                             .clicked()
                             && let Some(feed) = selected_feed
                         {
                             feed_settings_click = Some(feed);
                         }
-                        let label = if busy { "抓取中…" } else { "⟳ 刷新" };
+                        let label = if busy { "抓取中…" } else { "刷新" };
                         if ui
                             .add_enabled(
                                 !busy,
-                                egui::Button::new(
+                                egui::Button::image_and_text(
+                                    RemixIcon::Refresh.image(false, theme.muted, 16.0),
                                     egui::RichText::new(label).size(13.0).color(theme.muted),
                                 )
                                 .stroke(egui::Stroke::NONE),
@@ -4807,23 +4825,24 @@ impl eframe::App for GuiApp {
                     ui.add_space(3.0);
                 }
                 ui.add_space(4.0);
+                let navigation_width = ui.available_width();
+                let search_selected = self.ui_state.modal_kind() == Some(ModalKind::Search);
                 let search_response = ui.add_enabled(
                     !modal_open,
-                    egui::Button::new(egui::RichText::new("⌕ 全文搜索   Ctrl+F").size(15.0).color(
-                        if self.ui_state.modal_kind() == Some(ModalKind::Search) {
+                    NavigationButton {
+                        icon: RemixIcon::Search,
+                        selected: search_selected,
+                        label: "全文搜索",
+                        trailing: Some("Ctrl+F".into()),
+                        color: if search_selected {
                             theme.text
                         } else {
                             theme.muted
                         },
-                    ))
-                    .fill(if self.ui_state.modal_kind() == Some(ModalKind::Search) {
-                        theme.selected_bg
-                    } else {
-                        egui::Color32::TRANSPARENT
-                    })
-                    .stroke(egui::Stroke::NONE)
-                    .corner_radius(egui::CornerRadius::same(4))
-                    .min_size(egui::vec2(ui.available_width(), 34.0)),
+                        selected_fill: theme.selected_bg,
+                        width: navigation_width,
+                    }
+                    .widget(),
                 );
                 if search_response.clicked() {
                     self.open_search();
@@ -4834,149 +4853,133 @@ impl eframe::App for GuiApp {
                     Route::Articles(ArticleCollection::Saved)
                 );
                 let saved_articles_response = ui.add(
-                    egui::Button::new(
-                        egui::RichText::new(format!("★ 文章收藏  {saved_article_count}"))
-                            .size(15.0)
-                            .color(if saved_articles_visible {
-                                theme.text
-                            } else {
-                                theme.accent
-                            }),
-                    )
-                    .fill(if saved_articles_visible {
-                        theme.selected_bg
-                    } else {
-                        egui::Color32::TRANSPARENT
-                    })
-                    .stroke(egui::Stroke::NONE)
-                    .corner_radius(egui::CornerRadius::same(4))
-                    .min_size(egui::vec2(ui.available_width(), 34.0)),
+                    NavigationButton {
+                        icon: RemixIcon::Star,
+                        selected: saved_articles_visible,
+                        label: "文章收藏",
+                        trailing: Some(saved_article_count.to_string()),
+                        color: if saved_articles_visible {
+                            theme.text
+                        } else {
+                            theme.accent
+                        },
+                        selected_fill: theme.selected_bg,
+                        width: navigation_width,
+                    }
+                    .widget(),
                 );
                 if saved_articles_response.clicked() {
                     self.select_saved_articles();
                     self.clear_selection_popover();
                 }
                 ui.add_space(4.0);
+                let resources_visible = self.ui_state.route() == Route::Resources;
                 let resources_response = ui.add(
-                    egui::Button::new(egui::RichText::new("◆ 资源库").size(15.0).color(
-                        if self.ui_state.route() == Route::Resources {
+                    NavigationButton {
+                        icon: RemixIcon::Resources,
+                        selected: resources_visible,
+                        label: "资源库",
+                        trailing: None,
+                        color: if resources_visible {
                             theme.text
                         } else {
                             theme.accent
                         },
-                    ))
-                    .fill(if self.ui_state.route() == Route::Resources {
-                        theme.selected_bg
-                    } else {
-                        egui::Color32::TRANSPARENT
-                    })
-                    .stroke(egui::Stroke::NONE)
-                    .corner_radius(egui::CornerRadius::same(4))
-                    .min_size(egui::vec2(ui.available_width(), 34.0)),
+                        selected_fill: theme.selected_bg,
+                        width: navigation_width,
+                    }
+                    .widget(),
                 );
                 if resources_response.clicked() {
                     self.navigate(Route::Resources);
                     self.clear_selection_popover();
                 }
                 ui.add_space(4.0);
+                let read_later_visible = matches!(
+                    self.ui_state.route(),
+                    Route::Articles(ArticleCollection::ReadLater)
+                );
                 let read_later_response = ui.add(
-                    egui::Button::new(
-                        egui::RichText::new(format!("◷ 稍后读  {read_later_count}"))
-                            .size(15.0)
-                            .color(
-                                if matches!(
-                                    self.ui_state.route(),
-                                    Route::Articles(ArticleCollection::ReadLater)
-                                ) {
-                                    theme.text
-                                } else {
-                                    theme.muted
-                                },
-                            ),
-                    )
-                    .fill(
-                        if matches!(
-                            self.ui_state.route(),
-                            Route::Articles(ArticleCollection::ReadLater)
-                        ) {
-                            theme.selected_bg
+                    NavigationButton {
+                        icon: RemixIcon::ReadLater,
+                        selected: read_later_visible,
+                        label: "稍后读",
+                        trailing: Some(read_later_count.to_string()),
+                        color: if read_later_visible {
+                            theme.text
                         } else {
-                            egui::Color32::TRANSPARENT
+                            theme.muted
                         },
-                    )
-                    .stroke(egui::Stroke::NONE)
-                    .corner_radius(egui::CornerRadius::same(4))
-                    .min_size(egui::vec2(ui.available_width(), 34.0)),
+                        selected_fill: theme.selected_bg,
+                        width: navigation_width,
+                    }
+                    .widget(),
                 );
                 if read_later_response.clicked() {
                     self.select_read_later();
                     self.clear_selection_popover();
                 }
                 ui.add_space(4.0);
+                let excerpts_visible = self.ui_state.route() == Route::Excerpts;
                 let library_response = ui.add(
-                    egui::Button::new(
-                        egui::RichText::new(format!("✦ 摘录与想法  {}", self.excerpt_count()))
-                            .size(15.0)
-                            .color(if self.ui_state.route() == Route::Excerpts {
-                                theme.text
-                            } else {
-                                theme.accent
-                            }),
-                    )
-                    .fill(if self.ui_state.route() == Route::Excerpts {
-                        theme.selected_bg
-                    } else {
-                        egui::Color32::TRANSPARENT
-                    })
-                    .stroke(egui::Stroke::NONE)
-                    .corner_radius(egui::CornerRadius::same(4))
-                    .min_size(egui::vec2(ui.available_width(), 34.0)),
+                    NavigationButton {
+                        icon: RemixIcon::Excerpts,
+                        selected: excerpts_visible,
+                        label: "摘录与想法",
+                        trailing: Some(self.excerpt_count().to_string()),
+                        color: if excerpts_visible {
+                            theme.text
+                        } else {
+                            theme.accent
+                        },
+                        selected_fill: theme.selected_bg,
+                        width: navigation_width,
+                    }
+                    .widget(),
                 );
                 if library_response.clicked() {
                     self.navigate(Route::Excerpts);
                     self.clear_selection_popover();
                 }
                 ui.add_space(4.0);
+                let archive_visible = self.ui_state.route() == Route::Archive;
                 let archive_response = ui.add(
-                    egui::Button::new(
-                        egui::RichText::new(format!("▣ 已归档  {archived_article_count}"))
-                            .size(15.0)
-                            .color(if self.ui_state.route() == Route::Archive {
-                                theme.text
-                            } else {
-                                theme.muted
-                            }),
-                    )
-                    .fill(if self.ui_state.route() == Route::Archive {
-                        theme.selected_bg
-                    } else {
-                        egui::Color32::TRANSPARENT
-                    })
-                    .stroke(egui::Stroke::NONE)
-                    .corner_radius(egui::CornerRadius::same(4))
-                    .min_size(egui::vec2(ui.available_width(), 34.0)),
+                    NavigationButton {
+                        icon: RemixIcon::Archive,
+                        selected: archive_visible,
+                        label: "已归档",
+                        trailing: Some(archived_article_count.to_string()),
+                        color: if archive_visible {
+                            theme.text
+                        } else {
+                            theme.muted
+                        },
+                        selected_fill: theme.selected_bg,
+                        width: navigation_width,
+                    }
+                    .widget(),
                 );
                 if archive_response.clicked() {
                     self.navigate(Route::Archive);
                     self.clear_selection_popover();
                 }
                 ui.add_space(4.0);
+                let storage_visible = self.ui_state.route() == Route::Storage;
                 let storage_response = ui.add(
-                    egui::Button::new(egui::RichText::new("⚙ 资料库管理").size(15.0).color(
-                        if self.ui_state.route() == Route::Storage {
+                    NavigationButton {
+                        icon: RemixIcon::Storage,
+                        selected: storage_visible,
+                        label: "资料库管理",
+                        trailing: None,
+                        color: if storage_visible {
                             theme.text
                         } else {
                             theme.muted
                         },
-                    ))
-                    .fill(if self.ui_state.route() == Route::Storage {
-                        theme.selected_bg
-                    } else {
-                        egui::Color32::TRANSPARENT
-                    })
-                    .stroke(egui::Stroke::NONE)
-                    .corner_radius(egui::CornerRadius::same(4))
-                    .min_size(egui::vec2(ui.available_width(), 34.0)),
+                        selected_fill: theme.selected_bg,
+                        width: navigation_width,
+                    }
+                    .widget(),
                 );
                 if storage_response.clicked() {
                     self.navigate(Route::Storage);

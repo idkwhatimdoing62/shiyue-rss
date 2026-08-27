@@ -10,6 +10,7 @@ mod excerpt_thought_lifecycle;
 mod feed_subscription;
 mod fetch;
 mod gui;
+mod gui_icons;
 mod gui_modal;
 mod gui_state;
 mod gui_theme;
