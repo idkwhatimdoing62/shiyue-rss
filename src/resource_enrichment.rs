@@ -310,8 +310,11 @@ fn windows_credential(target: &str) -> Result<Option<String>> {
     let value = String::from_utf8(bytes.to_vec())
         .or_else(|_| {
             let words = bytes
-                .chunks_exact(2)
-                .map(|v| u16::from_le_bytes([v[0], v[1]]))
+                .chunks(2)
+                .filter_map(|pair| match pair {
+                    [low, high] => Some(u16::from_le_bytes([*low, *high])),
+                    _ => None,
+                })
                 .collect::<Vec<_>>();
             String::from_utf16(&words)
         })
