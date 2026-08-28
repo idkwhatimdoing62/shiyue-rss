@@ -1459,7 +1459,6 @@ fn execute_resource(
                 http_status: Some(200),
                 title: snapshot.title,
                 cleaned_content: Some(snapshot.content),
-                fetch_error: None,
             },
             now(),
         )? {
@@ -1775,7 +1774,6 @@ mod tests {
             http_status: Some(200),
             title: Some("Design Tool".into()),
             cleaned_content: Some("A useful design tool".into()),
-            fetch_error: None,
         };
         let tx = db.conn.unchecked_transaction().unwrap();
         tx.execute(
@@ -1906,6 +1904,66 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 2);
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn identical_resource_snapshot_reuses_content_addressed_row() {
+        let (db, path) = file_db("snapshot-deduplication");
+        let resource_id = resource(&db, 10);
+        let store = WorkflowStore::new(&db);
+        let owner = "snapshot-owner";
+        let generation = store.acquire_lease(owner, 11).unwrap().unwrap();
+        store
+            .request(TaskKey::new(TaskKind::ResourceCompletion, resource_id), 11)
+            .unwrap();
+        let task = store.claim_next(owner, generation, 11).unwrap().unwrap();
+        let input = SnapshotInput {
+            fetched_url: Some("https://example.com/design".into()),
+            http_status: Some(200),
+            title: Some("Design Tool".into()),
+            cleaned_content: Some("same fetched body".into()),
+        };
+
+        assert!(
+            store
+                .record_snapshot_and_advance(owner, &task, &input, 12)
+                .unwrap()
+        );
+        let first_snapshot_id: i64 = db
+            .conn
+            .query_row(
+                "SELECT latest_snapshot_id FROM resources WHERE id=?1",
+                [resource_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            store
+                .record_snapshot_and_advance(owner, &task, &input, 13)
+                .unwrap()
+        );
+        let second_snapshot_id: i64 = db
+            .conn
+            .query_row(
+                "SELECT latest_snapshot_id FROM resources WHERE id=?1",
+                [resource_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(second_snapshot_id, first_snapshot_id);
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM resource_snapshots WHERE resource_id=?1",
+                    [resource_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            2,
+            "the fixture snapshot and one content-addressed fetch should remain"
+        );
         drop(db);
         let _ = std::fs::remove_file(path);
     }

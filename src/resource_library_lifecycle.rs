@@ -5,7 +5,6 @@
 //! maintenance fencing, and post-commit processing handoff stay behind this
 //! module boundary.
 
-#[allow(dead_code)]
 mod store;
 
 use std::collections::HashSet;
@@ -947,7 +946,7 @@ pub(crate) fn resource_json(
     snippet: String,
     score: f64,
 ) -> anyhow::Result<serde_json::Value> {
-    store::ResourceStore::new(db).to_json(resource, matched_field, snippet, score)
+    store::resource_json(db, resource, matched_field, snippet, score)
 }
 
 pub(crate) fn load_processing_resource(db: &Db, id: i64) -> anyhow::Result<Resource> {
@@ -958,7 +957,7 @@ pub(crate) fn build_processing_input(
     db: &Db,
     id: i64,
 ) -> anyhow::Result<Option<crate::resource_enrichment::EnrichmentInput>> {
-    store::ResourceStore::new(db).enrichment_input(id)
+    store::enrichment_input(db, id)
 }
 
 pub(crate) fn apply_processing_enrichment(
@@ -967,7 +966,7 @@ pub(crate) fn apply_processing_enrichment(
     output: &crate::resource_enrichment::EnrichmentOutput,
     now: i64,
 ) -> anyhow::Result<()> {
-    store::ResourceStore::apply_enrichment_on(conn, id, output, now)
+    store::apply_enrichment_on(conn, id, output, now)
 }
 
 #[cfg(test)]
@@ -1220,12 +1219,21 @@ mod lifecycle_tests {
         let db = test_db();
         let handoff = RecordingHandoff::default();
         let clock = FixedClock(100);
+        let feed_id = db.add_feed("https://example.com/feed", 0).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO articles(feed_id,entry_id,title,fetched_at)
+                 VALUES(?1,'linked','Linked article',90)",
+                [feed_id],
+            )
+            .unwrap();
+        let linked_article_id = db.conn.last_insert_rowid();
         let created = lifecycle(&db, &handoff, &clock)
             .apply(
                 ResourceLifecycleChange::Create(CreateResource {
                     url: "https://example.com/delete-me".into(),
                     parent_resource_id: None,
-                    linked_article_id: None,
+                    linked_article_id: Some(linked_article_id),
                     kind: ResourceKind::Page,
                     title: None,
                     private_note: None,
@@ -1285,6 +1293,130 @@ mod lifecycle_tests {
                 .unwrap(),
             0
         );
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM articles WHERE id=?1",
+                    [linked_article_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn private_resources_never_produce_processing_input() {
+        let db = test_db();
+        let handoff = RecordingHandoff::default();
+        let created = lifecycle(&db, &handoff, &FixedClock(100))
+            .apply(
+                ResourceLifecycleChange::Create(CreateResource {
+                    url: "https://private.example/tool".into(),
+                    parent_resource_id: None,
+                    linked_article_id: None,
+                    kind: ResourceKind::Page,
+                    title: Some("Private tool".into()),
+                    private_note: Some("local only".into()),
+                    privacy: ResourcePrivacy::Private,
+                    source: ResourceSource::Gui,
+                    manual_rating: None,
+                }),
+                ProjectionScope::collection(ResourceCollection::Active),
+            )
+            .unwrap();
+
+        assert!(
+            build_processing_input(&db, created.affected_resource_ids[0])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn processing_enrichment_preserves_complete_manual_intent() {
+        use crate::resource_enrichment::{EnrichmentOutput, Evidence};
+
+        let db = test_db();
+        let handoff = RecordingHandoff::default();
+        let created = lifecycle(&db, &handoff, &FixedClock(100))
+            .apply(
+                ResourceLifecycleChange::Create(CreateResource {
+                    url: "https://icons.example/library".into(),
+                    parent_resource_id: None,
+                    linked_article_id: None,
+                    kind: ResourceKind::Site,
+                    title: Some("Icon library".into()),
+                    private_note: None,
+                    privacy: ResourcePrivacy::Public,
+                    source: ResourceSource::Gui,
+                    manual_rating: None,
+                }),
+                ProjectionScope::collection(ResourceCollection::Active),
+            )
+            .unwrap();
+        let resource_id = created.affected_resource_ids[0];
+        lifecycle(&db, &handoff, &FixedClock(200))
+            .apply(
+                ResourceLifecycleChange::CompleteManualEdit(CompleteManualEdit {
+                    resource_id,
+                    title: Some("Icon library".into()),
+                    purpose_zh: Some("我的手工用途".into()),
+                    use_when_zh: Some("需要手绘图标时".into()),
+                    private_note: None,
+                    privacy: ResourcePrivacy::Public,
+                    manual_rating: None,
+                    categories: vec![Category::AssetLibrary],
+                    tags: vec![ResourceTag {
+                        name: "手工标签".into(),
+                        language: TagLanguage::Zh,
+                        source: TagSource::Manual,
+                    }],
+                }),
+                ProjectionScope::Resource(resource_id),
+            )
+            .unwrap();
+        let output = EnrichmentOutput {
+            purpose_zh: "AI 用途".into(),
+            use_when_zh: "AI 使用时机".into(),
+            capabilities: vec!["搜索图标".into()],
+            limitations: vec![],
+            categories: vec!["tool".into()],
+            tags_zh: vec!["图标".into()],
+            tags_en: vec!["icon".into()],
+            pricing: "unknown".into(),
+            requires_login: None,
+            languages: vec!["en".into()],
+            evidence: vec![Evidence {
+                field: "purpose_zh".into(),
+                quote: None,
+                inferred: true,
+            }],
+        };
+        let tx = db.fenced_transaction().unwrap();
+        apply_processing_enrichment(&tx, resource_id, &output, 300).unwrap();
+        tx.commit().unwrap();
+
+        let detail = lifecycle(&db, &handoff, &FixedClock(300))
+            .project(ProjectionScope::Resource(resource_id))
+            .unwrap()
+            .detail
+            .unwrap();
+        assert_eq!(detail.resource.purpose_zh.as_deref(), Some("我的手工用途"));
+        assert_eq!(
+            detail.resource.use_when_zh.as_deref(),
+            Some("需要手绘图标时")
+        );
+        assert_eq!(detail.categories, vec![Category::AssetLibrary]);
+        assert_eq!(
+            detail.tags,
+            vec![ResourceTag {
+                name: "手工标签".into(),
+                language: TagLanguage::Zh,
+                source: TagSource::Manual,
+            }]
+        );
+        assert_eq!(detail.resource.capabilities, vec!["搜索图标"]);
     }
 
     #[test]
@@ -1318,6 +1450,49 @@ mod lifecycle_tests {
             0
         );
         assert!(handoff.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn web_clipping_import_is_previewable_idempotent_and_keeps_its_article() {
+        let db = test_db();
+        let handoff = RecordingHandoff::default();
+        let article_id = db
+            .save_web_clipping(
+                Some("https://icons.example/tool"),
+                Some("Icon tool"),
+                "<p>icons</p>",
+                50,
+            )
+            .unwrap();
+        let first_lifecycle = lifecycle(&db, &handoff, &FixedClock(100));
+        let preview = first_lifecycle.preview_web_clipping_import().unwrap();
+        assert_eq!(preview.len(), 1);
+        assert!(!preview[0].already_imported);
+
+        let first = first_lifecycle
+            .apply(
+                ResourceLifecycleChange::ImportWebClippings {
+                    article_ids: vec![article_id],
+                },
+                ProjectionScope::collection(ResourceCollection::Active),
+            )
+            .unwrap();
+        assert_eq!(first.disposition, ChangeDisposition::Created);
+        assert_eq!(first.affected_resource_ids.len(), 1);
+
+        let second_lifecycle = lifecycle(&db, &handoff, &FixedClock(200));
+        let second = second_lifecycle
+            .apply(
+                ResourceLifecycleChange::ImportWebClippings {
+                    article_ids: vec![article_id],
+                },
+                ProjectionScope::collection(ResourceCollection::Active),
+            )
+            .unwrap();
+        assert_eq!(second.disposition, ChangeDisposition::Existing);
+        assert_eq!(second.affected_resource_ids, first.affected_resource_ids);
+        assert!(db.get_article(article_id).is_ok());
+        assert!(second_lifecycle.preview_web_clipping_import().unwrap()[0].already_imported);
     }
 
     #[test]

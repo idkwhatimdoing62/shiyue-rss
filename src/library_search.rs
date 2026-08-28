@@ -1156,8 +1156,9 @@ mod tests {
     use crate::local_data_maintenance::{MaintenanceEngine, MaintenanceRequest, MaintenanceStatus};
     use crate::resource_library_lifecycle::{
         Category, CompleteManualEdit, CreateResource, ProcessingHandoff, ProjectionScope,
-        ResourceCurationState, ResourceKind, ResourceLibraryLifecycle, ResourceLifecycleChange,
-        ResourcePrivacy, ResourceSource, ResourceTag, TagLanguage, TagSource,
+        ResourceCollection, ResourceCurationState, ResourceKind, ResourceLibraryLifecycle,
+        ResourceLifecycleChange, ResourcePrivacy, ResourceSource, ResourceTag, TagLanguage,
+        TagSource,
     };
 
     #[derive(Debug)]
@@ -1225,6 +1226,112 @@ mod tests {
             PrimaryIdentity::Resource(resource_id)
         );
         assert_eq!(outcome.results[0].article_targets[0].article_id, article_id);
+    }
+
+    #[test]
+    fn mixed_library_regression_has_perfect_recall_at_five() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/library-search-regression.json"
+        ))
+        .unwrap();
+        let resources = fixture["resources"].as_array().unwrap();
+        let articles = fixture["articles"].as_array().unwrap();
+        let queries = fixture["queries"].as_array().unwrap();
+        assert!(resources.len() + articles.len() >= 40);
+        assert!(queries.len() >= 25);
+
+        let db = memory_db();
+        for (index, row) in resources.iter().enumerate() {
+            let now = i64::try_from(index + 1).unwrap();
+            let clock = FixedClock(now);
+            let lifecycle = ResourceLibraryLifecycle::new(&db, &NoHandoff, &clock);
+            let created = lifecycle
+                .apply(
+                    ResourceLifecycleChange::Create(CreateResource {
+                        url: row[0].as_str().unwrap().into(),
+                        parent_resource_id: None,
+                        linked_article_id: None,
+                        kind: ResourceKind::Page,
+                        title: Some(row[1].as_str().unwrap().into()),
+                        private_note: None,
+                        privacy: ResourcePrivacy::Public,
+                        source: ResourceSource::Gui,
+                        manual_rating: None,
+                    }),
+                    ProjectionScope::collection(ResourceCollection::Active),
+                )
+                .unwrap();
+            let resource_id = created.affected_resource_ids[0];
+            lifecycle
+                .apply(
+                    ResourceLifecycleChange::CompleteManualEdit(CompleteManualEdit {
+                        resource_id,
+                        title: Some(row[1].as_str().unwrap().into()),
+                        purpose_zh: Some(row[2].as_str().unwrap().into()),
+                        use_when_zh: None,
+                        private_note: None,
+                        privacy: ResourcePrivacy::Public,
+                        manual_rating: None,
+                        categories: vec![],
+                        tags: vec![],
+                    }),
+                    ProjectionScope::Resource(resource_id),
+                )
+                .unwrap();
+        }
+        let feed_id = db.add_feed("https://articles.test/feed", 1).unwrap();
+        for (index, row) in articles.iter().enumerate() {
+            db.conn
+                .execute(
+                    "INSERT INTO articles(feed_id,entry_id,url,title,content,starred,fetched_at)
+                     VALUES(?1,?2,?3,?4,?5,1,?6)",
+                    params![
+                        feed_id,
+                        row[0].as_str().unwrap(),
+                        row[1].as_str().unwrap(),
+                        row[2].as_str().unwrap(),
+                        row[3].as_str().unwrap(),
+                        i64::try_from(resources.len() + index + 1).unwrap()
+                    ],
+                )
+                .unwrap();
+        }
+
+        let mut recalled = 0usize;
+        let mut reciprocal_rank = 0.0;
+        for row in queries {
+            let query = row[0].as_str().unwrap();
+            let expected_type = row[1].as_str().unwrap();
+            let expected_url = row[2].as_str().unwrap();
+            let results = LibrarySearch::new(&db)
+                .search(SearchRequest {
+                    query: query.into(),
+                    scope: SearchScope::Curated,
+                    result_type: if expected_type == "resource" {
+                        ResultType::Resource
+                    } else {
+                        ResultType::Article
+                    },
+                    origin: SearchOrigin::Agent,
+                    limit: 5,
+                })
+                .unwrap()
+                .results;
+            let rank = results
+                .iter()
+                .position(|item| item.url.as_deref() == Some(expected_url))
+                .map(|index| index + 1);
+            if let Some(rank) = rank {
+                recalled += 1;
+                reciprocal_rank += 1.0 / rank as f64;
+            }
+            assert!(
+                rank.is_some(),
+                "query {query:?} missed {expected_url:?}: {results:?}"
+            );
+        }
+        assert_eq!(recalled, queries.len(), "Recall@5 must remain 100%");
+        println!("MRR={:.3}", reciprocal_rank / queries.len() as f64);
     }
 
     #[test]

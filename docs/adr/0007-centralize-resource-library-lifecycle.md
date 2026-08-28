@@ -44,6 +44,20 @@ Schema version 4 adds `curation_state`, `health`, `categories_source`, `tags_sou
 
 The legacy `status` column remains only for backward-compatible storage during this release. Production projection and search membership no longer read it. A later versioned migration may remove it after compatibility support is no longer needed.
 
+## Implementation record
+
+The initial implementation temporarily retained a private `ResourceStore` with broad storage-shaped CRUD, transition, snapshot, enrichment-run, usage-event, query, and Web Clipping methods. Once all application callers had adopted the lifecycle seam, that interface no longer had production consumers and became a misleading second way to express Resource behavior.
+
+The broad store was retired on 2026-08-28. The private SQLite file now exposes only three stateless persistence operations required across sibling boundaries:
+
+- serialize one Resource search result with its Categories and Tags;
+- load privacy-safe Resource Completion input;
+- apply enrichment inside a caller-owned fenced transaction.
+
+Lifecycle commands, Web Clipping import, Resource projections, validation, provenance, and deletion remain exclusively in the parent `Resource Library Lifecycle` module. Snapshot identity and task advancement remain in Knowledge Processing. No schema or user-visible JSON contract changed as part of this narrowing.
+
+Behavioral coverage formerly attached to the broad store moved to the owning modules: Resource lifecycle tests cover linked-Article preservation, private processing input, manual-intent preservation, and idempotent Web Clipping import; Knowledge Processing covers content-addressed snapshot reuse; Library Search owns the mixed-library Recall@5 regression fixture. Schema evolution continues to own released-database upgrade and integrity fixtures.
+
 ## Consequences
 
 GUI and CLI now share one definition of Resource collections, transitions, import idempotence, deletion safety, maintenance behavior, and projection counts. AI work cannot begin before its Resource commit, manual data is protected from enrichment, and the Knowledge workflow can update health without owning library membership.
