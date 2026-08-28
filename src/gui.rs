@@ -4,6 +4,8 @@
 //! 进程模型：UI 在主线程；RSS Refresh 与 Knowledge Processing 各自通过窄 facade
 //! 表达意图和 snapshot。后台模块只在短事务期间打开数据库，并通过 notice 请求 repaint。
 
+mod resource_feature;
+
 use anyhow::Result;
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
@@ -47,7 +49,7 @@ use crate::gui_theme::ReaderTheme;
 use crate::image_store::{CacheStats, DEFAULT_LIMIT_BYTES, ImageStore};
 use crate::knowledge_workflow::{
     ConnectionState, KnowledgeEngine, KnowledgeNotice, TaskKey, TaskKind as KnowledgeTaskKind,
-    TaskSnapshot, TaskStage as KnowledgeTaskStage, TaskStatus as KnowledgeTaskStatus,
+    TaskSnapshot, TaskStatus as KnowledgeTaskStatus,
 };
 use crate::library_search::{
     LibrarySearch, LibrarySearchResult, PrimaryIdentity, ResultType, SearchOrigin, SearchOutcome,
@@ -242,58 +244,10 @@ fn reconcile_article_selection(
         .or_else(|| remembered.filter(|id| present(*id)))
 }
 
-#[derive(Debug)]
-struct ResourceAddDialog {
-    url: String,
-    note: String,
-    private: bool,
-    error: Option<String>,
-    focus_input: bool,
-}
-
-impl Default for ResourceAddDialog {
-    fn default() -> Self {
-        Self {
-            url: String::new(),
-            note: String::new(),
-            private: false,
-            error: None,
-            focus_input: true,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ResourceEditDialog {
-    id: i64,
-    hydrated: bool,
-    title: String,
-    purpose_zh: String,
-    note: String,
-    private: bool,
-    rating: i64,
-    original: ResourceEditValues,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ResourceEditValues {
-    title: String,
-    purpose_zh: String,
-    note: String,
-    private: bool,
-    rating: i64,
-}
-
 #[derive(Debug, Clone, Copy, Default)]
 struct ArticleRouteMemory {
     selected_article_id: Option<i64>,
     body_scroll: f32,
-}
-
-struct ResourceImportDialog {
-    candidates: Vec<crate::resource_library_lifecycle::ImportCandidate>,
-    selected: HashSet<i64>,
-    initial_selected: HashSet<i64>,
 }
 
 #[derive(Debug, Default)]
@@ -416,9 +370,9 @@ enum ModalState {
     DeleteExcerpt(DeleteExcerptDialog),
     SaveWebPage(WebClipDialog),
     DeleteWebPage(DeleteWebClipDialog),
-    AddResource(ResourceAddDialog),
-    DeleteResource { id: i64, title: String },
-    ImportResources(ResourceImportDialog),
+    AddResource(resource_feature::AddDraft),
+    DeleteResource(resource_feature::DeleteDraft),
+    ImportResources(resource_feature::ImportDraft),
     RestoreBackup(BackupEntry),
     ClearImages,
 }
@@ -435,7 +389,7 @@ impl ModalPayload for ModalState {
             Self::SaveWebPage(_) => ModalKind::SaveWebPage,
             Self::DeleteWebPage(_) => ModalKind::DeleteWebPage,
             Self::AddResource(_) => ModalKind::AddResource,
-            Self::DeleteResource { .. } => ModalKind::DeleteResource,
+            Self::DeleteResource(_) => ModalKind::DeleteResource,
             Self::ImportResources(_) => ModalKind::ImportResources,
             Self::RestoreBackup(_) => ModalKind::RestoreBackup,
             Self::ClearImages => ModalKind::ClearImages,
@@ -454,14 +408,12 @@ impl ModalPayload for ModalState {
                     || !dialog.base_url.trim().is_empty()
                     || dialog.capture.is_some()
             }
-            Self::AddResource(dialog) => {
-                !dialog.url.trim().is_empty() || !dialog.note.trim().is_empty() || dialog.private
-            }
-            Self::ImportResources(dialog) => dialog.selected != dialog.initial_selected,
+            Self::AddResource(dialog) => dialog.is_dirty(),
+            Self::ImportResources(dialog) => dialog.is_dirty(),
             Self::DeleteFeed { .. }
             | Self::DeleteExcerpt(_)
             | Self::DeleteWebPage(_)
-            | Self::DeleteResource { .. }
+            | Self::DeleteResource(_)
             | Self::RestoreBackup(_)
             | Self::ClearImages => false,
         }
@@ -477,20 +429,14 @@ impl ModalPayload for ModalState {
 }
 
 enum PanelState {
-    ResourceEditor(ResourceEditDialog),
+    ResourceEditor(resource_feature::EditorDraft),
     FeedSettings(FeedSettingsPanel),
 }
 
 impl PanelPayload for PanelState {
     fn is_dirty(&self) -> bool {
         match self {
-            Self::ResourceEditor(dialog) => {
-                dialog.title != dialog.original.title
-                    || dialog.purpose_zh != dialog.original.purpose_zh
-                    || dialog.note != dialog.original.note
-                    || dialog.private != dialog.original.private
-                    || dialog.rating != dialog.original.rating
-            }
+            Self::ResourceEditor(dialog) => dialog.is_dirty(),
             Self::FeedSettings(panel) => {
                 panel.disabled != panel.original_disabled
                     || panel.interval_draft.trim() != panel.original_interval
@@ -643,26 +589,6 @@ impl GuiApp {
         self.apply_ui_effects(effects);
     }
 
-    fn set_resource_panel(&mut self, dialog: Option<ResourceEditDialog>) {
-        let panel = dialog.map(PanelState::ResourceEditor);
-        let effects = self.ui_state.reduce(UiAction::SetPanel(panel));
-        self.apply_ui_effects(effects);
-    }
-
-    fn resource_dialog(&self) -> Option<&ResourceEditDialog> {
-        match self.ui_state.panel() {
-            Some(PanelState::ResourceEditor(dialog)) => Some(dialog),
-            Some(PanelState::FeedSettings(_)) | None => None,
-        }
-    }
-
-    fn resource_dialog_mut(&mut self) -> Option<&mut ResourceEditDialog> {
-        match self.ui_state.panel_mut() {
-            Some(PanelState::ResourceEditor(dialog)) => Some(dialog),
-            Some(PanelState::FeedSettings(_)) | None => None,
-        }
-    }
-
     fn set_feed_settings_panel(&mut self, feed: Option<Feed>) {
         let panel = feed.map(|feed| PanelState::FeedSettings(FeedSettingsPanel::from_feed(&feed)));
         let effects = self.ui_state.reduce(UiAction::SetPanel(panel));
@@ -710,6 +636,41 @@ impl GuiApp {
         self.apply_ui_effects(effects);
     }
 
+    fn apply_resource_feature_outcome(
+        &mut self,
+        outcome: resource_feature::Outcome,
+        context: &egui::Context,
+    ) {
+        self.apply_modal_host_action(outcome.modal_action);
+        if let Some(projection) = outcome.projection {
+            self.desktop_projection
+                .accept(DesktopProjectionFact::adopt_resource(projection));
+        }
+        match outcome.interaction {
+            resource_feature::InteractionIntent::None => {}
+            resource_feature::InteractionIntent::CompleteModal => self.complete_modal(),
+            resource_feature::InteractionIntent::ClosePanel => {
+                let effects = self.ui_state.reduce(UiAction::SetPanel(None));
+                self.apply_ui_effects(effects);
+            }
+            resource_feature::InteractionIntent::FinishPanel => self.ui_state.finish_panel(),
+            resource_feature::InteractionIntent::KeepEditing => {
+                let effects = self.ui_state.reduce(UiAction::KeepEditing);
+                self.apply_ui_effects(effects);
+            }
+            resource_feature::InteractionIntent::ConfirmDiscard => {
+                let effects = self.ui_state.reduce(UiAction::ConfirmDiscard);
+                self.apply_ui_effects(effects);
+            }
+        }
+        if let Some(message) = outcome.notice {
+            self.notice(message);
+        }
+        if let Some(resource_id) = outcome.retry_resource_id {
+            self.retry_resource_task(resource_id, context);
+        }
+    }
+
     fn clear_selection_popover(&mut self) {
         self.ui_state.reduce(UiAction::SetPopover(None));
         self.selection_popup_geometry = None;
@@ -753,20 +714,6 @@ impl GuiApp {
     fn web_clip_dialog_mut(&mut self) -> Option<&mut WebClipDialog> {
         match self.ui_state.modal_mut() {
             Some(ModalState::SaveWebPage(dialog)) => Some(dialog),
-            _ => None,
-        }
-    }
-
-    fn resource_add_dialog_mut(&mut self) -> Option<&mut ResourceAddDialog> {
-        match self.ui_state.modal_mut() {
-            Some(ModalState::AddResource(dialog)) => Some(dialog),
-            _ => None,
-        }
-    }
-
-    fn resource_import_dialog_mut(&mut self) -> Option<&mut ResourceImportDialog> {
-        match self.ui_state.modal_mut() {
-            Some(ModalState::ImportResources(dialog)) => Some(dialog),
             _ => None,
         }
     }
@@ -1845,36 +1792,11 @@ impl GuiApp {
             .resource(ResourceProjectionDemand::Detail(resource_id))
             .and_then(|view| view.data.as_ref())
             .and_then(|projection| projection.detail.as_ref())
-            .map(|detail| detail.resource.clone());
-        let hydrated = resource.is_some();
-        let values = ResourceEditValues {
-            title: resource
-                .as_ref()
-                .and_then(|value| value.title.clone())
-                .unwrap_or_default(),
-            purpose_zh: resource
-                .as_ref()
-                .and_then(|value| value.purpose_zh.clone())
-                .unwrap_or_default(),
-            note: resource
-                .as_ref()
-                .and_then(|value| value.private_note.clone())
-                .unwrap_or_default(),
-            private: resource.as_ref().is_some_and(|value| {
-                value.privacy == crate::resource_library_lifecycle::ResourcePrivacy::Private
-            }),
-            rating: resource.and_then(|value| value.manual_rating).unwrap_or(0),
-        };
-        self.set_resource_panel(Some(ResourceEditDialog {
-            id: resource_id,
-            hydrated,
-            title: values.title.clone(),
-            purpose_zh: values.purpose_zh.clone(),
-            note: values.note.clone(),
-            private: values.private,
-            rating: values.rating,
-            original: values,
-        }));
+            .map(|detail| &detail.resource);
+        let panel =
+            PanelState::ResourceEditor(resource_feature::EditorDraft::open(resource_id, resource));
+        let effects = self.ui_state.reduce(UiAction::SetPanel(Some(panel)));
+        self.apply_ui_effects(effects);
     }
 
     /// 点开即已读（ADR-16），未读数同步减一。
@@ -2315,7 +2237,10 @@ impl GuiApp {
             demand
                 .resources
                 .push(ResourceProjectionDemand::Collection(collection));
-            if let Some(resource_id) = self.resource_dialog().map(|dialog| dialog.id) {
+            if let Some(resource_id) = self.ui_state.panel().and_then(|panel| match panel {
+                PanelState::ResourceEditor(draft) => Some(draft.id()),
+                PanelState::FeedSettings(_) => None,
+            }) {
                 demand
                     .resources
                     .push(ResourceProjectionDemand::Detail(resource_id));
@@ -2917,7 +2842,7 @@ impl GuiApp {
                     .inner_margin(egui::Margin::symmetric(24, 18)),
             )
             .show(root_ui, |ui| {
-                if self.resource_dialog().is_some() {
+                if matches!(self.ui_state.panel(), Some(PanelState::ResourceEditor(_))) {
                     egui::Panel::right("resource-editor")
                         .resizable(true)
                         .default_size(480.0)
@@ -2936,29 +2861,19 @@ impl GuiApp {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("＋ 添加网站").clicked() {
-                        self.open_modal(ModalState::AddResource(ResourceAddDialog::default()));
+                        self.open_modal(ModalState::AddResource(
+                            resource_feature::AddDraft::default(),
+                        ));
                     }
                     if ui.button("导入网页收藏").clicked() {
-                        match ResourceLibraryLifecycle::new(
-                            &self.db,
-                            &self.knowledge_engine,
-                            &SystemClock,
-                        )
-                        .preview_web_clipping_import()
-                        {
-                            Ok(candidates) => {
-                                let selected = candidates
-                                    .iter()
-                                    .filter(|item| !item.already_imported)
-                                    .map(|item| item.article_id)
-                                    .collect::<HashSet<_>>();
-                                self.open_modal(ModalState::ImportResources(
-                                    ResourceImportDialog {
-                                        initial_selected: selected.clone(),
-                                        selected,
-                                        candidates,
-                                    },
-                                ));
+                        let dependencies = resource_feature::Dependencies {
+                            db: &self.db,
+                            processing_handoff: &self.knowledge_engine,
+                            clock: &SystemClock,
+                        };
+                        match resource_feature::ImportDraft::prepare(&dependencies) {
+                            Ok(draft) => {
+                                self.open_modal(ModalState::ImportResources(draft));
                             }
                             Err(error) => self.notice(format!("读取网页收藏失败：{error}")),
                         }
@@ -3187,23 +3102,12 @@ impl GuiApp {
                 let _ = open::that(url);
             }
             Some(Action::Edit(resource)) => {
-                let values = ResourceEditValues {
-                    title: resource.title.unwrap_or_default(),
-                    purpose_zh: resource.purpose_zh.unwrap_or_default(),
-                    note: resource.private_note.unwrap_or_default(),
-                    private: resource.privacy == ResourcePrivacy::Private,
-                    rating: resource.manual_rating.unwrap_or(0),
-                };
-                self.set_resource_panel(Some(ResourceEditDialog {
-                    id: resource.id,
-                    hydrated: true,
-                    title: values.title.clone(),
-                    purpose_zh: values.purpose_zh.clone(),
-                    note: values.note.clone(),
-                    private: values.private,
-                    rating: values.rating,
-                    original: values,
-                }));
+                let panel = PanelState::ResourceEditor(resource_feature::EditorDraft::open(
+                    resource.id,
+                    Some(&resource),
+                ));
+                let effects = self.ui_state.reduce(UiAction::SetPanel(Some(panel)));
+                self.apply_ui_effects(effects);
             }
             Some(Action::Transition(id, status)) => {
                 match ResourceLibraryLifecycle::new(&self.db, &self.knowledge_engine, &SystemClock)
@@ -3223,7 +3127,9 @@ impl GuiApp {
                 }
             }
             Some(Action::Delete(id, title)) => {
-                self.open_modal(ModalState::DeleteResource { id, title });
+                self.open_modal(ModalState::DeleteResource(
+                    resource_feature::DeleteDraft::new(id, title),
+                ));
             }
             Some(Action::Retry(id, url)) => {
                 let _ = url;
@@ -3237,357 +3143,70 @@ impl GuiApp {
         }
     }
 
-    fn show_resource_add_dialog(&mut self, ctx: &egui::Context) {
-        use crate::resource_library_lifecycle::{
-            CreateResource, ResourceCollection, ResourceKind, ResourceLibraryLifecycle,
-            ResourceLifecycleChange, ResourcePrivacy, ResourceSource, SystemClock,
-        };
-        if self.ui_state.modal_kind() != Some(ModalKind::AddResource) {
-            return;
-        }
+    fn show_resource_modal(&mut self, ctx: &egui::Context) {
         let show_discard = self.ui_state.discard_owner() == Some(DiscardOwner::Modal);
-        let Some(dialog) = self.resource_add_dialog_mut() else {
-            return;
+        let dependencies = resource_feature::Dependencies {
+            db: &self.db,
+            processing_handoff: &self.knowledge_engine,
+            clock: &crate::resource_library_lifecycle::SystemClock,
         };
-        let mut save = false;
-        let response = gui_modal::show(ctx, ModalKind::AddResource, show_discard, |ui, focus| {
-            ui.label("网址（唯一必填项）");
-            let input = ui.add(
-                egui::TextEdit::singleline(&mut dialog.url)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("https://koboyo.com/icons?q=app+icon"),
-            );
-            if focus == InitialFocus::PrimaryField && dialog.focus_input {
-                input.request_focus();
-                dialog.focus_input = false;
-            }
-            ui.label("私人备注（可选）");
-            ui.add(
-                egui::TextEdit::multiline(&mut dialog.note)
-                    .desired_rows(3)
-                    .desired_width(f32::INFINITY),
-            );
-            ui.checkbox(&mut dialog.private, "私密资源（永不发送到云端 AI）");
-            if let Some(error) = &dialog.error {
-                ui.colored_label(egui::Color32::RED, error);
-            }
-            if ui.button("立即保存").clicked() {
-                save = true;
-            }
-        });
-        let input = save.then(|| CreateResource {
-            url: dialog.url.clone(),
-            parent_resource_id: None,
-            linked_article_id: None,
-            kind: ResourceKind::Page,
-            title: None,
-            private_note: non_empty_owned(&dialog.note),
-            privacy: if dialog.private {
-                ResourcePrivacy::Private
-            } else {
-                ResourcePrivacy::Public
-            },
-            source: ResourceSource::Gui,
-            manual_rating: None,
-        });
-        self.apply_modal_host_action(response.action);
-        if let Some(input) = input {
-            match ResourceLibraryLifecycle::new(&self.db, &self.knowledge_engine, &SystemClock)
-                .apply(
-                    ResourceLifecycleChange::Create(input),
-                    crate::resource_library_lifecycle::ProjectionScope::collection(
-                        ResourceCollection::Active,
-                    ),
-                ) {
-                Ok(outcome) => {
-                    self.desktop_projection
-                        .accept(DesktopProjectionFact::adopt_resource(outcome.projection));
-                    self.complete_modal();
-                    self.notice("资源网址已保存；断网也不会丢失");
-                }
-                Err(e) => {
-                    if let Some(dialog) = self.resource_add_dialog_mut() {
-                        dialog.error = Some(e.to_string());
-                    }
-                }
-            }
-        }
+        let outcome = match self.ui_state.modal_mut() {
+            Some(ModalState::AddResource(draft)) => resource_feature::show_modal(
+                ctx,
+                resource_feature::ModalDraft::Add(draft),
+                show_discard,
+                &dependencies,
+            ),
+            Some(ModalState::DeleteResource(draft)) => resource_feature::show_modal(
+                ctx,
+                resource_feature::ModalDraft::Delete(draft),
+                show_discard,
+                &dependencies,
+            ),
+            Some(ModalState::ImportResources(draft)) => resource_feature::show_modal(
+                ctx,
+                resource_feature::ModalDraft::Import(draft),
+                show_discard,
+                &dependencies,
+            ),
+            _ => return,
+        };
+        self.apply_resource_feature_outcome(outcome, ctx);
     }
 
     fn show_resource_editor(&mut self, ui: &mut egui::Ui) {
-        let show_discard = self.ui_state.discard_owner() == Some(DiscardOwner::Panel);
-        let task_resource_id = self.resource_dialog().map(|dialog| dialog.id);
-        let task = task_resource_id.and_then(|resource_id| {
-            self.knowledge_task(KnowledgeTaskKind::ResourceCompletion, resource_id)
-        });
-        let details = self.resource_dialog().and_then(|dialog| {
-            self.desktop_projection_frame
-                .resource(ResourceProjectionDemand::Detail(dialog.id))
-                .and_then(|view| view.data.as_ref())
-                .and_then(|projection| projection.detail.as_ref())
-                .map(|detail| {
-                    (
-                        detail.resource.clone(),
-                        detail.categories.clone(),
-                        detail.tags.clone(),
-                    )
-                })
-        });
-        if let Some((resource, _, _)) = &details
-            && self
-                .resource_dialog()
-                .is_some_and(|dialog| !dialog.hydrated)
-        {
-            let values = ResourceEditValues {
-                title: resource.title.clone().unwrap_or_default(),
-                purpose_zh: resource.purpose_zh.clone().unwrap_or_default(),
-                note: resource.private_note.clone().unwrap_or_default(),
-                private: resource.privacy
-                    == crate::resource_library_lifecycle::ResourcePrivacy::Private,
-                rating: resource.manual_rating.unwrap_or(0),
-            };
-            if let Some(dialog) = self.resource_dialog_mut() {
-                dialog.title = values.title.clone();
-                dialog.purpose_zh = values.purpose_zh.clone();
-                dialog.note = values.note.clone();
-                dialog.private = values.private;
-                dialog.rating = values.rating;
-                dialog.original = values;
-                dialog.hydrated = true;
-            }
-        }
-        let Some(dialog) = self.resource_dialog_mut() else {
+        let Some(resource_id) = self.ui_state.panel().and_then(|panel| match panel {
+            PanelState::ResourceEditor(draft) => Some(draft.id()),
+            _ => None,
+        }) else {
             return;
         };
-        let resource_id = dialog.id;
-        let mut save = false;
-        let mut close = false;
-        let mut enrich = false;
-        ui.horizontal(|ui| {
-            ui.heading("编辑资源");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("关闭").clicked() {
-                    close = true;
-                }
-            });
-        });
-        ui.separator();
-        if let Some(task) = &task {
-            let stage = match task.current_stage {
-                Some(KnowledgeTaskStage::Fetching) => "正在抓取网页",
-                Some(KnowledgeTaskStage::Organizing) => "正在整理描述",
-                Some(KnowledgeTaskStage::Summarizing) => "正在总结文章",
-                None => "等待后台处理",
-            };
-            if matches!(
-                task.status,
-                KnowledgeTaskStatus::Queued | KnowledgeTaskStatus::Running
-            ) {
-                ui.label(egui::RichText::new(stage).strong());
-                ui.spinner();
-            } else if matches!(
-                task.status,
-                KnowledgeTaskStatus::Failed | KnowledgeTaskStatus::Interrupted
-            ) {
-                ui.colored_label(egui::Color32::RED, "上次处理失败，可以重试");
-                ui.collapsing("技术详情", |ui| {
-                    ui.monospace(task.technical_detail.as_deref().unwrap_or("未知错误"));
-                });
-                if ui.button("重试处理").clicked() {
-                    enrich = true;
-                }
-            } else {
-                ui.label("AI 信息已更新");
-            }
-            ui.separator();
-        }
-        if let Some((resource, categories, tags)) = &details {
-            ui.label(egui::RichText::new("AI 补全信息").strong());
-            let has_ai_details = resource.purpose_zh.is_some()
-                || resource.use_when_zh.is_some()
-                || !resource.capabilities.is_empty()
-                || !resource.limitations.is_empty()
-                || !categories.is_empty()
-                || !tags.is_empty()
-                || resource.pricing.is_some()
-                || resource.requires_login.is_some()
-                || !resource.languages.is_empty();
-            if !has_ai_details {
-                ui.weak("这条资源还没有成功生成 AI 描述。网页或文章内容已经保存，可以重新补全。");
-                if resource.privacy == crate::resource_library_lifecycle::ResourcePrivacy::Private {
-                    ui.weak("私密资源不会发送给 AI；取消“私密资源”并保存后才能补全。");
-                } else if ui.button("立即补全描述").clicked() {
-                    enrich = true;
-                }
-            }
-            if let Some(value) = &resource.purpose_zh {
-                ui.label("用途描述");
-                ui.label(value);
-            }
-            if let Some(value) = &resource.use_when_zh {
-                ui.label("适合什么时候使用");
-                ui.label(value);
-            }
-            if !resource.capabilities.is_empty() {
-                ui.label(format!("主要能力：{}", resource.capabilities.join("、")));
-            }
-            if !resource.limitations.is_empty() {
-                ui.label(format!("限制：{}", resource.limitations.join("、")));
-            }
-            if !categories.is_empty() {
-                let values = categories
-                    .iter()
-                    .map(|category| match category {
-                        crate::resource_library_lifecycle::Category::Tool => "工具",
-                        crate::resource_library_lifecycle::Category::AssetLibrary => "素材库",
-                        crate::resource_library_lifecycle::Category::Docs => "文档",
-                        crate::resource_library_lifecycle::Category::Blog => "博客",
-                        crate::resource_library_lifecycle::Category::Inspiration => "灵感",
-                        crate::resource_library_lifecycle::Category::Service => "服务",
-                        crate::resource_library_lifecycle::Category::Repository => "代码仓库",
-                        crate::resource_library_lifecycle::Category::Other => "其他",
-                    })
-                    .collect::<Vec<_>>();
-                ui.label(format!("分类：{}", values.join("、")));
-            }
-            if !tags.is_empty() {
-                ui.label(format!(
-                    "标签：{}",
-                    tags.iter()
-                        .map(|tag| tag.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join("、")
-                ));
-            }
-            let pricing = resource.pricing.map(|pricing| match pricing {
-                crate::resource_library_lifecycle::Pricing::Free => "免费",
-                crate::resource_library_lifecycle::Pricing::Freemium => "部分免费",
-                crate::resource_library_lifecycle::Pricing::Paid => "付费",
-                crate::resource_library_lifecycle::Pricing::Unknown => "未知",
-            });
-            let login = resource
-                .requires_login
-                .map(|value| if value { "需要" } else { "不需要" });
-            if pricing.is_some() || login.is_some() || !resource.languages.is_empty() {
-                ui.label(format!(
-                    "价格：{}　登录：{}　语言：{}",
-                    pricing.unwrap_or("未判断"),
-                    login.unwrap_or("未判断"),
-                    if resource.languages.is_empty() {
-                        "未判断".to_owned()
-                    } else {
-                        resource.languages.join("、")
-                    }
-                ));
-            }
-            ui.separator();
-        }
-        ui.label(egui::RichText::new("可手动修改").strong());
-        ui.label("标题");
-        ui.add(egui::TextEdit::singleline(&mut dialog.title).desired_width(f32::INFINITY));
-        ui.label("用途");
-        ui.add(
-            egui::TextEdit::multiline(&mut dialog.purpose_zh)
-                .desired_rows(6)
-                .desired_width(f32::INFINITY),
-        );
-        ui.label("私人备注");
-        ui.add(
-            egui::TextEdit::multiline(&mut dialog.note)
-                .desired_rows(6)
-                .desired_width(f32::INFINITY),
-        );
-        ui.checkbox(&mut dialog.private, "私密资源");
-        ui.horizontal(|ui| {
-            ui.label("评分");
-            ui.add(
-                egui::Slider::new(&mut dialog.rating, 0..=5).custom_formatter(|v, _| {
-                    if v == 0.0 {
-                        "未设置".into()
-                    } else {
-                        format!("{v:.0}/5")
-                    }
-                }),
-            );
-        });
-        ui.add_space(8.0);
-        if ui
-            .add_enabled(details.is_some(), egui::Button::new("保存修改"))
-            .clicked()
-        {
-            save = true;
-        }
-        let update = save.then(|| {
-            (
-                dialog.id,
-                non_empty_owned(&dialog.title),
-                non_empty_owned(&dialog.purpose_zh),
-                non_empty_owned(&dialog.note),
-                dialog.private,
-                (dialog.rating > 0).then_some(dialog.rating),
-            )
-        });
-        let discard_decision = discard_guard_controls(ui, show_discard);
-        self.apply_discard_decision(discard_decision);
-        if discard_decision.is_some() {
-            return;
-        }
-        if close {
-            self.set_resource_panel(None);
-            return;
-        }
-        if let Some((id, title, purpose, note, private, rating)) = update {
-            use crate::resource_library_lifecycle::{
-                CompleteManualEdit, FailureKind, LifecycleFailure, ResourceLibraryLifecycle,
-                ResourceLifecycleChange, ResourcePrivacy, SystemClock,
-            };
-            let lifecycle =
-                ResourceLibraryLifecycle::new(&self.db, &self.knowledge_engine, &SystemClock);
-            let result = details
-                .clone()
-                .ok_or_else(|| LifecycleFailure {
-                    kind: FailureKind::Storage,
-                    user_message: "资源详情读取失败".into(),
-                    technical_detail: format!("RESOURCE_DETAIL_MISSING: {id}"),
-                })
-                .and_then(|(resource, categories, tags)| {
-                    lifecycle
-                        .apply(
-                            ResourceLifecycleChange::CompleteManualEdit(CompleteManualEdit {
-                                resource_id: id,
-                                title,
-                                purpose_zh: purpose,
-                                use_when_zh: resource.use_when_zh,
-                                private_note: note,
-                                privacy: if private {
-                                    ResourcePrivacy::Private
-                                } else {
-                                    ResourcePrivacy::Public
-                                },
-                                manual_rating: rating,
-                                categories,
-                                tags,
-                            }),
-                            crate::resource_library_lifecycle::ProjectionScope::Resource(id),
-                        )
-                        .map(|outcome| outcome.projection)
-                });
-            match result {
-                Ok(projection) => {
-                    self.desktop_projection
-                        .accept(DesktopProjectionFact::adopt_resource(projection));
-                    self.ui_state.finish_panel();
-                    self.notice("资源已更新");
-                }
-                Err(e) => self.notice(format!("保存失败：{e}")),
-            }
-        }
-        if enrich {
-            let ctx = ui.ctx().clone();
-            self.retry_resource_task(resource_id, &ctx);
-        }
+        let show_discard = self.ui_state.discard_owner() == Some(DiscardOwner::Panel);
+        let task = self.knowledge_task(KnowledgeTaskKind::ResourceCompletion, resource_id);
+        let detail = self
+            .desktop_projection_frame
+            .resource(ResourceProjectionDemand::Detail(resource_id))
+            .and_then(|view| view.data.as_ref())
+            .and_then(|projection| projection.detail.clone());
+        let dependencies = resource_feature::Dependencies {
+            db: &self.db,
+            processing_handoff: &self.knowledge_engine,
+            clock: &crate::resource_library_lifecycle::SystemClock,
+        };
+        let outcome = match self.ui_state.panel_mut() {
+            Some(PanelState::ResourceEditor(draft)) => resource_feature::show_panel(
+                ui,
+                draft,
+                detail.as_ref(),
+                task.as_ref(),
+                show_discard,
+                &dependencies,
+            ),
+            _ => return,
+        };
+        let context = ui.ctx().clone();
+        self.apply_resource_feature_outcome(outcome, &context);
     }
-
     fn show_feed_settings_panel(&mut self, ui: &mut egui::Ui) {
         let show_discard = self.ui_state.discard_owner() == Some(DiscardOwner::Panel);
         let mut save = false;
@@ -3705,138 +3324,6 @@ impl GuiApp {
                 if let Some(panel) = self.feed_settings_panel_mut() {
                     panel.error = Some(error.user_message);
                 }
-            }
-        }
-    }
-
-    fn show_resource_delete_confirmation(&mut self, ctx: &egui::Context) {
-        if self.ui_state.modal_kind() != Some(ModalKind::DeleteResource) {
-            return;
-        }
-        let Some(ModalState::DeleteResource { id, title }) = self.ui_state.modal() else {
-            return;
-        };
-        let id = *id;
-        let title = title.clone();
-        let mut confirm = false;
-        let mut cancel = false;
-        let response = gui_modal::show(ctx, ModalKind::DeleteResource, false, |ui, _| {
-            ui.label(format!("确定永久删除「{title}」吗？"));
-            ui.weak("资源快照、分类、标签和整理记录会一起删除；关联的博客文章不会删除。");
-            ui.horizontal(|ui| {
-                if ui.button("确认永久删除").clicked() {
-                    confirm = true;
-                }
-                if ui.button("取消").clicked() {
-                    cancel = true;
-                }
-            });
-        });
-        self.apply_modal_host_action(response.action);
-        if confirm {
-            match crate::resource_library_lifecycle::ResourceLibraryLifecycle::new(
-                &self.db,
-                &self.knowledge_engine,
-                &crate::resource_library_lifecycle::SystemClock,
-            )
-            .apply(
-                crate::resource_library_lifecycle::ResourceLifecycleChange::Delete {
-                    resource_id: id,
-                },
-                crate::resource_library_lifecycle::ProjectionScope::collection(
-                    crate::resource_library_lifecycle::ResourceCollection::Archived,
-                ),
-            ) {
-                Ok(outcome) => {
-                    self.desktop_projection
-                        .accept(DesktopProjectionFact::adopt_resource(outcome.projection));
-                    self.notice("资源已永久删除");
-                }
-                Err(error) => self.notice(format!("删除失败：{error}")),
-            }
-            self.complete_modal();
-        } else if cancel {
-            self.complete_modal();
-        }
-    }
-
-    fn show_resource_import_dialog(&mut self, ctx: &egui::Context) {
-        if self.ui_state.modal_kind() != Some(ModalKind::ImportResources) {
-            return;
-        }
-        let show_discard = self.ui_state.discard_owner() == Some(DiscardOwner::Modal);
-        let Some(dialog) = self.resource_import_dialog_mut() else {
-            return;
-        };
-        let mut import = false;
-        let response = gui_modal::show(ctx, ModalKind::ImportResources, show_discard, |ui, _| {
-            ui.label(
-                "只创建 Resource 与原 Article 的关联，不复制正文，也不改变原文章、标签或收藏状态。",
-            );
-            ui.separator();
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                for candidate in &dialog.candidates {
-                    let mut checked = dialog.selected.contains(&candidate.article_id);
-                    ui.horizontal(|ui| {
-                        let response = ui.add_enabled(
-                            !candidate.already_imported,
-                            egui::Checkbox::new(&mut checked, ""),
-                        );
-                        if response.changed() {
-                            if checked {
-                                dialog.selected.insert(candidate.article_id);
-                            } else {
-                                dialog.selected.remove(&candidate.article_id);
-                            }
-                        }
-                        ui.vertical(|ui| {
-                            ui.label(candidate.title.as_deref().unwrap_or(&candidate.url));
-                            ui.weak(if candidate.already_imported {
-                                format!("{} · 已导入", candidate.url)
-                            } else {
-                                candidate.url.clone()
-                            });
-                        });
-                    });
-                    ui.separator();
-                }
-            });
-            if ui
-                .add_enabled(
-                    !dialog.selected.is_empty(),
-                    egui::Button::new(format!("导入选中的 {} 项", dialog.selected.len())),
-                )
-                .clicked()
-            {
-                import = true;
-            }
-        });
-        let ids = import.then(|| dialog.selected.iter().copied().collect::<Vec<_>>());
-        self.apply_modal_host_action(response.action);
-        if let Some(ids) = ids {
-            match crate::resource_library_lifecycle::ResourceLibraryLifecycle::new(
-                &self.db,
-                &self.knowledge_engine,
-                &crate::resource_library_lifecycle::SystemClock,
-            )
-            .apply(
-                crate::resource_library_lifecycle::ResourceLifecycleChange::ImportWebClippings {
-                    article_ids: ids,
-                },
-                crate::resource_library_lifecycle::ProjectionScope::collection(
-                    crate::resource_library_lifecycle::ResourceCollection::Active,
-                ),
-            ) {
-                Ok(outcome) => {
-                    self.desktop_projection
-                        .accept(DesktopProjectionFact::adopt_resource(outcome.projection));
-                    self.notice(format!(
-                        "已导入 {} 个资源，正在后台补全描述",
-                        outcome.affected_resource_ids.len()
-                    ));
-                    self.complete_modal();
-                }
-                Err(error) => self.notice(format!("导入失败：{error}")),
             }
         }
     }
@@ -4522,9 +4009,9 @@ impl GuiApp {
             Some(ModalKind::DeleteExcerpt) => self.show_delete_excerpt_dialog(ctx),
             Some(ModalKind::SaveWebPage) => self.show_web_clip_dialog(ctx),
             Some(ModalKind::DeleteWebPage) => self.show_delete_web_clip_dialog(ctx),
-            Some(ModalKind::AddResource) => self.show_resource_add_dialog(ctx),
-            Some(ModalKind::DeleteResource) => self.show_resource_delete_confirmation(ctx),
-            Some(ModalKind::ImportResources) => self.show_resource_import_dialog(ctx),
+            Some(
+                ModalKind::AddResource | ModalKind::DeleteResource | ModalKind::ImportResources,
+            ) => self.show_resource_modal(ctx),
             Some(ModalKind::RestoreBackup | ModalKind::ClearImages) => self.show_storage_modal(ctx),
             None => {}
         }
@@ -6061,9 +5548,9 @@ fn resource_card<R>(
 mod tests {
     use super::{
         CommentDialog, ExcerptTarget, FeedSettingsPanel, ModalPayload, ModalState, PanelPayload,
-        PanelState, ResourceEditDialog, ResourceEditValues, SelectedQuote, TagDialog,
-        WebClipDialog, accepts_search_response, projection_scope_for_route,
-        reconcile_article_selection, resource_card, search_match_ranges, search_preview,
+        PanelState, SelectedQuote, TagDialog, WebClipDialog, accepts_search_response,
+        projection_scope_for_route, reconcile_article_selection, resource_card,
+        search_match_ranges, search_preview,
     };
     use crate::article_library_lifecycle::ProjectionScope;
     use crate::gui_state::{ArticleCollection, Route};
@@ -6214,30 +5701,6 @@ mod tests {
             ..thought
         };
         assert!(ModalState::WriteThought(thought).is_dirty());
-    }
-
-    #[test]
-    fn resource_panel_compares_edits_with_its_opening_snapshot() {
-        let original = ResourceEditValues {
-            title: "Tool".into(),
-            purpose_zh: "用途".into(),
-            note: String::new(),
-            private: false,
-            rating: 0,
-        };
-        let mut dialog = ResourceEditDialog {
-            id: 3,
-            hydrated: true,
-            title: original.title.clone(),
-            purpose_zh: original.purpose_zh.clone(),
-            note: original.note.clone(),
-            private: original.private,
-            rating: original.rating,
-            original,
-        };
-        assert!(!PanelState::ResourceEditor(dialog.clone()).is_dirty());
-        dialog.note = "remember".into();
-        assert!(PanelState::ResourceEditor(dialog).is_dirty());
     }
 
     #[test]

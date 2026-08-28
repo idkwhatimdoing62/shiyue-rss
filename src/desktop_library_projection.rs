@@ -1750,8 +1750,9 @@ mod tests {
     }
 
     #[test]
-    fn gui_consumes_article_and_excerpt_frames_without_parallel_projection_state() {
+    fn gui_features_consume_library_frames_without_parallel_projection_state() {
         let gui = include_str!("gui.rs");
+        let resource_feature = include_str!("gui/resource_feature.rs");
         assert!(!gui.contains("ArticleLibraryLifecycle::new(&self.db).project"));
         assert!(!gui.contains("ExcerptThoughtLifecycle::new(&self.db, &SYSTEM_CLOCK).project"));
         assert!(!gui.contains("self.db.article_ai"));
@@ -1763,5 +1764,9 @@ mod tests {
         assert!(!gui.contains("articles: Vec<Article>"));
         assert!(!gui.contains("article_ai: HashMap"));
         assert!(!gui.contains("excerpt_projection: Option"));
+        for source in [gui, resource_feature] {
+            assert!(!source.contains(".project(ProjectionScope::Resource"));
+            assert!(!source.contains("resource_projection: Option"));
+        }
     }
 }

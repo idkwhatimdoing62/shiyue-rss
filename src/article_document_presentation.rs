@@ -2100,6 +2100,7 @@ mod tests {
         let presentation = include_str!("article_document_presentation.rs");
         let parser = include_str!("article_document_presentation/parser.rs");
         let gui = include_str!("gui.rs");
+        let resource_feature = include_str!("gui/resource_feature.rs");
         let knowledge = include_str!("knowledge_workflow.rs");
         let clipping = include_str!("web_clipping_lifecycle.rs");
 
@@ -2107,7 +2108,7 @@ mod tests {
         assert!(presentation.contains("mod parser;"));
         assert!(parser.contains("pub(super) enum Block"));
         assert!(!parser.contains("pub(crate)"));
-        for caller in [gui, knowledge, clipping] {
+        for caller in [gui, resource_feature, knowledge, clipping] {
             assert!(!caller.contains("crate::text"));
             assert!(!caller.contains("parser::Block"));
             assert!(!caller.contains("content_blocks("));

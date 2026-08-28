@@ -226,6 +226,7 @@ mod tests {
     #[test]
     fn gui_does_not_reach_behind_the_desktop_runtime_interface() {
         let gui = include_str!("../gui.rs");
+        let resource_feature = include_str!("../gui/resource_feature.rs");
         for forbidden in [
             "config_file:",
             "TrayIcon",
@@ -235,10 +236,12 @@ mod tests {
             "hidden:",
             "quitting:",
         ] {
-            assert!(
-                !gui.contains(forbidden),
-                "GUI contains forbidden desktop implementation detail: {forbidden}"
-            );
+            for source in [gui, resource_feature] {
+                assert!(
+                    !source.contains(forbidden),
+                    "GUI contains forbidden desktop implementation detail: {forbidden}"
+                );
+            }
         }
     }
 }
