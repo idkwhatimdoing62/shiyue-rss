@@ -522,82 +522,7 @@ fn apply_change(
             }
             Ok((ChangeDisposition::Created, vec![id]))
         }
-        ResourceLifecycleChange::CompleteManualEdit(edit) => {
-            let current = get_resource(conn, edit.resource_id)?;
-            if current.privacy == ResourcePrivacy::Public
-                && edit.privacy == ResourcePrivacy::Private
-                && resource_target::has_active_processing(conn, edit.resource_id)
-                    .map_err(LifecycleFailure::storage)?
-            {
-                return Err(LifecycleFailure::processing_active(edit.resource_id));
-            }
-            let title = normalize_optional(edit.title);
-            let purpose = normalize_optional(edit.purpose_zh);
-            let use_when = normalize_optional(edit.use_when_zh);
-            let private_note = normalize_optional(edit.private_note);
-            if manual_edit_is_noop(
-                conn,
-                &current,
-                title.as_deref(),
-                purpose.as_deref(),
-                use_when.as_deref(),
-                private_note.as_deref(),
-                edit.privacy,
-                edit.manual_rating,
-                &edit.categories,
-                &edit.tags,
-            )? {
-                return Ok((ChangeDisposition::Unchanged, vec![edit.resource_id]));
-            }
-            conn.execute(
-                "UPDATE resources SET title=?2,purpose_zh=?3,purpose_source='manual',
-                   use_when_zh=?4,use_when_source='manual',private_note=?5,privacy=?6,
-                   manual_rating=?7,categories_source='manual',tags_source='manual',updated_at=?8
-                 WHERE id=?1",
-                params![
-                    edit.resource_id,
-                    title,
-                    purpose,
-                    use_when,
-                    private_note,
-                    edit.privacy.as_str(),
-                    edit.manual_rating,
-                    now
-                ],
-            )
-            .map_err(LifecycleFailure::storage)?;
-            conn.execute(
-                "DELETE FROM resource_categories WHERE resource_id=?1",
-                [edit.resource_id],
-            )
-            .map_err(LifecycleFailure::storage)?;
-            for category in edit.categories {
-                conn.execute(
-                    "INSERT INTO resource_categories(resource_id,category) VALUES(?1,?2)",
-                    params![edit.resource_id, category.as_str()],
-                )
-                .map_err(LifecycleFailure::storage)?;
-            }
-            conn.execute(
-                "DELETE FROM resource_tags WHERE resource_id=?1",
-                [edit.resource_id],
-            )
-            .map_err(LifecycleFailure::storage)?;
-            for tag in edit.tags {
-                conn.execute(
-                    "INSERT INTO resource_tags(resource_id,name,language,source,created_at)
-                     VALUES(?1,?2,?3,'manual',?4)",
-                    params![
-                        edit.resource_id,
-                        tag.name.trim(),
-                        tag.language.as_str(),
-                        now
-                    ],
-                )
-                .map_err(LifecycleFailure::storage)?;
-            }
-            Ok((ChangeDisposition::Changed, vec![edit.resource_id]))
-        }
+        ResourceLifecycleChange::CompleteManualEdit(edit) => apply_manual_edit(conn, edit, now),
         ResourceLifecycleChange::SetCurationState {
             resource_id,
             target,
@@ -673,62 +598,151 @@ fn apply_change(
             Ok((ChangeDisposition::Deleted, vec![resource_id]))
         }
         ResourceLifecycleChange::ImportWebClippings { article_ids } => {
-            let mut ids = Vec::new();
-            let mut created = false;
-            for article_id in article_ids {
-                let row = conn
-                    .query_row(
-                        "SELECT a.url,a.title FROM articles a JOIN feeds f ON f.id=a.feed_id
-                         WHERE a.id=?1 AND f.url=?2 AND a.url IS NOT NULL",
-                        params![article_id, WEB_CLIPPINGS_FEED_URL],
-                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
-                    )
-                    .optional()
-                    .map_err(LifecycleFailure::storage)?
-                    .ok_or_else(|| {
-                        LifecycleFailure::input(
-                            "所选内容不是有效的网页收藏",
-                            format!("INVALID_WEB_CLIPPING: {article_id}"),
-                        )
-                    })?;
-                let canonical =
-                    store::canonicalize_url(&row.0).map_err(LifecycleFailure::storage)?;
-                if let Some(id) = conn
-                    .query_row(
-                        "SELECT id FROM resources WHERE canonical_url=?1 OR
-                         (source='import' AND linked_article_id=?2)",
-                        params![canonical, article_id],
-                        |row| row.get(0),
-                    )
-                    .optional()
-                    .map_err(LifecycleFailure::storage)?
-                {
-                    ids.push(id);
-                    continue;
-                }
-                conn.execute(
-                    "INSERT INTO resources(
-                       url,canonical_url,linked_article_id,kind,title,privacy,status,curation_state,
-                       health,categories_source,tags_source,source,created_at,updated_at
-                     ) VALUES(?1,?2,?3,'article',?4,'public','active','active','healthy','ai','ai','import',?5,?5)",
-                    params![row.0, canonical, article_id, row.1, now],
-                )
-                .map_err(LifecycleFailure::storage)?;
-                let id = conn.last_insert_rowid();
-                ids.push(id);
-                processing_ids.push(id);
-                created = true;
-            }
-            Ok((
-                if created {
-                    ChangeDisposition::Created
-                } else {
-                    ChangeDisposition::Existing
-                },
-                ids,
-            ))
+            import_web_clippings(conn, article_ids, now, processing_ids)
         }
     }
+}
+
+fn apply_manual_edit(
+    conn: &Connection,
+    edit: CompleteManualEdit,
+    now: i64,
+) -> Result<(ChangeDisposition, Vec<i64>), LifecycleFailure> {
+    let current = get_resource(conn, edit.resource_id)?;
+    if current.privacy == ResourcePrivacy::Public
+        && edit.privacy == ResourcePrivacy::Private
+        && resource_target::has_active_processing(conn, edit.resource_id)
+            .map_err(LifecycleFailure::storage)?
+    {
+        return Err(LifecycleFailure::processing_active(edit.resource_id));
+    }
+    let title = normalize_optional(edit.title);
+    let purpose = normalize_optional(edit.purpose_zh);
+    let use_when = normalize_optional(edit.use_when_zh);
+    let private_note = normalize_optional(edit.private_note);
+    if manual_edit_is_noop(
+        conn,
+        &current,
+        title.as_deref(),
+        purpose.as_deref(),
+        use_when.as_deref(),
+        private_note.as_deref(),
+        edit.privacy,
+        edit.manual_rating,
+        &edit.categories,
+        &edit.tags,
+    )? {
+        return Ok((ChangeDisposition::Unchanged, vec![edit.resource_id]));
+    }
+    conn.execute(
+        "UPDATE resources SET title=?2,purpose_zh=?3,purpose_source='manual',
+           use_when_zh=?4,use_when_source='manual',private_note=?5,privacy=?6,
+           manual_rating=?7,categories_source='manual',tags_source='manual',updated_at=?8
+         WHERE id=?1",
+        params![
+            edit.resource_id,
+            title,
+            purpose,
+            use_when,
+            private_note,
+            edit.privacy.as_str(),
+            edit.manual_rating,
+            now
+        ],
+    )
+    .map_err(LifecycleFailure::storage)?;
+    conn.execute(
+        "DELETE FROM resource_categories WHERE resource_id=?1",
+        [edit.resource_id],
+    )
+    .map_err(LifecycleFailure::storage)?;
+    for category in edit.categories {
+        conn.execute(
+            "INSERT INTO resource_categories(resource_id,category) VALUES(?1,?2)",
+            params![edit.resource_id, category.as_str()],
+        )
+        .map_err(LifecycleFailure::storage)?;
+    }
+    conn.execute(
+        "DELETE FROM resource_tags WHERE resource_id=?1",
+        [edit.resource_id],
+    )
+    .map_err(LifecycleFailure::storage)?;
+    for tag in edit.tags {
+        conn.execute(
+            "INSERT INTO resource_tags(resource_id,name,language,source,created_at)
+             VALUES(?1,?2,?3,'manual',?4)",
+            params![
+                edit.resource_id,
+                tag.name.trim(),
+                tag.language.as_str(),
+                now
+            ],
+        )
+        .map_err(LifecycleFailure::storage)?;
+    }
+    Ok((ChangeDisposition::Changed, vec![edit.resource_id]))
+}
+
+fn import_web_clippings(
+    conn: &Connection,
+    article_ids: Vec<i64>,
+    now: i64,
+    processing_ids: &mut Vec<i64>,
+) -> Result<(ChangeDisposition, Vec<i64>), LifecycleFailure> {
+    let mut ids = Vec::new();
+    let mut created = false;
+    for article_id in article_ids {
+        let row = conn
+            .query_row(
+                "SELECT a.url,a.title FROM articles a JOIN feeds f ON f.id=a.feed_id
+                 WHERE a.id=?1 AND f.url=?2 AND a.url IS NOT NULL",
+                params![article_id, WEB_CLIPPINGS_FEED_URL],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()
+            .map_err(LifecycleFailure::storage)?
+            .ok_or_else(|| {
+                LifecycleFailure::input(
+                    "所选内容不是有效的网页收藏",
+                    format!("INVALID_WEB_CLIPPING: {article_id}"),
+                )
+            })?;
+        let canonical = store::canonicalize_url(&row.0).map_err(LifecycleFailure::storage)?;
+        if let Some(id) = conn
+            .query_row(
+                "SELECT id FROM resources WHERE canonical_url=?1 OR
+                 (source='import' AND linked_article_id=?2)",
+                params![canonical, article_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(LifecycleFailure::storage)?
+        {
+            ids.push(id);
+            continue;
+        }
+        conn.execute(
+            "INSERT INTO resources(
+               url,canonical_url,linked_article_id,kind,title,privacy,status,curation_state,
+               health,categories_source,tags_source,source,created_at,updated_at
+             ) VALUES(?1,?2,?3,'article',?4,'public','active','active','healthy','ai','ai','import',?5,?5)",
+            params![row.0, canonical, article_id, row.1, now],
+        )
+        .map_err(LifecycleFailure::storage)?;
+        let id = conn.last_insert_rowid();
+        ids.push(id);
+        processing_ids.push(id);
+        created = true;
+    }
+    Ok((
+        if created {
+            ChangeDisposition::Created
+        } else {
+            ChangeDisposition::Existing
+        },
+        ids,
+    ))
 }
 
 fn get_resource(conn: &Connection, id: i64) -> Result<Resource, LifecycleFailure> {
