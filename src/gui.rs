@@ -4,6 +4,7 @@
 //! 进程模型：UI 在主线程；RSS Refresh 与 Knowledge Processing 各自通过窄 facade
 //! 表达意图和 snapshot。后台模块只在短事务期间打开数据库，并通过 notice 请求 repaint。
 
+mod feed_subscription_feature;
 mod resource_feature;
 
 use anyhow::Result;
@@ -36,9 +37,7 @@ use crate::excerpt_thought_lifecycle::{
     ExcerptThoughtChange, ExcerptThoughtLifecycle, ExcerptThoughtProjection, ExcerptView,
     ProjectionScope as ExcerptProjectionScope, SYSTEM_CLOCK,
 };
-use crate::feed_subscription::{
-    ChangeDisposition, FeedSubscriptions, InitialRefreshOutcome, SubscriptionChange,
-};
+use crate::feed_subscription::FeedSubscriptions;
 use crate::gui_icons::{NavigationButton, RemixIcon};
 use crate::gui_modal::{self, InitialFocus, ModalHostAction};
 use crate::gui_state::{
@@ -160,54 +159,6 @@ impl Deref for DbSlot {
 impl DerefMut for DbSlot {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.0.as_mut().expect("database is closed for maintenance")
-    }
-}
-
-#[derive(Debug)]
-struct FeedAddDialog {
-    url: String,
-    error: Option<String>,
-    focus_input: bool,
-}
-
-#[derive(Debug, Clone)]
-struct FeedSettingsPanel {
-    feed_id: i64,
-    title: String,
-    url: String,
-    disabled: bool,
-    original_disabled: bool,
-    interval_draft: String,
-    original_interval: String,
-    error: Option<String>,
-}
-
-impl FeedSettingsPanel {
-    fn from_feed(feed: &Feed) -> Self {
-        let interval = feed
-            .interval_secs
-            .map(|seconds| format!("{seconds}s"))
-            .unwrap_or_default();
-        Self {
-            feed_id: feed.id,
-            title: feed.title.clone().unwrap_or_else(|| feed.url.clone()),
-            url: feed.url.clone(),
-            disabled: feed.disabled,
-            original_disabled: feed.disabled,
-            interval_draft: interval.clone(),
-            original_interval: interval,
-            error: None,
-        }
-    }
-}
-
-impl Default for FeedAddDialog {
-    fn default() -> Self {
-        Self {
-            url: String::new(),
-            error: None,
-            focus_input: true,
-        }
     }
 }
 
@@ -362,8 +313,8 @@ struct DeleteExcerptDialog {
 }
 
 enum ModalState {
-    AddFeed(FeedAddDialog),
-    DeleteFeed { id: i64, title: String },
+    AddFeed(feed_subscription_feature::AddDraft),
+    DeleteFeed(feed_subscription_feature::DeleteDraft),
     Search(SearchDialog),
     EditTags(TagDialog),
     WriteThought(CommentDialog),
@@ -381,7 +332,7 @@ impl ModalPayload for ModalState {
     fn kind(&self) -> ModalKind {
         match self {
             Self::AddFeed(_) => ModalKind::AddFeed,
-            Self::DeleteFeed { .. } => ModalKind::DeleteFeed,
+            Self::DeleteFeed(_) => ModalKind::DeleteFeed,
             Self::Search(_) => ModalKind::Search,
             Self::EditTags(_) => ModalKind::EditTags,
             Self::WriteThought(_) => ModalKind::WriteThought,
@@ -398,7 +349,7 @@ impl ModalPayload for ModalState {
 
     fn is_dirty(&self) -> bool {
         match self {
-            Self::AddFeed(dialog) => !dialog.url.trim().is_empty(),
+            Self::AddFeed(dialog) => dialog.is_dirty(),
             Self::Search(_) => false,
             Self::EditTags(dialog) => dialog.draft != dialog.original,
             Self::WriteThought(dialog) => dialog.draft != dialog.original,
@@ -410,7 +361,7 @@ impl ModalPayload for ModalState {
             }
             Self::AddResource(dialog) => dialog.is_dirty(),
             Self::ImportResources(dialog) => dialog.is_dirty(),
-            Self::DeleteFeed { .. }
+            Self::DeleteFeed(_)
             | Self::DeleteExcerpt(_)
             | Self::DeleteWebPage(_)
             | Self::DeleteResource(_)
@@ -430,17 +381,14 @@ impl ModalPayload for ModalState {
 
 enum PanelState {
     ResourceEditor(resource_feature::EditorDraft),
-    FeedSettings(FeedSettingsPanel),
+    FeedSettings(feed_subscription_feature::SettingsDraft),
 }
 
 impl PanelPayload for PanelState {
     fn is_dirty(&self) -> bool {
         match self {
             Self::ResourceEditor(dialog) => dialog.is_dirty(),
-            Self::FeedSettings(panel) => {
-                panel.disabled != panel.original_disabled
-                    || panel.interval_draft.trim() != panel.original_interval
-            }
+            Self::FeedSettings(panel) => panel.is_dirty(),
         }
     }
 
@@ -448,7 +396,7 @@ impl PanelPayload for PanelState {
         match self {
             Self::ResourceEditor(_) => route == Route::Resources,
             Self::FeedSettings(panel) => {
-                route == Route::Articles(ArticleCollection::Feed(Some(panel.feed_id)))
+                route == Route::Articles(ArticleCollection::Feed(Some(panel.feed_id())))
             }
         }
     }
@@ -485,31 +433,6 @@ enum SelectionAction {
     Copy,
     Favorite,
     Comment,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum DiscardDecision {
-    KeepEditing,
-    Discard,
-}
-
-fn discard_guard_controls(ui: &mut egui::Ui, visible: bool) -> Option<DiscardDecision> {
-    if !visible {
-        return None;
-    }
-    let mut decision = None;
-    ui.separator();
-    ui.colored_label(egui::Color32::from_rgb(190, 86, 86), "有尚未保存的修改");
-    ui.weak("继续刚才的操作会丢弃这些修改。");
-    ui.horizontal(|ui| {
-        if ui.button("继续编辑").clicked() {
-            decision = Some(DiscardDecision::KeepEditing);
-        }
-        if ui.button("放弃修改").clicked() {
-            decision = Some(DiscardDecision::Discard);
-        }
-    });
-    decision
 }
 
 #[derive(Debug, Clone)]
@@ -590,20 +513,15 @@ impl GuiApp {
     }
 
     fn set_feed_settings_panel(&mut self, feed: Option<Feed>) {
-        let panel = feed.map(|feed| PanelState::FeedSettings(FeedSettingsPanel::from_feed(&feed)));
+        let panel = feed.map(|feed| {
+            PanelState::FeedSettings(feed_subscription_feature::SettingsDraft::from_feed(&feed))
+        });
         let effects = self.ui_state.reduce(UiAction::SetPanel(panel));
         self.apply_ui_effects(effects);
     }
 
-    fn feed_settings_panel(&self) -> Option<&FeedSettingsPanel> {
+    fn feed_settings_panel(&self) -> Option<&feed_subscription_feature::SettingsDraft> {
         match self.ui_state.panel() {
-            Some(PanelState::FeedSettings(panel)) => Some(panel),
-            Some(PanelState::ResourceEditor(_)) | None => None,
-        }
-    }
-
-    fn feed_settings_panel_mut(&mut self) -> Option<&mut FeedSettingsPanel> {
-        match self.ui_state.panel_mut() {
             Some(PanelState::FeedSettings(panel)) => Some(panel),
             Some(PanelState::ResourceEditor(_)) | None => None,
         }
@@ -611,19 +529,6 @@ impl GuiApp {
 
     fn notice(&mut self, message: impl Into<String>) {
         self.ui_state.show_notice(message, Instant::now());
-    }
-
-    fn apply_discard_decision(&mut self, decision: Option<DiscardDecision>) {
-        match decision {
-            Some(DiscardDecision::KeepEditing) => {
-                self.ui_state.reduce(UiAction::KeepEditing);
-            }
-            Some(DiscardDecision::Discard) => {
-                let effects = self.ui_state.reduce(UiAction::ConfirmDiscard);
-                self.apply_ui_effects(effects);
-            }
-            None => {}
-        }
     }
 
     fn apply_modal_host_action(&mut self, action: ModalHostAction) {
@@ -671,16 +576,41 @@ impl GuiApp {
         }
     }
 
+    fn apply_feed_feature_outcome(&mut self, outcome: feed_subscription_feature::Outcome) {
+        self.apply_modal_host_action(outcome.modal_action);
+        match outcome.interaction {
+            feed_subscription_feature::InteractionIntent::None => {}
+            feed_subscription_feature::InteractionIntent::CompleteModal => self.complete_modal(),
+            feed_subscription_feature::InteractionIntent::ClosePanel => {
+                let effects = self.ui_state.reduce(UiAction::SetPanel(None));
+                self.apply_ui_effects(effects);
+            }
+            feed_subscription_feature::InteractionIntent::FinishPanel => {
+                self.ui_state.finish_panel()
+            }
+            feed_subscription_feature::InteractionIntent::KeepEditing => {
+                let effects = self.ui_state.reduce(UiAction::KeepEditing);
+                self.apply_ui_effects(effects);
+            }
+            feed_subscription_feature::InteractionIntent::ConfirmDiscard => {
+                let effects = self.ui_state.reduce(UiAction::ConfirmDiscard);
+                self.apply_ui_effects(effects);
+            }
+        }
+        if outcome.reload {
+            self.reload();
+        }
+        if let Some(feed_id) = outcome.select_feed_id {
+            self.select_feed(feed_id);
+        }
+        if let Some(message) = outcome.notice {
+            self.notice(message);
+        }
+    }
+
     fn clear_selection_popover(&mut self) {
         self.ui_state.reduce(UiAction::SetPopover(None));
         self.selection_popup_geometry = None;
-    }
-
-    fn feed_add_dialog_mut(&mut self) -> Option<&mut FeedAddDialog> {
-        match self.ui_state.modal_mut() {
-            Some(ModalState::AddFeed(dialog)) => Some(dialog),
-            _ => None,
-        }
     }
 
     fn search_dialog(&self) -> Option<&SearchDialog> {
@@ -1474,132 +1404,28 @@ impl GuiApp {
     }
 
     fn show_feed_dialogs(&mut self, ctx: &egui::Context) {
-        let kind = self.ui_state.modal_kind();
-        let discard_pending = self.ui_state.discard_owner() == Some(DiscardOwner::Modal);
-        match kind {
-            Some(ModalKind::AddFeed) => {
-                let Some(dialog) = self.feed_add_dialog_mut() else {
-                    return;
-                };
-                let response =
-                    gui_modal::show(ctx, ModalKind::AddFeed, discard_pending, |ui, focus| {
-                        let mut submit = false;
-                        let mut cancel = false;
-                        ui.label("粘贴 RSS、Atom 或博客订阅地址");
-                        let input = ui.add(
-                            egui::TextEdit::singleline(&mut dialog.url)
-                                .hint_text("https://example.com/feed.xml")
-                                .desired_width(f32::INFINITY),
-                        );
-                        if focus == InitialFocus::PrimaryField && dialog.focus_input {
-                            input.request_focus();
-                            dialog.focus_input = false;
-                        }
-                        if let Some(error) = &dialog.error {
-                            ui.colored_label(egui::Color32::RED, error);
-                        }
-                        ui.horizontal(|ui| {
-                            if ui.button("添加并立即抓取").clicked()
-                                || (input.lost_focus()
-                                    && ui.input(|input| input.key_pressed(egui::Key::Enter)))
-                            {
-                                submit = true;
-                            }
-                            if ui.button("取消").clicked() {
-                                cancel = true;
-                            }
-                        });
-                        (submit.then(|| dialog.url.trim().to_owned()), cancel)
-                    });
-                self.apply_modal_host_action(response.action);
-                let Some((add_url, cancel)) = response.inner else {
-                    return;
-                };
-                if cancel {
-                    self.close_modal();
-                    return;
-                }
-                if let Some(url) = add_url {
-                    match FeedSubscriptions::session(self.db_path.clone(), &self.rss_refresh)
-                        .apply(SubscriptionChange::Add { url })
-                    {
-                        Ok(outcome) => {
-                            let id = outcome
-                                .subscription
-                                .as_ref()
-                                .expect("add returns a durable subscription")
-                                .id;
-                            self.complete_modal();
-                            self.reload();
-                            self.select_feed(id);
-                            match outcome.refresh {
-                                Some(InitialRefreshOutcome::Deferred) => {
-                                    self.notice("订阅已添加，将在资料维护结束后刷新")
-                                }
-                                Some(InitialRefreshOutcome::Queued) => {
-                                    self.notice("订阅已添加，正在抓取文章")
-                                }
-                                _ => self.notice("订阅已添加"),
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!(detail = %error.technical_detail, "add subscription failed");
-                            if let Some(dialog) = self.feed_add_dialog_mut() {
-                                dialog.error = Some(error.user_message);
-                            }
-                        }
-                    }
-                }
-            }
-            Some(ModalKind::DeleteFeed) => {
-                let target = match self.ui_state.modal() {
-                    Some(ModalState::DeleteFeed { id, title }) => (*id, title.clone()),
-                    _ => return,
-                };
-                let response = gui_modal::show(ctx, ModalKind::DeleteFeed, false, |ui, _| {
-                    let mut delete = false;
-                    let mut cancel = false;
-                    ui.label(format!("确定删除订阅“{}”吗？", target.1));
-                    ui.weak("该订阅下的本地文章也会被删除，此操作无法撤销。");
-                    ui.horizontal(|ui| {
-                        if ui.button("删除订阅").clicked() {
-                            delete = true;
-                        }
-                        if ui.button("取消").clicked() {
-                            cancel = true;
-                        }
-                    });
-                    (delete, cancel)
-                });
-                self.apply_modal_host_action(response.action);
-                let Some((delete, cancel)) = response.inner else {
-                    return;
-                };
-                if cancel {
-                    self.complete_modal();
-                } else if delete {
-                    self.complete_modal();
-                    match FeedSubscriptions::session(self.db_path.clone(), &self.rss_refresh).apply(
-                        SubscriptionChange::Delete {
-                            target: target.0.to_string(),
-                        },
-                    ) {
-                        Ok(outcome) if outcome.disposition == ChangeDisposition::Deleted => {
-                            self.reload();
-                            self.notice("订阅已删除");
-                        }
-                        Ok(_) => self.notice("没有找到该订阅"),
-                        Err(error) => {
-                            tracing::warn!(detail = %error.technical_detail, "delete subscription failed");
-                            self.notice(error.user_message);
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
+        let show_discard = self.ui_state.discard_owner() == Some(DiscardOwner::Modal);
+        let dependencies = feed_subscription_feature::Dependencies {
+            database: self.db_path.as_path(),
+            refresh: &self.rss_refresh,
+        };
+        let outcome = match self.ui_state.modal_mut() {
+            Some(ModalState::AddFeed(draft)) => feed_subscription_feature::show_modal(
+                ctx,
+                feed_subscription_feature::ModalDraft::Add(draft),
+                show_discard,
+                &dependencies,
+            ),
+            Some(ModalState::DeleteFeed(draft)) => feed_subscription_feature::show_modal(
+                ctx,
+                feed_subscription_feature::ModalDraft::Delete(draft),
+                show_discard,
+                &dependencies,
+            ),
+            _ => return,
+        };
+        self.apply_feed_feature_outcome(outcome);
     }
-
     fn select_feed(&mut self, id: i64) {
         let route = Route::Articles(ArticleCollection::Feed(Some(id)));
         if self.ui_state.route() != route {
@@ -3209,125 +3035,18 @@ impl GuiApp {
     }
     fn show_feed_settings_panel(&mut self, ui: &mut egui::Ui) {
         let show_discard = self.ui_state.discard_owner() == Some(DiscardOwner::Panel);
-        let mut save = false;
-        let mut close = false;
-        let Some(panel) = self.feed_settings_panel_mut() else {
-            return;
-        };
-        ui.horizontal(|ui| {
-            ui.heading("订阅设置");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("关闭").clicked() {
-                    close = true;
-                }
-            });
-        });
-        ui.separator();
-        ui.label(egui::RichText::new(&panel.title).strong());
-        ui.hyperlink_to(&panel.url, &panel.url);
-        ui.add_space(10.0);
-        ui.checkbox(&mut panel.disabled, "暂停这个订阅");
-        ui.weak("暂停后不再自动抓取；重新启用时会立即抓取一次。");
-        ui.add_space(10.0);
-        ui.label("刷新间隔");
-        ui.add(
-            egui::TextEdit::singleline(&mut panel.interval_draft)
-                .hint_text("例如 30m、6h；留空使用全局默认")
-                .desired_width(f32::INFINITY),
-        );
-        ui.weak("支持 s / m / h / d；修改间隔不会立刻抓取。");
-        if let Some(error) = &panel.error {
-            ui.add_space(8.0);
-            ui.colored_label(egui::Color32::RED, error);
-        }
-        ui.add_space(12.0);
-        if ui.button("保存设置").clicked() {
-            save = true;
-        }
-
-        let discard_decision = discard_guard_controls(ui, show_discard);
-        self.apply_discard_decision(discard_decision);
-        if discard_decision.is_some() {
-            return;
-        }
-        if close {
-            self.set_feed_settings_panel(None);
-            return;
-        }
-        if !save {
-            return;
-        }
-
-        let Some(panel) = self.feed_settings_panel() else {
-            return;
-        };
-        let feed_id = panel.feed_id;
-        let disabled = panel.disabled;
-        let disabled_changed = disabled != panel.original_disabled;
-        let interval_draft = panel.interval_draft.trim().to_owned();
-        let interval_changed = interval_draft != panel.original_interval;
-        let interval = if interval_changed {
-            if interval_draft.is_empty() {
-                if let Some(panel) = self.feed_settings_panel_mut() {
-                    panel.error = Some("当前版本暂不支持清除单源间隔，请输入新的间隔".into());
-                }
+        let outcome = {
+            let Some(PanelState::FeedSettings(draft)) = self.ui_state.panel_mut() else {
                 return;
-            }
-            match crate::config::parse_duration(&interval_draft) {
-                Ok(seconds) if seconds > 0 => Some(seconds),
-                _ => {
-                    if let Some(panel) = self.feed_settings_panel_mut() {
-                        panel.error = Some("请输入大于 0 的间隔，例如 30m 或 6h".into());
-                    }
-                    return;
-                }
-            }
-        } else {
-            None
-        };
-
-        let result = (|| {
-            let subscriptions = FeedSubscriptions::session(self.db_path.clone(), &self.rss_refresh);
-            if let Some(seconds) = interval {
-                subscriptions.apply(SubscriptionChange::SetInterval {
-                    id: feed_id,
-                    seconds,
-                })?;
-            }
-            let refresh = if disabled_changed {
-                subscriptions
-                    .apply(if disabled {
-                        SubscriptionChange::Disable { id: feed_id }
-                    } else {
-                        SubscriptionChange::Enable { id: feed_id }
-                    })?
-                    .refresh
-            } else {
-                None
             };
-            Ok::<_, crate::feed_subscription::SubscriptionError>(refresh)
-        })();
-        match result {
-            Ok(refresh) => {
-                self.ui_state.finish_panel();
-                self.reload();
-                match refresh {
-                    Some(InitialRefreshOutcome::Queued) => self.notice("订阅设置已保存，正在刷新"),
-                    Some(InitialRefreshOutcome::Deferred) => {
-                        self.notice("订阅设置已保存，将在资料维护结束后刷新")
-                    }
-                    _ => self.notice("订阅设置已保存"),
-                }
-            }
-            Err(error) => {
-                tracing::warn!(detail = %error.technical_detail, "save subscription settings failed");
-                if let Some(panel) = self.feed_settings_panel_mut() {
-                    panel.error = Some(error.user_message);
-                }
-            }
-        }
+            let dependencies = feed_subscription_feature::Dependencies {
+                database: self.db_path.as_path(),
+                refresh: &self.rss_refresh,
+            };
+            feed_subscription_feature::show_panel(ui, draft, show_discard, &dependencies)
+        };
+        self.apply_feed_feature_outcome(outcome);
     }
-
     fn show_saved_library_page(&mut self, root_ui: &mut egui::Ui) {
         if self.ui_state.route() != Route::Excerpts {
             return;
@@ -4231,7 +3950,9 @@ impl eframe::App for GuiApp {
                             .on_hover_text("添加订阅")
                             .clicked()
                         {
-                            self.open_modal(ModalState::AddFeed(FeedAddDialog::default()));
+                            self.open_modal(ModalState::AddFeed(
+                                feed_subscription_feature::AddDraft::default(),
+                            ));
                         }
                         let selected_feed = self
                             .ui_state
@@ -4254,10 +3975,12 @@ impl eframe::App for GuiApp {
                             .clicked()
                             && let Some(feed) = selected_feed.as_ref()
                         {
-                            self.open_modal(ModalState::DeleteFeed {
-                                id: feed.id,
-                                title: feed.title.clone().unwrap_or_else(|| feed.url.clone()),
-                            });
+                            self.open_modal(ModalState::DeleteFeed(
+                                feed_subscription_feature::DeleteDraft::new(
+                                    feed.id,
+                                    feed.title.clone().unwrap_or_else(|| feed.url.clone()),
+                                ),
+                            ));
                         }
                         if ui
                             .add_enabled(
@@ -5547,14 +5270,14 @@ fn resource_card<R>(
 #[cfg(test)]
 mod tests {
     use super::{
-        CommentDialog, ExcerptTarget, FeedSettingsPanel, ModalPayload, ModalState, PanelPayload,
-        PanelState, SelectedQuote, TagDialog, WebClipDialog, accepts_search_response,
+        CommentDialog, ExcerptTarget, ModalPayload, ModalState, PanelState, SelectedQuote,
+        TagDialog, WebClipDialog, accepts_search_response, feed_subscription_feature,
         projection_scope_for_route, reconcile_article_selection, resource_card,
         search_match_ranges, search_preview,
     };
     use crate::article_library_lifecycle::ProjectionScope;
-    use crate::gui_state::{ArticleCollection, Route};
-    use crate::model::Article;
+    use crate::gui_state::{ArticleCollection, PanelPayload, Route};
+    use crate::model::{Article, Feed};
     use eframe::egui;
 
     #[test]
@@ -5704,28 +5427,23 @@ mod tests {
     }
 
     #[test]
-    fn feed_settings_panel_is_owned_by_its_feed_route_and_tracks_edits() {
-        let mut panel = FeedSettingsPanel {
-            feed_id: 7,
-            title: "Rust Blog".into(),
+    fn feed_settings_panel_remains_owned_by_its_feed_route() {
+        let feed = Feed {
+            id: 7,
             url: "https://example.com/feed.xml".into(),
+            title: Some("Rust Blog".into()),
+            interval_secs: Some(3600),
+            last_fetch: Some(0),
+            next_fetch: 0,
+            last_error: None,
+            fail_count: 0,
             disabled: false,
-            original_disabled: false,
-            interval_draft: "1h".into(),
-            original_interval: "1h".into(),
-            error: None,
         };
-        assert!(!PanelState::FeedSettings(panel.clone()).is_dirty());
-        assert!(
-            PanelState::FeedSettings(panel.clone())
-                .is_compatible(Route::Articles(ArticleCollection::Feed(Some(7))))
-        );
-        assert!(
-            !PanelState::FeedSettings(panel.clone())
-                .is_compatible(Route::Articles(ArticleCollection::Feed(Some(8))))
-        );
-        panel.interval_draft = "2h".into();
-        assert!(PanelState::FeedSettings(panel).is_dirty());
+        let panel =
+            PanelState::FeedSettings(feed_subscription_feature::SettingsDraft::from_feed(&feed));
+        assert!(!panel.is_dirty());
+        assert!(panel.is_compatible(Route::Articles(ArticleCollection::Feed(Some(7)))));
+        assert!(!panel.is_compatible(Route::Articles(ArticleCollection::Feed(Some(8)))));
     }
 
     #[test]
