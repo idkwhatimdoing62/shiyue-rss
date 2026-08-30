@@ -6,6 +6,7 @@
 
 mod feed_subscription_feature;
 mod resource_feature;
+mod web_clipping_feature;
 
 use anyhow::Result;
 use eframe::egui;
@@ -63,8 +64,7 @@ use crate::rss_refresh_workflow::{
     RefreshNotice, RefreshRunStatus, RefreshWorkflowStatus, RssRefreshWorkflow, RunId,
 };
 use crate::web_clipping_lifecycle::{
-    CancelDisposition, CaptureFailureKind, CaptureId, CaptureLease, CaptureRequest,
-    CaptureSnapshot, CaptureState, DeleteRequest as DeleteWebClippingRequest, WebClippingLifecycle,
+    CaptureFailureKind, CaptureId, CaptureSnapshot, CaptureState, WebClippingLifecycle,
 };
 
 const FEED_PANEL_WIDTH: f32 = 240.0;
@@ -237,37 +237,6 @@ struct TagDialog {
     focus_input: bool,
 }
 
-#[derive(Debug)]
-struct WebClipDialog {
-    /// 可以是 http(s) 地址，也可以是用户粘贴的完整 HTML / HTML 片段。
-    source: String,
-    title: String,
-    /// 粘贴 HTML 时用于解析相对链接；网址抓取模式会自动使用最终地址。
-    base_url: String,
-    capture: Option<CaptureLease>,
-    error: Option<String>,
-    focus_input: bool,
-}
-
-impl Default for WebClipDialog {
-    fn default() -> Self {
-        Self {
-            source: String::new(),
-            title: String::new(),
-            base_url: String::new(),
-            capture: None,
-            error: None,
-            focus_input: true,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct DeleteWebClipDialog {
-    article_id: i64,
-    title: String,
-}
-
 impl SelectedQuote {
     fn capture(&self) -> ExcerptCapture {
         ExcerptCapture {
@@ -319,8 +288,8 @@ enum ModalState {
     EditTags(TagDialog),
     WriteThought(CommentDialog),
     DeleteExcerpt(DeleteExcerptDialog),
-    SaveWebPage(WebClipDialog),
-    DeleteWebPage(DeleteWebClipDialog),
+    SaveWebPage(web_clipping_feature::WebClipDialog),
+    DeleteWebPage(web_clipping_feature::DeleteWebClipDialog),
     AddResource(resource_feature::AddDraft),
     DeleteResource(resource_feature::DeleteDraft),
     ImportResources(resource_feature::ImportDraft),
@@ -353,12 +322,7 @@ impl ModalPayload for ModalState {
             Self::Search(_) => false,
             Self::EditTags(dialog) => dialog.draft != dialog.original,
             Self::WriteThought(dialog) => dialog.draft != dialog.original,
-            Self::SaveWebPage(dialog) => {
-                !dialog.source.trim().is_empty()
-                    || !dialog.title.trim().is_empty()
-                    || !dialog.base_url.trim().is_empty()
-                    || dialog.capture.is_some()
-            }
+            Self::SaveWebPage(dialog) => dialog.is_dirty(),
             Self::AddResource(dialog) => dialog.is_dirty(),
             Self::ImportResources(dialog) => dialog.is_dirty(),
             Self::DeleteFeed(_)
@@ -641,7 +605,14 @@ impl GuiApp {
         }
     }
 
-    fn web_clip_dialog_mut(&mut self) -> Option<&mut WebClipDialog> {
+    fn web_clip_dialog(&self) -> Option<&web_clipping_feature::WebClipDialog> {
+        match self.ui_state.modal() {
+            Some(ModalState::SaveWebPage(dialog)) => Some(dialog),
+            _ => None,
+        }
+    }
+
+    fn web_clip_dialog_mut(&mut self) -> Option<&mut web_clipping_feature::WebClipDialog> {
         match self.ui_state.modal_mut() {
             Some(ModalState::SaveWebPage(dialog)) => Some(dialog),
             _ => None,
@@ -1826,56 +1797,17 @@ impl GuiApp {
 
     fn open_web_clip_dialog(&mut self) {
         if self.ui_state.modal_kind() != Some(ModalKind::SaveWebPage) {
-            self.open_modal(ModalState::SaveWebPage(WebClipDialog::default()));
+            self.open_modal(ModalState::SaveWebPage(
+                web_clipping_feature::WebClipDialog::default(),
+            ));
         }
         self.clear_selection_popover();
     }
 
-    fn begin_web_clip_import(&mut self, ctx: &egui::Context) {
-        let Some(dialog) = self.web_clip_dialog_mut() else {
-            return;
-        };
-        if dialog
-            .capture
-            .as_ref()
-            .is_some_and(|capture| !capture.snapshot().state.is_terminal())
-        {
-            return;
-        }
-        let request = CaptureRequest {
-            source: dialog.source.clone(),
-            title_override: non_empty_owned(&dialog.title),
-            pasted_html_base_url: non_empty_owned(&dialog.base_url),
-            refresh_scope: ProjectionScope::ArticleBookmarks,
-        };
-        dialog.error = None;
-        match self.web_clipping_lifecycle.begin_capture(request) {
-            Ok(capture) => {
-                if let Some(dialog) = self.web_clip_dialog_mut() {
-                    dialog.capture = Some(capture);
-                }
-                ctx.request_repaint_after(Duration::from_millis(80));
-            }
-            Err(error) => {
-                tracing::warn!(
-                    kind = ?error.failure.kind,
-                    detail = %error.failure.technical_detail,
-                    "web clipping capture admission failed"
-                );
-                if let Some(dialog) = self.web_clip_dialog_mut() {
-                    dialog.error = Some(error.user_message);
-                }
-            }
-        }
-    }
-
     fn receive_web_clipping_updates(&mut self, ctx: &egui::Context) {
-        let modal_snapshot = match self.ui_state.modal() {
-            Some(ModalState::SaveWebPage(dialog)) => {
-                dialog.capture.as_ref().map(CaptureLease::snapshot)
-            }
-            _ => None,
-        };
+        let modal_snapshot = self
+            .web_clip_dialog()
+            .and_then(web_clipping_feature::WebClipDialog::capture_snapshot);
         if modal_snapshot
             .as_ref()
             .is_some_and(|snapshot| !snapshot.state.is_terminal())
@@ -1900,8 +1832,7 @@ impl GuiApp {
     fn apply_web_clipping_terminal(&mut self, snapshot: CaptureSnapshot) {
         let modal_owns_capture = matches!(
             self.ui_state.modal(),
-            Some(ModalState::SaveWebPage(dialog))
-                if dialog.capture.as_ref().is_some_and(|capture| capture.id() == snapshot.id)
+            Some(ModalState::SaveWebPage(dialog)) if dialog.owns_capture(snapshot.id)
         );
         match snapshot.state {
             CaptureState::Succeeded(success) => {
@@ -1929,8 +1860,7 @@ impl GuiApp {
                 );
                 if modal_owns_capture {
                     if let Some(dialog) = self.web_clip_dialog_mut() {
-                        dialog.capture = None;
-                        dialog.error = Some(failure.user_message);
+                        dialog.fail_capture(failure.user_message);
                     }
                 } else {
                     self.notice(failure.user_message);
@@ -1946,8 +1876,7 @@ impl GuiApp {
                 if modal_owns_capture {
                     if failure.kind == CaptureFailureKind::Maintenance {
                         if let Some(dialog) = self.web_clip_dialog_mut() {
-                            dialog.capture = None;
-                            dialog.error = Some(failure.user_message);
+                            dialog.fail_capture(failure.user_message);
                         }
                     } else {
                         self.complete_modal();
@@ -2161,10 +2090,9 @@ impl GuiApp {
                 .and_then(|projection| projection.articles.iter().find(|article| article.id == id))
                 .and_then(|article| article.title.clone())
                 .unwrap_or_else(|| "未命名网页".to_owned());
-            self.open_modal(ModalState::DeleteWebPage(DeleteWebClipDialog {
-                article_id: id,
-                title,
-            }));
+            self.open_modal(ModalState::DeleteWebPage(
+                web_clipping_feature::DeleteWebClipDialog::new(id, title),
+            ));
         } else {
             self.toggle_star(id);
         }
@@ -2434,183 +2362,51 @@ impl GuiApp {
         }
     }
 
-    fn show_web_clip_dialog(&mut self, ctx: &egui::Context) {
-        if self.ui_state.modal_kind() != Some(ModalKind::SaveWebPage) {
-            return;
-        }
+    fn show_web_clipping_dialogs(&mut self, ctx: &egui::Context) {
         let show_discard = self.ui_state.discard_owner() == Some(DiscardOwner::Modal);
-        let Some(dialog) = self.web_clip_dialog_mut() else {
-            return;
+        let dependencies = web_clipping_feature::Dependencies {
+            lifecycle: &self.web_clipping_lifecycle,
+            delete_scope: self
+                .current_article_projection_scope()
+                .unwrap_or(ProjectionScope::ArticleBookmarks),
         };
-        let capture_snapshot = dialog.capture.as_ref().map(CaptureLease::snapshot);
-        let capture_active = capture_snapshot
-            .as_ref()
-            .is_some_and(|snapshot| !snapshot.state.is_terminal());
-        let theme = ReaderTheme::sspai();
-        let mut import = false;
-        let mut cancel = false;
-        let response = gui_modal::show(ctx, ModalKind::SaveWebPage, show_discard, |ui, focus| {
-            ui.label(
-                egui::RichText::new("粘贴网页地址，或直接粘贴 HTML 源码")
-                    .size(17.0)
-                    .color(theme.text),
-            );
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new("正文会作为本地快照保存；网页中的远程图片仍需要联网加载。")
-                    .size(13.0)
-                    .color(theme.muted),
-            );
-            ui.add_space(12.0);
-            ui.label("网页地址 / HTML");
-            let source_response = ui.add_enabled(
-                !capture_active,
-                egui::TextEdit::multiline(&mut dialog.source)
-                    .desired_rows(10)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("https://example.com/article\n\n或\n\n<article>…</article>"),
-            );
-            if focus == InitialFocus::PrimaryField && dialog.focus_input {
-                source_response.request_focus();
-                dialog.focus_input = false;
-            }
-            if source_response.changed() {
-                dialog.error = None;
-            }
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui.label("标题（可选）");
-                ui.add_enabled(
-                    !capture_active,
-                    egui::TextEdit::singleline(&mut dialog.title)
-                        .desired_width(ui.available_width())
-                        .hint_text("留空则从 HTML 自动识别"),
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.label("基础网址（可选）");
-                ui.add_enabled(
-                    !capture_active,
-                    egui::TextEdit::singleline(&mut dialog.base_url)
-                        .desired_width(ui.available_width())
-                        .hint_text("仅粘贴 HTML 时，用于解析相对图片和链接"),
-                );
-            });
-            if let Some(error) = &dialog.error {
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new(error).color(theme.link).size(13.0));
-            }
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                let import_label = match capture_snapshot.as_ref().map(|snapshot| &snapshot.state) {
-                    Some(CaptureState::Fetching) => "正在抓取…",
-                    Some(CaptureState::Preparing) => "正在整理…",
-                    Some(CaptureState::Committing) => "正在保存…",
-                    _ => "保存网页",
-                };
-                if ui
-                    .add_enabled(
-                        !capture_active,
-                        egui::Button::new(import_label)
-                            .fill(theme.accent)
-                            .stroke(egui::Stroke::NONE),
-                    )
-                    .clicked()
-                {
-                    import = true;
-                }
-                if capture_active {
-                    ui.spinner();
-                }
-                let cancel_label = if capture_active {
-                    "关闭窗口"
-                } else {
-                    "取消"
-                };
-                if ui.button(cancel_label).clicked() {
-                    cancel = true;
-                }
-            });
-        });
-        self.apply_modal_host_action(response.action);
-        if cancel {
-            if let Some(capture) = self
-                .web_clip_dialog_mut()
-                .and_then(|dialog| dialog.capture.as_ref())
-            {
-                let disposition = capture.request_cancel();
-                if disposition == CancelDisposition::CommitAlreadyStarted {
-                    tracing::info!(
-                        capture_id = capture.id().value(),
-                        "web clipping modal closed while commit completes"
-                    );
-                }
-            }
-            self.complete_modal();
-        } else if import {
-            self.begin_web_clip_import(ctx);
-        }
+        let outcome = match self.ui_state.modal_mut() {
+            Some(ModalState::SaveWebPage(draft)) => web_clipping_feature::show_modal(
+                ctx,
+                web_clipping_feature::ModalDraft::Save(draft),
+                show_discard,
+                &dependencies,
+            ),
+            Some(ModalState::DeleteWebPage(draft)) => web_clipping_feature::show_modal(
+                ctx,
+                web_clipping_feature::ModalDraft::Delete(draft),
+                false,
+                &dependencies,
+            ),
+            _ => return,
+        };
+        self.apply_web_clipping_feature_outcome(outcome);
     }
 
-    fn show_delete_web_clip_dialog(&mut self, ctx: &egui::Context) {
-        if self.ui_state.modal_kind() != Some(ModalKind::DeleteWebPage) {
-            return;
+    fn apply_web_clipping_feature_outcome(&mut self, outcome: web_clipping_feature::Outcome) {
+        self.apply_modal_host_action(outcome.modal_action);
+        if let Some(projection) = outcome.projection {
+            self.accept_article_projection(projection);
         }
-        let Some(ModalState::DeleteWebPage(dialog)) = self.ui_state.modal() else {
-            return;
-        };
-        let dialog = dialog.clone();
-        let mut confirm = false;
-        let mut cancel = false;
-        let response = gui_modal::show(ctx, ModalKind::DeleteWebPage, false, |ui, _| {
-            ui.label(format!("确定永久删除「{}」吗？", dialog.title));
-            ui.weak("正文快照及其摘录、想法会一起删除，无法撤销。");
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                if ui.button("永久删除").clicked() {
-                    confirm = true;
-                }
-                if ui.button("取消").clicked() {
-                    cancel = true;
-                }
-            });
-        });
-        self.apply_modal_host_action(response.action);
-        if confirm {
-            let refresh_scope = self
-                .current_article_projection_scope()
-                .unwrap_or(ProjectionScope::ArticleBookmarks);
-            match self
-                .web_clipping_lifecycle
-                .delete(DeleteWebClippingRequest {
-                    article_id: dialog.article_id,
-                    refresh_scope,
-                }) {
-                Ok(outcome) => {
-                    if self.sel_article_id == Some(dialog.article_id) {
-                        self.sel_article_id = None;
-                        self.body_article_id = None;
-                    }
-                    self.accept_article_projection(outcome.projection);
-                    tracing::info!(
-                        article_id = outcome.deleted.article_id,
-                        detached_resources = ?outcome.detached_resource_ids,
-                        "web clipping deleted"
-                    );
-                    self.notice("本地网页已永久删除");
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        kind = ?error.kind,
-                        detail = %error.technical_detail,
-                        "web clipping delete failed"
-                    );
-                    self.notice(error.user_message);
-                }
-            }
+        if let Some(article_id) = outcome.deleted_article_id
+            && self.sel_article_id == Some(article_id)
+        {
+            self.sel_article_id = None;
+            self.body_article_id = None;
+        }
+        if matches!(
+            outcome.interaction,
+            web_clipping_feature::InteractionIntent::CompleteModal
+        ) {
             self.complete_modal();
-        } else if cancel {
-            self.complete_modal();
+        }
+        if let Some(message) = outcome.notice {
+            self.notice(message);
         }
     }
 
@@ -3726,8 +3522,9 @@ impl GuiApp {
             Some(ModalKind::EditTags) => self.show_tag_dialog(ctx),
             Some(ModalKind::WriteThought) => self.show_comment_dialog(ctx),
             Some(ModalKind::DeleteExcerpt) => self.show_delete_excerpt_dialog(ctx),
-            Some(ModalKind::SaveWebPage) => self.show_web_clip_dialog(ctx),
-            Some(ModalKind::DeleteWebPage) => self.show_delete_web_clip_dialog(ctx),
+            Some(ModalKind::SaveWebPage | ModalKind::DeleteWebPage) => {
+                self.show_web_clipping_dialogs(ctx)
+            }
             Some(
                 ModalKind::AddResource | ModalKind::DeleteResource | ModalKind::ImportResources,
             ) => self.show_resource_modal(ctx),
@@ -5247,11 +5044,6 @@ fn rect_changed(a: egui::Rect, b: egui::Rect) -> bool {
     (a.min - b.min).length_sq() > 0.25 || (a.max - b.max).length_sq() > 0.25
 }
 
-fn non_empty_owned(value: &str) -> Option<String> {
-    let value = value.trim();
-    (!value.is_empty()).then(|| value.to_owned())
-}
-
 /// 用系统默认浏览器打开链接，不经过 shell/cmd 字符串解释。
 fn open_in_browser(url: &str) {
     let _ = open::that_detached(url);
@@ -5271,9 +5063,9 @@ fn resource_card<R>(
 mod tests {
     use super::{
         CommentDialog, ExcerptTarget, ModalPayload, ModalState, PanelState, SelectedQuote,
-        TagDialog, WebClipDialog, accepts_search_response, feed_subscription_feature,
-        projection_scope_for_route, reconcile_article_selection, resource_card,
-        search_match_ranges, search_preview,
+        TagDialog, accepts_search_response, feed_subscription_feature, projection_scope_for_route,
+        reconcile_article_selection, resource_card, search_match_ranges, search_preview,
+        web_clipping_feature,
     };
     use crate::article_library_lifecycle::ProjectionScope;
     use crate::gui_state::{ArticleCollection, PanelPayload, Route};
@@ -5394,13 +5186,8 @@ mod tests {
         tags.draft.push_str(", architecture");
         assert!(ModalState::EditTags(tags).is_dirty());
 
-        let mut web = WebClipDialog::default();
+        let web = web_clipping_feature::WebClipDialog::default();
         assert!(!ModalState::SaveWebPage(web).is_dirty());
-        web = WebClipDialog {
-            source: "https://example.com".into(),
-            ..Default::default()
-        };
-        assert!(ModalState::SaveWebPage(web).is_dirty());
 
         let quote = SelectedQuote {
             article_id: 7,

@@ -61,6 +61,10 @@ The trade-off is deliberate SQLite coupling inside a deep module, one more versi
 
 The lifecycle now acquires a short linearized mutation permit and opens its immediate transaction before publishing `Committing`. Maintenance intent rejects acquisition of any new mutation permit, while a permit acquired before that intent may validate and drain. Therefore `Committing` is the actual cancellation and maintenance linearization point: pre-commit cancellation guarantees zero writes, and an already-published commit cannot be invalidated between state publication and transaction acquisition.
 
+## Implementation record
+
+The Desktop Web Clipping feature adapter was extracted on 2026-08-30. `src/gui/web_clipping_feature.rs` now owns the Save Web Page and Delete Web Page drafts, modal rendering, capture admission and cancellation, delete lifecycle invocation, and user-facing error mapping. `GuiApp` retains the Route/Modal reducer, revisioned terminal Capture Lease observation, Article Library Projection adoption, selected-article reconciliation, and Notices. The adapter returns typed outcomes so Modal closure, projection acceptance, and selection cleanup remain explicit root effects. No Web Clipping Lifecycle ordering, cancellation, maintenance, or persistence semantics changed.
+
 ## Rejected alternatives
 
 - Keep request ids and worker channels in `gui.rs`: preserves less code movement but keeps lifecycle ordering and late-result correctness in presentation code.
