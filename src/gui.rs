@@ -6,6 +6,7 @@
 
 mod excerpt_thought_feature;
 mod feed_subscription_feature;
+mod knowledge_feature;
 mod library_search_feature;
 mod resource_feature;
 mod web_clipping_feature;
@@ -48,8 +49,8 @@ use crate::gui_state::{
 use crate::gui_theme::ReaderTheme;
 use crate::image_store::{CacheStats, DEFAULT_LIMIT_BYTES, ImageStore};
 use crate::knowledge_workflow::{
-    ConnectionState, KnowledgeEngine, KnowledgeNotice, TaskKey, TaskKind as KnowledgeTaskKind,
-    TaskSnapshot, TaskStatus as KnowledgeTaskStatus,
+    ConnectionState, KnowledgeEngine, TaskKey, TaskKind as KnowledgeTaskKind, TaskSnapshot,
+    TaskStatus as KnowledgeTaskStatus,
 };
 use crate::library_search::{LibrarySearchResult, PrimaryIdentity};
 use crate::local_data_maintenance::{
@@ -105,14 +106,10 @@ pub(crate) struct GuiApp {
     consumed_web_clipping_terminal: Option<(CaptureId, u64)>,
     search_feature: library_search_feature::SearchFeature,
     resource_filter: ResourceFilter,
-    ai_api_key_draft: String,
-    ai_settings_message: Option<String>,
     desktop_projection: DesktopLibraryProjection,
     desktop_projection_frame: DesktopProjectionFrame,
     knowledge_engine: KnowledgeEngine,
-    knowledge_watch: HashSet<TaskKey>,
-    pending_knowledge_notices: Vec<TaskKey>,
-    connection_state: Option<ConnectionState>,
+    knowledge_feature: knowledge_feature::KnowledgeFeature,
     /// Declared after every background workflow so their Drop implementations
     /// stop accepting work before the long-lived UI database handle closes.
     db: DbSlot,
@@ -472,7 +469,14 @@ impl GuiApp {
             self.notice(message);
         }
         if let Some(resource_id) = outcome.retry_resource_id {
-            self.retry_resource_task(resource_id, context);
+            match self.knowledge_feature.request_resource_completion(
+                resource_id,
+                &self.knowledge_engine,
+                context,
+            ) {
+                Ok(()) => self.notice("已重新加入后台处理队列"),
+                Err(error) => self.notice(format!("无法重试后台任务：{error:#}")),
+            }
         }
     }
 
@@ -620,14 +624,10 @@ impl GuiApp {
             consumed_web_clipping_terminal: None,
             search_feature: library_search_feature::SearchFeature::new(),
             resource_filter: ResourceFilter::Active,
-            ai_api_key_draft: String::new(),
-            ai_settings_message: None,
             desktop_projection,
             desktop_projection_frame: DesktopProjectionFrame::default(),
             knowledge_engine,
-            knowledge_watch: HashSet::new(),
-            pending_knowledge_notices: Vec::new(),
-            connection_state: None,
+            knowledge_feature: knowledge_feature::KnowledgeFeature::new(),
             db: DbSlot(Some(db)),
             desktop,
         };
@@ -973,7 +973,7 @@ impl GuiApp {
             self.refresh_storage_overview();
         }
         let overview = self.storage_overview.clone();
-        let connection_task = self.connection_state.clone();
+        let connection_task = self.knowledge_feature.connection_state().cloned();
         let mut action = None;
         let theme = ReaderTheme::sspai();
         egui::CentralPanel::default()
@@ -1068,39 +1068,27 @@ impl GuiApp {
                 ui.label("API Key 安全保存在 Windows 凭据管理器，用于资源补全、RSS 总结和中文翻译。");
                 ui.horizontal(|ui| {
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.ai_api_key_draft)
+                            egui::TextEdit::singleline(self.knowledge_feature.api_key_draft_mut())
                             .password(true)
                             .hint_text("sk-…")
                             .desired_width(320.0),
                     );
                     if ui.button("保存 Key").clicked() {
-                        match crate::resource_enrichment::save_api_key(&self.ai_api_key_draft) {
-                            Ok(_) => {
-                                self.ai_api_key_draft.clear();
-                                self.ai_settings_message =
-                                    Some("API Key 已保存到 Windows 凭据管理器".into());
-                            }
-                            Err(error) => self.ai_settings_message = Some(error.to_string()),
-                        }
+                        self.knowledge_feature.save_api_key();
                     }
-                    let connection_busy = matches!(
-                        connection_task.as_ref(),
-                        Some(ConnectionState::Running)
-                    );
+                    let connection_busy = self.knowledge_feature.connection_busy();
                     if ui
                         .add_enabled(!connection_busy, egui::Button::new("测试连接"))
                         .clicked()
                     {
-                        self.begin_ai_connection_test(&ctx);
+                        self.knowledge_feature
+                            .begin_connection_test(&self.knowledge_engine, &ctx);
                     }
                     if ui.button("删除 Key").clicked() {
-                        match crate::resource_enrichment::delete_api_key() {
-                            Ok(_) => self.ai_settings_message = Some("API Key 已删除".into()),
-                            Err(error) => self.ai_settings_message = Some(error.to_string()),
-                        }
+                        self.knowledge_feature.delete_api_key();
                     }
                 });
-                if let Some(message) = &self.ai_settings_message {
+                if let Some(message) = self.knowledge_feature.settings_message() {
                     ui.label(message);
                 }
                 if let Some(state) = &connection_task {
@@ -1687,77 +1675,20 @@ impl GuiApp {
     }
 
     fn receive_knowledge_updates(&mut self, ctx: &egui::Context) {
-        let notices = self.knowledge_engine.try_notices().collect::<Vec<_>>();
-        let received_notice = !notices.is_empty();
+        let notices = self
+            .knowledge_feature
+            .receive_updates(&self.knowledge_engine, ctx);
         for notice in notices {
-            match notice {
-                KnowledgeNotice::Changed(key) => {
-                    self.pending_knowledge_notices.push(key);
-                }
-                KnowledgeNotice::ConnectionChanged(state) => {
-                    self.ai_settings_message = Some(match &state {
-                        ConnectionState::Running => "正在测试 DeepSeek 连接".to_owned(),
-                        ConnectionState::Succeeded(message) => message.clone(),
-                        ConnectionState::Failed { detail } => format!("连接失败：{detail}"),
-                    });
-                    self.connection_state = Some(state);
-                }
-                KnowledgeNotice::ModuleFault {
-                    user_message,
-                    technical_detail,
-                } => {
-                    tracing::warn!("knowledge module: {technical_detail}");
-                    self.notice(user_message);
-                }
-            }
-        }
-        if received_notice {
-            ctx.request_repaint();
-        } else {
-            // The workflow can change on its background executor. Poll at a
-            // low idle cadence without forcing the desktop into a permanent
-            // maximum-rate repaint loop.
-            ctx.request_repaint_after(Duration::from_millis(100));
+            self.notice(notice);
         }
     }
 
     fn publish_pending_knowledge_notices(&mut self) {
-        let keys = std::mem::take(&mut self.pending_knowledge_notices);
-        for key in keys.into_iter().collect::<HashSet<_>>() {
-            let Some(view) = self.desktop_projection_frame.knowledge(key) else {
-                continue;
-            };
-            if matches!(view.freshness, ProjectionFreshness::Loading) {
-                self.pending_knowledge_notices.push(key);
-                continue;
-            }
-            let terminal = view
-                .data
-                .as_ref()
-                .is_some_and(|snapshot| snapshot.status.is_terminal());
-            let notice = view
-                .data
-                .as_ref()
-                .and_then(|snapshot| match snapshot.status {
-                    KnowledgeTaskStatus::Succeeded => match snapshot.key.kind {
-                        KnowledgeTaskKind::ResourceCompletion => {
-                            Some("资源抓取和 AI 整理已完成".to_owned())
-                        }
-                        KnowledgeTaskKind::ArticleSummary => {
-                            Some("AI 总结和中文翻译已保存".to_owned())
-                        }
-                    },
-                    KnowledgeTaskStatus::Failed | KnowledgeTaskStatus::Interrupted => {
-                        snapshot.user_message.clone()
-                    }
-                    KnowledgeTaskStatus::Queued | KnowledgeTaskStatus::Running => None,
-                });
-            if let Some(notice) = notice {
-                self.notice(notice);
-            }
-            if terminal {
-                self.knowledge_watch.remove(&key);
-            }
+        let notices = self
+            .knowledge_feature
+            .publish_pending_notices(&self.desktop_projection_frame);
+        for notice in notices {
+            self.notice(notice);
         }
     }
 
@@ -1811,7 +1742,7 @@ impl GuiApp {
         }
         demand
             .knowledge
-            .extend(self.knowledge_watch.iter().copied());
+            .extend(self.knowledge_feature.watched_keys());
         self.desktop_projection_frame = self.desktop_projection.frame(demand);
 
         let article_projection = self.article_projection(article_scope);
@@ -1892,49 +1823,6 @@ impl GuiApp {
             ));
         } else {
             self.toggle_star(id);
-        }
-    }
-
-    fn retry_resource_task(&mut self, resource_id: i64, ctx: &egui::Context) {
-        let key = TaskKey::new(KnowledgeTaskKind::ResourceCompletion, resource_id);
-        let result = self.knowledge_engine.request(key);
-        match result {
-            Ok(_) => {
-                self.knowledge_watch.insert(key);
-                ctx.request_repaint();
-                self.notice("已重新加入后台处理队列");
-            }
-            Err(error) => {
-                self.notice(format!("无法重试后台任务：{error:#}"));
-            }
-        }
-    }
-
-    fn begin_ai_connection_test(&mut self, ctx: &egui::Context) {
-        match self.knowledge_engine.test_connection() {
-            Ok(()) => {
-                self.connection_state = Some(ConnectionState::Running);
-                ctx.request_repaint();
-            }
-            Err(error) => {
-                self.connection_state = Some(ConnectionState::Failed {
-                    detail: format!("{error:#}"),
-                });
-            }
-        }
-    }
-
-    fn begin_article_ai(&mut self, article_id: i64, ctx: &egui::Context) {
-        let key = TaskKey::new(KnowledgeTaskKind::ArticleSummary, article_id);
-        let result = self.knowledge_engine.request(key);
-        match result {
-            Ok(_) => {
-                self.knowledge_watch.insert(key);
-                ctx.request_repaint();
-            }
-            Err(error) => {
-                self.notice(format!("无法提交文章 AI 任务：{error:#}"));
-            }
         }
     }
 
@@ -2413,7 +2301,14 @@ impl GuiApp {
             }
             Some(Action::Retry(id, url)) => {
                 let _ = url;
-                self.retry_resource_task(id, &ctx);
+                match self.knowledge_feature.request_resource_completion(
+                    id,
+                    &self.knowledge_engine,
+                    &ctx,
+                ) {
+                    Ok(()) => self.notice("已重新加入后台处理队列"),
+                    Err(error) => self.notice(format!("无法重试后台任务：{error:#}")),
+                }
             }
             Some(Action::LoadMore) => {
                 self.desktop_projection
@@ -4275,7 +4170,16 @@ impl eframe::App for GuiApp {
                     self.open_tag_dialog(article_id);
                 }
                 if generate_article_ai {
-                    self.begin_article_ai(article_id, &ctx);
+                    match self.knowledge_feature.request_article_summary(
+                        article_id,
+                        &self.knowledge_engine,
+                        &ctx,
+                    ) {
+                        Ok(()) => {}
+                        Err(error) => {
+                            self.notice(format!("无法提交文章 AI 任务：{error:#}"));
+                        }
+                    }
                 }
             });
         self.show_selection_popup(&ctx);

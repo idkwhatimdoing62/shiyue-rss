@@ -45,6 +45,10 @@ Schema version 2 added `knowledge_tasks` and `knowledge_task_attempts`, includin
 
 Failures and retries remain diagnosable across restarts, GUI navigation cannot orphan work, and Resource/Article paths share one lifecycle. GUI and CLI cannot diverge on retry or status semantics, and opening a second process cannot steal or destroy valid work. The workflow module gains depth by hiding persistence, execution, fencing, maintenance participation and failure classification behind a small seam. The tradeoff is lease/heartbeat machinery, more transactional code, bounded maintenance interruption, polling latency, and a versioned migration for ownership metadata.
 
+## Implementation record (2026-08-31)
+
+The private Desktop Knowledge Processing adapter was extracted to `src/gui/knowledge_feature.rs`. It owns desktop interaction state for the DeepSeek key draft, connection-test state, watched task keys, workflow notice intake, task submission, retry requests, and user-facing task outcomes. `GuiApp` retains Route/Modal/Panel state, Desktop Library Projection demand and adoption, and Notice publication. The Knowledge Processing workflow, persistence, retry, fencing, and provider semantics are unchanged.
+
 ## Rejected alternatives
 
 - Keep independent GUI threads: simple locally, but lifecycle and persistence remain duplicated.
