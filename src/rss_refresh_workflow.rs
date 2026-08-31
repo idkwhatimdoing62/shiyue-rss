@@ -988,6 +988,30 @@ fn sanitize_detail(detail: &str) -> String {
     compact.chars().take(MAX_TECHNICAL_DETAIL_CHARS).collect()
 }
 
+/// Convert persisted request details into a concise user-facing explanation
+/// while retaining the bounded technical detail for diagnosis.
+pub(crate) fn format_refresh_error_for_display(detail: &str) -> String {
+    let lower = detail.to_ascii_lowercase();
+    let summary = if lower.contains("timeout") || lower.contains("timed out") {
+        "请求超时，请检查网络连接或稍后重试"
+    } else if lower.contains("error sending request")
+        || lower.contains("dns")
+        || lower.contains("failed to lookup")
+        || lower.contains("connect")
+    {
+        "网络连接失败，请检查网络或代理设置"
+    } else if lower.contains("404") {
+        "订阅地址不存在（HTTP 404），请编辑订阅地址"
+    } else if lower.contains("401") || lower.contains("403") {
+        "服务器拒绝访问，请检查订阅地址或访问权限"
+    } else if detail.contains("解析订阅源失败") {
+        "订阅内容无法解析，请检查源格式"
+    } else {
+        return detail.to_owned();
+    };
+    format!("{summary}\n技术详情：{detail}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1344,5 +1368,22 @@ mod tests {
         assert!(!sanitized.contains("Bearer secret"));
         assert!(!sanitized.contains("sk-abc"));
         assert_eq!(sanitized.chars().count(), MAX_TECHNICAL_DETAIL_CHARS);
+    }
+
+    #[test]
+    fn refresh_error_display_explains_common_network_failures() {
+        let message = format_refresh_error_for_display(
+            "error sending request for url (https://example.test/feed): operation timed out",
+        );
+        assert!(message.starts_with("请求超时，请检查网络连接或稍后重试"));
+        assert!(message.contains("技术详情："));
+    }
+
+    #[test]
+    fn refresh_error_display_keeps_unknown_details_unchanged() {
+        assert_eq!(
+            format_refresh_error_for_display("自定义订阅错误"),
+            "自定义订阅错误"
+        );
     }
 }

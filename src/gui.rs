@@ -60,6 +60,7 @@ use crate::local_data_maintenance::{
 use crate::model::{Article, ArticleSelection, Feed, TextAnchor};
 use crate::rss_refresh_workflow::{
     RefreshNotice, RefreshRunStatus, RefreshWorkflowStatus, RssRefreshWorkflow, RunId,
+    format_refresh_error_for_display,
 };
 use crate::web_clipping_lifecycle::{
     CaptureFailureKind, CaptureId, CaptureSnapshot, CaptureState, WebClippingLifecycle,
@@ -3353,7 +3354,10 @@ impl eframe::App for GuiApp {
                                 .min_size(egui::vec2(ui.available_width(), 34.0)),
                             );
                             if let Some(error) = &fd.last_error {
-                                response = response.on_hover_text(format!("最近刷新失败：{error}"));
+                                response = response.on_hover_text(format!(
+                                    "最近刷新失败：{}",
+                                    format_refresh_error_for_display(error)
+                                ));
                             }
                             if sel {
                                 ui.painter().rect_filled(

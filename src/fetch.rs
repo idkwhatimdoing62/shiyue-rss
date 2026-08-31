@@ -5,6 +5,10 @@ use std::time::Duration;
 
 use crate::model::NewArticle;
 
+const MAX_ATTEMPTS: usize = 3;
+const RETRY_DELAYS: [Duration; MAX_ATTEMPTS - 1] =
+    [Duration::from_millis(250), Duration::from_secs(1)];
+
 pub fn client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .user_agent(concat!("Shiyue/", env!("CARGO_PKG_VERSION")))
@@ -14,6 +18,23 @@ pub fn client() -> Result<reqwest::Client> {
 
 /// 拉取一个源并解析成统一条目。返回 (源标题, 条目列表)。
 pub async fn fetch(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<(Option<String>, Vec<NewArticle>)> {
+    let mut attempt = 0;
+    loop {
+        match fetch_once(client, url).await {
+            Ok(value) => return Ok(value),
+            Err(error) if attempt < RETRY_DELAYS.len() && is_retryable_request_error(&error) => {
+                tokio::time::sleep(RETRY_DELAYS[attempt]).await;
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn fetch_once(
     client: &reqwest::Client,
     url: &str,
 ) -> Result<(Option<String>, Vec<NewArticle>)> {
@@ -28,6 +49,20 @@ pub async fn fetch(
     let title = feed.title.map(|t| t.content);
     let articles = feed.entries.into_iter().map(entry_to_article).collect();
     Ok((title, articles))
+}
+
+fn is_retryable_request_error(error: &anyhow::Error) -> bool {
+    let Some(request) = error.downcast_ref::<reqwest::Error>() else {
+        return false;
+    };
+    request.is_timeout()
+        || request.is_connect()
+        || request.is_request()
+        || request.status().is_some_and(|status| {
+            status == reqwest::StatusCode::REQUEST_TIMEOUT
+                || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || status.is_server_error()
+        })
 }
 
 /// feed-rs 的 Entry → 待入库 NewArticle。entry_id 优先 guid/id，回退链接、再回退标题（ADR-8）。
@@ -96,5 +131,46 @@ fn entry_to_article(e: feed_rs::model::Entry) -> NewArticle {
         author,
         published,
         content,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener};
+    use std::thread;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retries_transient_request_failures_with_a_bounded_attempt_count() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for attempt in 0..MAX_ATTEMPTS {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request);
+                if attempt + 1 < MAX_ATTEMPTS {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    continue;
+                }
+                let body = br#"<?xml version="1.0"?><rss version="2.0"><channel><title>Retry Feed</title></channel></rss>"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/rss+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                stream.write_all(body).unwrap();
+            }
+        });
+
+        let client = client().unwrap();
+        let (title, articles) = fetch(&client, &format!("http://{address}/feed"))
+            .await
+            .unwrap();
+        assert_eq!(title.as_deref(), Some("Retry Feed"));
+        assert!(articles.is_empty());
+        server.join().unwrap();
     }
 }
