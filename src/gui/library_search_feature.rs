@@ -391,7 +391,10 @@ impl SearchFeature {
         }
         ModalOutcome {
             modal_action: response.action,
-            selected_hit,
+            // Preserve the old `submit`-first precedence: when Enter/the
+            // Search button and a result click happen in the same frame,
+            // execute the search and do not also open the stale result.
+            selected_hit: if submit { None } else { selected_hit },
             notices,
         }
     }
@@ -406,14 +409,17 @@ impl SearchFeature {
         while let Ok(event) = self.search_event_rx.try_recv() {
             match event.target {
                 SearchTarget::Modal => {
-                    let refreshed_history = event
-                        .result
-                        .as_ref()
-                        .ok()
-                        .map(|_| LibrarySearch::new(db).history(12).unwrap_or_default());
                     if let Some(dialog) = dialog.as_deref_mut()
                         && accepts_search_response(dialog.active_request, event.request_id)
                     {
+                        // Do not touch the database for late or already-closed
+                        // requests. This keeps request invalidation a true
+                        // no-op on the UI path.
+                        let refreshed_history = event
+                            .result
+                            .as_ref()
+                            .ok()
+                            .map(|_| LibrarySearch::new(db).history(12).unwrap_or_default());
                         dialog.searching = false;
                         dialog.active_request = None;
                         match event.result {

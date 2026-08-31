@@ -302,7 +302,10 @@ fn show_add_modal(
         return outcome;
     };
     if cancel {
-        outcome.interaction = InteractionIntent::CompleteModal;
+        // Request a close through the modal host so dirty drafts still go
+        // through the discard confirmation guard, matching the pre-adapter
+        // `close_modal` behavior.
+        outcome.modal_action = ModalHostAction::RequestClose;
         return outcome;
     }
     let Some(url) = add_url else { return outcome };
