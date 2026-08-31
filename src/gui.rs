@@ -4,6 +4,7 @@
 //! 进程模型：UI 在主线程；RSS Refresh 与 Knowledge Processing 各自通过窄 facade
 //! 表达意图和 snapshot。后台模块只在短事务期间打开数据库，并通过 notice 请求 repaint。
 
+mod excerpt_thought_feature;
 mod feed_subscription_feature;
 mod resource_feature;
 mod web_clipping_feature;
@@ -34,9 +35,8 @@ use crate::desktop_library_projection::{
 };
 use crate::desktop_runtime::{DesktopIntent, DesktopSession, Paths, SettingsChange};
 use crate::excerpt_thought_lifecycle::{
-    ArticleOrigin as ExcerptArticleOrigin, ExcerptCapture, ExcerptIdentityKind, ExcerptTarget,
-    ExcerptThoughtChange, ExcerptThoughtLifecycle, ExcerptThoughtProjection, ExcerptView,
-    ProjectionScope as ExcerptProjectionScope, SYSTEM_CLOCK,
+    ArticleOrigin as ExcerptArticleOrigin, ExcerptCapture, ExcerptIdentityKind,
+    ExcerptThoughtProjection, ExcerptView, ProjectionScope as ExcerptProjectionScope,
 };
 use crate::feed_subscription::FeedSubscriptions;
 use crate::gui_icons::{NavigationButton, RemixIcon};
@@ -263,31 +263,13 @@ impl SelectedQuote {
     }
 }
 
-#[derive(Debug, Clone)]
-struct CommentDialog {
-    quote: SelectedQuote,
-    target: ExcerptTarget,
-    draft: String,
-    original: String,
-    error: Option<String>,
-    focus_input: bool,
-}
-
-#[derive(Debug, Clone)]
-struct DeleteExcerptDialog {
-    excerpt_id: i64,
-    selected_text: String,
-    has_thought: bool,
-    refresh_scope: ExcerptProjectionScope,
-}
-
 enum ModalState {
     AddFeed(feed_subscription_feature::AddDraft),
     DeleteFeed(feed_subscription_feature::DeleteDraft),
     Search(SearchDialog),
     EditTags(TagDialog),
-    WriteThought(CommentDialog),
-    DeleteExcerpt(DeleteExcerptDialog),
+    WriteThought(excerpt_thought_feature::CommentDialog),
+    DeleteExcerpt(excerpt_thought_feature::DeleteExcerptDialog),
     SaveWebPage(web_clipping_feature::WebClipDialog),
     DeleteWebPage(web_clipping_feature::DeleteWebClipDialog),
     AddResource(resource_feature::AddDraft),
@@ -321,7 +303,7 @@ impl ModalPayload for ModalState {
             Self::AddFeed(dialog) => dialog.is_dirty(),
             Self::Search(_) => false,
             Self::EditTags(dialog) => dialog.draft != dialog.original,
-            Self::WriteThought(dialog) => dialog.draft != dialog.original,
+            Self::WriteThought(dialog) => dialog.is_dirty(),
             Self::SaveWebPage(dialog) => dialog.is_dirty(),
             Self::AddResource(dialog) => dialog.is_dirty(),
             Self::ImportResources(dialog) => dialog.is_dirty(),
@@ -598,13 +580,6 @@ impl GuiApp {
         }
     }
 
-    fn comment_dialog_mut(&mut self) -> Option<&mut CommentDialog> {
-        match self.ui_state.modal_mut() {
-            Some(ModalState::WriteThought(dialog)) => Some(dialog),
-            _ => None,
-        }
-    }
-
     fn web_clip_dialog(&self) -> Option<&web_clipping_feature::WebClipDialog> {
         match self.ui_state.modal() {
             Some(ModalState::SaveWebPage(dialog)) => Some(dialog),
@@ -772,20 +747,6 @@ impl GuiApp {
         self.current_excerpt_projection()
             .as_deref()
             .map_or(0, |projection| projection.counts.library_excerpts)
-    }
-
-    fn report_excerpt_failure(
-        &mut self,
-        action: &str,
-        error: crate::excerpt_thought_lifecycle::LifecycleFailure,
-    ) {
-        tracing::warn!(
-            kind = ?error.kind,
-            operation = ?error.operation,
-            detail = %error.technical_detail,
-            "excerpt/thought lifecycle failed"
-        );
-        self.notice(format!("{action}失败：{}", error.user_message));
     }
 
     fn current_article_projection_scope(&self) -> Option<ProjectionScope> {
@@ -2143,222 +2104,106 @@ impl GuiApp {
 
     fn save_favorite_quote(&mut self, quote: SelectedQuote) {
         let article_id = quote.article_id;
-        let result = ExcerptThoughtLifecycle::new(&self.db, &SYSTEM_CLOCK).apply(
-            ExcerptThoughtChange::EnsureExcerpt {
-                capture: quote.capture(),
-            },
+        let outcome = excerpt_thought_feature::ensure_excerpt(
+            quote.capture(),
             ExcerptProjectionScope::Article(article_id),
+            &excerpt_thought_feature::Dependencies {
+                db: &self.db,
+                clock: &crate::excerpt_thought_lifecycle::SYSTEM_CLOCK,
+            },
         );
-        match result {
-            Ok(outcome) => {
-                self.accept_excerpt_projection(outcome.projection);
-                self.notice("已摘录，可在左侧「摘录与想法」查看");
-            }
-            Err(error) => self.report_excerpt_failure("摘录", error),
-        }
+        self.apply_excerpt_thought_feature_outcome(outcome);
     }
 
     fn begin_comment(&mut self, quote: SelectedQuote) {
-        let capture = quote.capture();
         let projection = self.current_excerpt_projection();
-        let existing = projection
-            .as_ref()
-            .and_then(|projection| projection.match_capture(&capture));
-        let target = existing
-            .map(|excerpt| ExcerptTarget::Existing(excerpt.id))
-            .unwrap_or_else(|| ExcerptTarget::Captured(capture));
-        let draft = existing
-            .and_then(|excerpt| excerpt.thought.as_ref())
-            .map(|thought| thought.content.clone())
-            .unwrap_or_default();
-        self.open_modal(ModalState::WriteThought(CommentDialog {
-            quote,
-            target,
-            original: draft.clone(),
-            draft,
-            error: None,
-            focus_input: true,
-        }));
+        self.open_modal(ModalState::WriteThought(
+            excerpt_thought_feature::new_comment_dialog(quote, projection.as_deref()),
+        ));
     }
 
     fn begin_edit_thought(&mut self, excerpt: &ExcerptView) {
-        let draft = excerpt
-            .thought
-            .as_ref()
-            .map(|thought| thought.content.clone())
-            .unwrap_or_default();
-        self.open_modal(ModalState::WriteThought(CommentDialog {
-            quote: SelectedQuote::from_excerpt(excerpt),
-            target: ExcerptTarget::Existing(excerpt.id),
-            original: draft.clone(),
-            draft,
-            error: None,
-            focus_input: true,
-        }));
-    }
-
-    fn submit_comment(&mut self) {
-        let Some(ModalState::WriteThought(dialog)) = self.ui_state.modal() else {
-            return;
-        };
-        let article_id = dialog.quote.article_id;
-        let target = dialog.target.clone();
-        let draft = dialog.draft.clone();
-        if draft.trim().is_empty() {
-            if let Some(dialog) = self.comment_dialog_mut() {
-                dialog.error = Some("想法内容不能为空".to_owned());
-            }
-            return;
-        }
-        let result = ExcerptThoughtLifecycle::new(&self.db, &SYSTEM_CLOCK).apply(
-            ExcerptThoughtChange::PutThought {
-                target,
-                content: draft,
-            },
-            ExcerptProjectionScope::Article(article_id),
-        );
-        match result {
-            Ok(outcome) => {
-                self.complete_modal();
-                self.accept_excerpt_projection(outcome.projection);
-                self.notice("想法已保存，可在左侧「摘录与想法」查看");
-            }
-            Err(error) => {
-                if let Some(dialog) = self.comment_dialog_mut() {
-                    dialog.error = Some(format!("想法保存失败：{}", error.user_message));
-                }
-                tracing::warn!(detail = %error.technical_detail, "put thought failed");
-            }
-        }
+        self.open_modal(ModalState::WriteThought(
+            excerpt_thought_feature::new_edit_dialog(excerpt),
+        ));
     }
 
     fn remove_thought(&mut self, excerpt_id: i64, scope: ExcerptProjectionScope) {
-        match ExcerptThoughtLifecycle::new(&self.db, &SYSTEM_CLOCK)
-            .apply(ExcerptThoughtChange::RemoveThought { excerpt_id }, scope)
-        {
-            Ok(outcome) => {
-                self.accept_excerpt_projection(outcome.projection);
-                self.notice("想法已删除，摘录仍然保留");
-            }
-            Err(error) => self.report_excerpt_failure("删除想法", error),
-        }
+        let outcome = excerpt_thought_feature::remove_thought(
+            excerpt_id,
+            scope,
+            &excerpt_thought_feature::Dependencies {
+                db: &self.db,
+                clock: &crate::excerpt_thought_lifecycle::SYSTEM_CLOCK,
+            },
+        );
+        self.apply_excerpt_thought_feature_outcome(outcome);
     }
 
     fn request_delete_excerpt(&mut self, excerpt: &ExcerptView, scope: ExcerptProjectionScope) {
         if excerpt.thought.is_some() {
-            self.open_modal(ModalState::DeleteExcerpt(DeleteExcerptDialog {
-                excerpt_id: excerpt.id,
-                selected_text: excerpt.selected_text.clone(),
-                has_thought: true,
-                refresh_scope: scope,
-            }));
+            self.open_modal(ModalState::DeleteExcerpt(
+                excerpt_thought_feature::new_delete_dialog(excerpt, scope),
+            ));
         } else {
-            self.delete_excerpt(excerpt.id, scope);
-        }
-    }
-
-    fn delete_excerpt(&mut self, excerpt_id: i64, scope: ExcerptProjectionScope) {
-        match ExcerptThoughtLifecycle::new(&self.db, &SYSTEM_CLOCK)
-            .apply(ExcerptThoughtChange::DeleteExcerpt { excerpt_id }, scope)
-        {
-            Ok(outcome) => {
-                self.accept_excerpt_projection(outcome.projection);
-                self.notice("摘录已删除");
-            }
-            Err(error) => self.report_excerpt_failure("删除摘录", error),
-        }
-    }
-
-    fn show_comment_dialog(&mut self, ctx: &egui::Context) {
-        if self.ui_state.modal_kind() != Some(ModalKind::WriteThought) {
-            return;
-        }
-        let show_discard = self.ui_state.discard_owner() == Some(DiscardOwner::Modal);
-        let Some(dialog) = self.comment_dialog_mut() else {
-            return;
-        };
-        let mut submit = false;
-        let mut cancel = false;
-        let response = gui_modal::show(ctx, ModalKind::WriteThought, show_discard, |ui, focus| {
-            ui.label("选中的文字：");
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(&dialog.quote.text)
-                            .size(17.0)
-                            .color(ui.visuals().weak_text_color()),
-                    )
-                    .wrap(),
-                );
-            });
-            ui.add_space(8.0);
-            ui.label("想法内容：");
-            let input = ui.add(
-                egui::TextEdit::multiline(&mut dialog.draft)
-                    .desired_rows(4)
-                    .desired_width(440.0)
-                    .hint_text("写下你的想法…"),
+            let outcome = excerpt_thought_feature::delete_excerpt(
+                excerpt.id,
+                scope,
+                &excerpt_thought_feature::Dependencies {
+                    db: &self.db,
+                    clock: &crate::excerpt_thought_lifecycle::SYSTEM_CLOCK,
+                },
             );
-            if focus == InitialFocus::PrimaryField && dialog.focus_input {
-                input.request_focus();
-                dialog.focus_input = false;
-            }
-            if let Some(error) = &dialog.error {
-                ui.colored_label(egui::Color32::RED, error);
-            }
-            ui.horizontal(|ui| {
-                if ui.button("保存想法").clicked() {
-                    submit = true;
-                }
-                if ui.button("取消").clicked() {
-                    cancel = true;
-                }
-            });
-        });
-        self.apply_modal_host_action(response.action);
-        if cancel {
-            self.close_modal();
-        } else if submit {
-            self.submit_comment();
+            self.apply_excerpt_thought_feature_outcome(outcome);
         }
     }
 
-    fn show_delete_excerpt_dialog(&mut self, ctx: &egui::Context) {
-        if self.ui_state.modal_kind() != Some(ModalKind::DeleteExcerpt) {
-            return;
-        }
-        let Some(ModalState::DeleteExcerpt(dialog)) = self.ui_state.modal() else {
-            return;
+    fn show_excerpt_thought_dialogs(&mut self, ctx: &egui::Context) {
+        let show_discard = self.ui_state.discard_owner() == Some(DiscardOwner::Modal);
+        let dependencies = excerpt_thought_feature::Dependencies {
+            db: &self.db,
+            clock: &crate::excerpt_thought_lifecycle::SYSTEM_CLOCK,
         };
-        let dialog = dialog.clone();
-        let mut confirm = false;
-        let mut cancel = false;
-        let response = gui_modal::show(ctx, ModalKind::DeleteExcerpt, false, |ui, _| {
-            ui.label("确定删除这条摘录吗？");
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.add(egui::Label::new(&dialog.selected_text).wrap());
-            });
-            if dialog.has_thought {
-                ui.colored_label(
-                    ui.visuals().warn_fg_color,
-                    "附在这条摘录上的想法也会一起删除，此操作无法撤销。",
-                );
-            }
-            ui.horizontal(|ui| {
-                if ui.button("删除摘录").clicked() {
-                    confirm = true;
-                }
-                if ui.button("取消").clicked() {
-                    cancel = true;
-                }
-            });
-        });
-        self.apply_modal_host_action(response.action);
-        if cancel {
-            self.close_modal();
-        } else if confirm {
-            self.complete_modal();
-            self.delete_excerpt(dialog.excerpt_id, dialog.refresh_scope);
+        let outcome = match self.ui_state.modal_mut() {
+            Some(ModalState::WriteThought(draft)) => excerpt_thought_feature::show_modal(
+                ctx,
+                excerpt_thought_feature::ModalDraft::Thought(draft),
+                show_discard,
+                &dependencies,
+            ),
+            Some(ModalState::DeleteExcerpt(draft)) => excerpt_thought_feature::show_modal(
+                ctx,
+                excerpt_thought_feature::ModalDraft::Delete(draft),
+                false,
+                &dependencies,
+            ),
+            _ => return,
+        };
+        self.apply_excerpt_thought_feature_outcome(outcome);
+    }
+
+    fn apply_excerpt_thought_feature_outcome(&mut self, outcome: excerpt_thought_feature::Outcome) {
+        self.apply_modal_host_action(outcome.modal_action);
+        match outcome.interaction {
+            excerpt_thought_feature::InteractionIntent::None => {}
+            excerpt_thought_feature::InteractionIntent::CloseModal => self.close_modal(),
+            excerpt_thought_feature::InteractionIntent::CompleteModal => self.complete_modal(),
+        }
+        if let Some(projection) = outcome.projection {
+            self.accept_excerpt_projection(projection);
+        }
+        if let Some(message) = outcome.notice {
+            self.notice(message);
+        }
+        if let Some(request) = outcome.pending_delete {
+            let follow_up = excerpt_thought_feature::execute_delete(
+                request,
+                &excerpt_thought_feature::Dependencies {
+                    db: &self.db,
+                    clock: &crate::excerpt_thought_lifecycle::SYSTEM_CLOCK,
+                },
+            );
+            self.apply_excerpt_thought_feature_outcome(follow_up);
         }
     }
 
@@ -3520,8 +3365,9 @@ impl GuiApp {
             Some(ModalKind::AddFeed | ModalKind::DeleteFeed) => self.show_feed_dialogs(ctx),
             Some(ModalKind::Search) => self.show_search_window(ctx),
             Some(ModalKind::EditTags) => self.show_tag_dialog(ctx),
-            Some(ModalKind::WriteThought) => self.show_comment_dialog(ctx),
-            Some(ModalKind::DeleteExcerpt) => self.show_delete_excerpt_dialog(ctx),
+            Some(ModalKind::WriteThought | ModalKind::DeleteExcerpt) => {
+                self.show_excerpt_thought_dialogs(ctx)
+            }
             Some(ModalKind::SaveWebPage | ModalKind::DeleteWebPage) => {
                 self.show_web_clipping_dialogs(ctx)
             }
@@ -5061,13 +4907,14 @@ fn resource_card<R>(
 
 #[cfg(test)]
 mod tests {
+    use super::excerpt_thought_feature;
     use super::{
-        CommentDialog, ExcerptTarget, ModalPayload, ModalState, PanelState, SelectedQuote,
-        TagDialog, accepts_search_response, feed_subscription_feature, projection_scope_for_route,
-        reconcile_article_selection, resource_card, search_match_ranges, search_preview,
-        web_clipping_feature,
+        ModalPayload, ModalState, PanelState, SelectedQuote, TagDialog, accepts_search_response,
+        feed_subscription_feature, projection_scope_for_route, reconcile_article_selection,
+        resource_card, search_match_ranges, search_preview, web_clipping_feature,
     };
     use crate::article_library_lifecycle::ProjectionScope;
+    use crate::excerpt_thought_lifecycle::ExcerptTarget;
     use crate::gui_state::{ArticleCollection, PanelPayload, Route};
     use crate::model::{Article, Feed};
     use eframe::egui;
@@ -5197,7 +5044,7 @@ mod tests {
             anchor_prefix: String::new(),
             anchor_suffix: String::new(),
         };
-        let mut thought = CommentDialog {
+        let mut thought = excerpt_thought_feature::CommentDialog {
             quote,
             target: ExcerptTarget::Existing(3),
             draft: "current thought".into(),
@@ -5206,7 +5053,7 @@ mod tests {
             focus_input: false,
         };
         assert!(!ModalState::WriteThought(thought.clone()).is_dirty());
-        thought = CommentDialog {
+        thought = excerpt_thought_feature::CommentDialog {
             draft: "edited thought".into(),
             ..thought
         };

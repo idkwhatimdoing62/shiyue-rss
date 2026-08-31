@@ -25,8 +25,12 @@ Introduce `Excerpt & Thought Lifecycle` as the only production interface for cre
 - A successful change, Library Search visibility, counts, and the requested projection commit in one short SQLite transaction guarded by the existing writer permit. There is no queue, background task, or automatic retry.
 - CRLF and bare CR are normalized to LF. New Excerpts are limited to 256 KiB and Thoughts to 64 KiB. Blank Thoughts and invalid anchors are rejected. Existing oversized legacy data is preserved.
 - Exact no-ops return `Unchanged`, do not update `updated_at`, and do not move the Excerpt in collection order. A missing explicit target is `NotFound`; removing an already absent Thought is `Unchanged`.
-- Desktop Interaction owns text-selection gestures, Popovers, Modals, Notices, and delete confirmation. The GUI renders the returned projection and does not call the old selection persistence helpers. Deleting an Excerpt with a Thought requires confirmation; editing or deleting only the Thought is separate.
+- Desktop Interaction owns text-selection gestures, Popovers, the Modal host/reducer, and Notices. Private feature adapters own feature-specific Modal drafts and rendering while the GUI root hosts their returned intents. The GUI renders the returned projection and does not call the old selection persistence helpers. Deleting an Excerpt with a Thought requires confirmation; editing or deleting only the Thought is separate.
 - This work does not add CLI commands. Future adapters must use the same lifecycle interface.
+
+## Implementation record
+
+The Desktop Excerpt & Thought feature adapter was extracted on 2026-08-31. `src/gui/excerpt_thought_feature.rs` now owns the Comment and Delete Excerpt drafts, modal rendering, lifecycle invocation, validation, and user-facing error mapping. `GuiApp` retains text selection, Popovers, Route/Modal reducer, projection adoption, navigation, and Notices. Delete confirmation still closes the Modal before executing the lifecycle change; lifecycle, no-op, failure, and projection semantics are unchanged.
 
 ## Module seam and ownership
 
