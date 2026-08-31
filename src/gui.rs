@@ -6,6 +6,7 @@
 
 mod excerpt_thought_feature;
 mod feed_subscription_feature;
+mod library_search_feature;
 mod resource_feature;
 mod web_clipping_feature;
 
@@ -15,7 +16,6 @@ use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut, Range};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
 
 use crate::article_document_presentation::{
@@ -51,15 +51,12 @@ use crate::knowledge_workflow::{
     ConnectionState, KnowledgeEngine, KnowledgeNotice, TaskKey, TaskKind as KnowledgeTaskKind,
     TaskSnapshot, TaskStatus as KnowledgeTaskStatus,
 };
-use crate::library_search::{
-    LibrarySearch, LibrarySearchResult, PrimaryIdentity, ResultType, SearchOrigin, SearchOutcome,
-    SearchRequest, SearchScope,
-};
+use crate::library_search::{LibrarySearchResult, PrimaryIdentity};
 use crate::local_data_maintenance::{
     MaintenanceEngine, MaintenanceNotice, MaintenanceParticipant, MaintenanceRequest,
     MaintenanceSnapshot, MaintenanceStage, MaintenanceStatus,
 };
-use crate::model::{Article, ArticleSelection, Feed, SearchHistoryEntry, TextAnchor};
+use crate::model::{Article, ArticleSelection, Feed, TextAnchor};
 use crate::rss_refresh_workflow::{
     RefreshNotice, RefreshRunStatus, RefreshWorkflowStatus, RssRefreshWorkflow, RunId,
 };
@@ -106,15 +103,8 @@ pub(crate) struct GuiApp {
     /// 跨标题、正文、列表和图片的文章级拖选状态。
     web_clipping_lifecycle: WebClippingLifecycle,
     consumed_web_clipping_terminal: Option<(CaptureId, u64)>,
-    search_event_tx: std_mpsc::Sender<SearchEvent>,
-    search_event_rx: std_mpsc::Receiver<SearchEvent>,
-    search_request_generation: u64,
-    resource_query: String,
+    search_feature: library_search_feature::SearchFeature,
     resource_filter: ResourceFilter,
-    resource_search_results: Vec<LibrarySearchResult>,
-    resource_searching: bool,
-    resource_search_request: Option<u64>,
-    resource_search_error: Option<String>,
     ai_api_key_draft: String,
     ai_settings_message: Option<String>,
     desktop_projection: DesktopLibraryProjection,
@@ -201,34 +191,6 @@ struct ArticleRouteMemory {
     body_scroll: f32,
 }
 
-#[derive(Debug, Default)]
-struct SearchDialog {
-    query: String,
-    searched_query: String,
-    results: Vec<LibrarySearchResult>,
-    error: Option<String>,
-    focus_input: bool,
-    history: Vec<SearchHistoryEntry>,
-    searching: bool,
-    active_request: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SearchTarget {
-    Modal,
-    ResourceRoute,
-}
-
-struct SearchEvent {
-    request_id: u64,
-    target: SearchTarget,
-    result: Result<SearchOutcome, String>,
-}
-
-fn accepts_search_response(active_request: Option<u64>, incoming_request: u64) -> bool {
-    active_request == Some(incoming_request)
-}
-
 #[derive(Debug, Clone)]
 struct TagDialog {
     article_id: i64,
@@ -266,7 +228,7 @@ impl SelectedQuote {
 enum ModalState {
     AddFeed(feed_subscription_feature::AddDraft),
     DeleteFeed(feed_subscription_feature::DeleteDraft),
-    Search(SearchDialog),
+    Search(library_search_feature::SearchDialog),
     EditTags(TagDialog),
     WriteThought(excerpt_thought_feature::CommentDialog),
     DeleteExcerpt(excerpt_thought_feature::DeleteExcerptDialog),
@@ -313,14 +275,6 @@ impl ModalPayload for ModalState {
             | Self::DeleteResource(_)
             | Self::RestoreBackup(_)
             | Self::ClearImages => false,
-        }
-    }
-
-    #[cfg(test)]
-    fn active_request_id(&self) -> Option<u64> {
-        match self {
-            Self::Search(dialog) => dialog.active_request,
-            _ => None,
         }
     }
 }
@@ -559,15 +513,8 @@ impl GuiApp {
         self.selection_popup_geometry = None;
     }
 
-    fn search_dialog(&self) -> Option<&SearchDialog> {
+    fn search_dialog(&self) -> Option<&library_search_feature::SearchDialog> {
         match self.ui_state.modal() {
-            Some(ModalState::Search(dialog)) => Some(dialog),
-            _ => None,
-        }
-    }
-
-    fn search_dialog_mut(&mut self) -> Option<&mut SearchDialog> {
-        match self.ui_state.modal_mut() {
             Some(ModalState::Search(dialog)) => Some(dialog),
             _ => None,
         }
@@ -624,7 +571,6 @@ impl GuiApp {
                 repaint.request_repaint()
             })?;
 
-        let (search_event_tx, search_event_rx) = std_mpsc::channel();
         let image_store = Arc::new(ImageStore::open(&paths.image_cache_dir)?);
         let _ = image_store.prune_to(DEFAULT_LIMIT_BYTES);
         let web_clipping_lifecycle = WebClippingLifecycle::start(paths.db_file.clone());
@@ -672,15 +618,8 @@ impl GuiApp {
             selection_popup_generation: 0,
             web_clipping_lifecycle,
             consumed_web_clipping_terminal: None,
-            search_event_tx,
-            search_event_rx,
-            search_request_generation: 0,
-            resource_query: String::new(),
+            search_feature: library_search_feature::SearchFeature::new(),
             resource_filter: ResourceFilter::Active,
-            resource_search_results: Vec::new(),
-            resource_searching: false,
-            resource_search_request: None,
-            resource_search_error: None,
             ai_api_key_draft: String::new(),
             ai_settings_message: None,
             desktop_projection,
@@ -1380,130 +1319,27 @@ impl GuiApp {
     }
 
     fn open_search(&mut self) {
-        let history = LibrarySearch::new(&self.db).history(12).unwrap_or_default();
         if self.search_dialog().is_none() {
-            self.open_modal(ModalState::Search(SearchDialog::default()));
+            self.open_modal(ModalState::Search(self.search_feature.new_dialog(&self.db)));
         }
-        let Some(dialog) = self.search_dialog_mut() else {
+        let db = &self.db;
+        let Some(dialog) = (match self.ui_state.modal_mut() {
+            Some(ModalState::Search(dialog)) => Some(dialog),
+            _ => None,
+        }) else {
             return;
         };
-        dialog.focus_input = true;
-        dialog.history = history;
+        library_search_feature::prepare_dialog(dialog, db);
         self.clear_selection_popover();
     }
 
-    fn run_search(&mut self, ctx: &egui::Context) {
-        let Some(dialog) = self.search_dialog() else {
-            return;
-        };
-        let query = dialog.query.trim().to_owned();
-        if query.is_empty() {
-            if let Some(dialog) = self.search_dialog_mut() {
-                dialog.searched_query.clear();
-                dialog.error = None;
-                dialog.results.clear();
-                dialog.searching = false;
-                dialog.active_request = None;
-            }
-            return;
-        }
-        let request_id = self.start_search_job(
-            SearchRequest {
-                query: query.clone(),
-                scope: SearchScope::Curated,
-                result_type: ResultType::All,
-                origin: SearchOrigin::Human,
-                limit: 50,
-            },
-            SearchTarget::Modal,
-            ctx,
-        );
-        if let Some(dialog) = self.search_dialog_mut() {
-            dialog.searched_query = query;
-            dialog.error = None;
-            dialog.results.clear();
-            dialog.searching = true;
-            dialog.active_request = Some(request_id);
-        }
-    }
-
-    fn start_search_job(
-        &mut self,
-        request: SearchRequest,
-        target: SearchTarget,
-        ctx: &egui::Context,
-    ) -> u64 {
-        self.search_request_generation = self.search_request_generation.wrapping_add(1);
-        let request_id = self.search_request_generation;
-        let db_path = self.db_path.clone();
-        let event_tx = self.search_event_tx.clone();
-        let repaint = ctx.clone();
-        std::thread::spawn(move || {
-            let result = Db::open(&db_path)
-                .map_err(|error| format!("无法打开资料库：{error}"))
-                .and_then(|db| {
-                    LibrarySearch::new(&db).search(request).map_err(|failure| {
-                        format!("{}（{}）", failure.user_message, failure.technical_detail)
-                    })
-                });
-            let _ = event_tx.send(SearchEvent {
-                request_id,
-                target,
-                result,
-            });
-            repaint.request_repaint();
-        });
-        request_id
-    }
-
     fn receive_search_events(&mut self, _ctx: &egui::Context) {
-        while let Ok(event) = self.search_event_rx.try_recv() {
-            match event.target {
-                SearchTarget::Modal => {
-                    let mut warning = false;
-                    let refreshed_history = event
-                        .result
-                        .as_ref()
-                        .ok()
-                        .map(|_| LibrarySearch::new(&self.db).history(12).unwrap_or_default());
-                    if let Some(dialog) = self.search_dialog_mut()
-                        && accepts_search_response(dialog.active_request, event.request_id)
-                    {
-                        dialog.searching = false;
-                        dialog.active_request = None;
-                        match event.result {
-                            Ok(outcome) => {
-                                warning = !outcome.warnings.is_empty();
-                                dialog.results = outcome.results;
-                                dialog.history = refreshed_history.unwrap_or_default();
-                            }
-                            Err(error) => {
-                                dialog.results.clear();
-                                dialog.error = Some(error);
-                            }
-                        }
-                    }
-                    if warning {
-                        self.notice("搜索完成，但搜索历史没有保存");
-                    }
-                }
-                SearchTarget::ResourceRoute => {
-                    if accepts_search_response(self.resource_search_request, event.request_id) {
-                        self.resource_searching = false;
-                        self.resource_search_request = None;
-                        match event.result {
-                            Ok(outcome) => {
-                                self.resource_search_results = outcome.results;
-                                self.resource_search_error = None;
-                            }
-                            Err(error) => {
-                                self.resource_search_results.clear();
-                                self.resource_search_error = Some(error);
-                            }
-                        }
-                    }
-                }
-            }
+        let dialog = match self.ui_state.modal_mut() {
+            Some(ModalState::Search(dialog)) => Some(dialog),
+            _ => None,
+        };
+        for notice in self.search_feature.receive_events(&self.db, dialog) {
+            self.notice(notice);
         }
     }
 
@@ -2261,8 +2097,7 @@ impl GuiApp {
         }
         let ctx = root_ui.ctx().clone();
         use crate::resource_library_lifecycle::{
-            ResourceCollection, ResourceCurationState, ResourceHealth, ResourceLibraryLifecycle,
-            ResourcePrivacy, SystemClock,
+            ResourceCollection, ResourceCurationState, ResourceHealth, ResourcePrivacy, SystemClock,
         };
         let collection = match self.resource_filter {
             ResourceFilter::Active => ResourceCollection::Active,
@@ -2346,29 +2181,14 @@ impl GuiApp {
                         }
                     }
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.resource_query)
+                        egui::TextEdit::singleline(self.search_feature.resource_query_mut())
                             .hint_text("搜索标题、URL、用途或备注")
                             .desired_width(280.0),
                     );
                     if ui.button("搜索资源和文章").clicked() {
-                        let query = self.resource_query.trim().to_owned();
-                        if !query.is_empty() {
-                            let request_id = self.start_search_job(
-                                SearchRequest {
-                                    query,
-                                    scope: SearchScope::Curated,
-                                    result_type: ResultType::All,
-                                    origin: SearchOrigin::Human,
-                                    limit: 50,
-                                },
-                                SearchTarget::ResourceRoute,
-                                ui.ctx(),
-                            );
-                            self.resource_search_results.clear();
-                            self.resource_search_error = None;
-                            self.resource_searching = true;
-                            self.resource_search_request = Some(request_id);
-                        }
+                        let query = self.search_feature.resource_query().trim().to_owned();
+                        self.search_feature
+                            .start_resource_search(query, ui.ctx(), &self.db_path);
                     }
                 });
                 ui.horizontal_wrapped(|ui| {
@@ -2395,7 +2215,7 @@ impl GuiApp {
                         }
                     }
                 });
-                if let Some(error) = &self.resource_search_error {
+                if let Some(error) = self.search_feature.resource_error() {
                     ui.colored_label(egui::Color32::RED, format!("搜索失败：{error}"));
                 }
                 if let Some(error) = &projection_error {
@@ -2411,8 +2231,8 @@ impl GuiApp {
                         ui.weak("正在读取资源…");
                     });
                 }
-                if !self.resource_query.trim().is_empty() {
-                    if self.resource_searching {
+                if !self.search_feature.resource_query().trim().is_empty() {
+                    if self.search_feature.resource_searching() {
                         ui.horizontal(|ui| {
                             ui.add(egui::Spinner::new());
                             ui.label("正在搜索资料库…");
@@ -2420,9 +2240,9 @@ impl GuiApp {
                     }
                     ui.weak(format!(
                         "与 CLI 相同的统一搜索结果：{} 条",
-                        self.resource_search_results.len()
+                        self.search_feature.resource_results().len()
                     ));
-                    for result in &self.resource_search_results {
+                    for result in self.search_feature.resource_results() {
                         let kind = match result.primary {
                             PrimaryIdentity::Resource(_) => "网站资源",
                             PrimaryIdentity::Article(_) => "收藏文章",
@@ -2577,21 +2397,14 @@ impl GuiApp {
                 self.apply_ui_effects(effects);
             }
             Some(Action::Transition(id, status)) => {
-                match ResourceLibraryLifecycle::new(&self.db, &self.knowledge_engine, &SystemClock)
-                    .apply(
-                    crate::resource_library_lifecycle::ResourceLifecycleChange::SetCurationState {
-                        resource_id: id,
-                        target: status,
-                    },
-                    crate::resource_library_lifecycle::ProjectionScope::collection(collection),
-                ) {
-                    Ok(outcome) => {
-                        self.desktop_projection
-                            .accept(DesktopProjectionFact::adopt_resource(outcome.projection));
-                        self.notice("资源状态已更新");
-                    }
-                    Err(e) => self.notice(format!("操作失败：{e}")),
-                }
+                let dependencies = resource_feature::Dependencies {
+                    db: &self.db,
+                    processing_handoff: &self.knowledge_engine,
+                    clock: &SystemClock,
+                };
+                let outcome =
+                    resource_feature::transition_curation(id, status, collection, &dependencies);
+                self.apply_resource_feature_outcome(outcome, &ctx);
             }
             Some(Action::Delete(id, title)) => {
                 self.open_modal(ModalState::DeleteResource(
@@ -3100,262 +2913,21 @@ impl GuiApp {
     }
 
     fn show_search_window(&mut self, ctx: &egui::Context) {
-        if self.ui_state.modal_kind() != Some(ModalKind::Search) {
-            return;
-        }
-        let Some(dialog) = self.search_dialog_mut() else {
+        let db_path = self.db_path.clone();
+        let db = &self.db;
+        let search_feature = &mut self.search_feature;
+        let Some(dialog) = (match self.ui_state.modal_mut() {
+            Some(ModalState::Search(dialog)) => Some(dialog),
+            _ => None,
+        }) else {
             return;
         };
-        let theme = ReaderTheme::sspai();
-        let mut submit = false;
-        let mut selected_hit = None;
-        let mut clear_history = false;
-
-        let response = gui_modal::show(ctx, ModalKind::Search, false, |ui, focus| {
-            ui.horizontal(|ui| {
-                let input = ui.add_sized(
-                    egui::vec2((ui.available_width() - 76.0).max(180.0), 34.0),
-                    egui::TextEdit::singleline(&mut dialog.query)
-                        .hint_text("搜索文章、网页快照、摘录和想法…")
-                        .font(egui::TextStyle::Body),
-                );
-                if dialog.focus_input && focus == InitialFocus::PrimaryField {
-                    input.request_focus();
-                    dialog.focus_input = false;
-                }
-                if input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    submit = true;
-                }
-                if ui
-                    .add_sized(
-                        egui::vec2(68.0, 34.0),
-                        egui::Button::new(egui::RichText::new("搜索").size(15.0).color(theme.text))
-                            .fill(theme.selected_bg)
-                            .stroke(egui::Stroke::new(1.0, theme.border)),
-                    )
-                    .clicked()
-                {
-                    submit = true;
-                }
-            });
-            ui.add_space(7.0);
-            ui.label(
-                egui::RichText::new(
-                    "支持标题、作者、正文、网址、摘录原文和想法内容；最多显示 200 条。",
-                )
-                .size(13.0)
-                .color(theme.muted),
-            );
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(6.0);
-
-            if let Some(error) = &dialog.error {
-                ui.colored_label(ui.visuals().error_fg_color, error);
-                return;
-            }
-            if dialog.searching {
-                ui.horizontal(|ui| {
-                    ui.add(egui::Spinner::new());
-                    ui.label("正在搜索资料库…");
-                });
-                return;
-            }
-            if dialog.searched_query.is_empty() {
-                if !dialog.history.is_empty() {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new("最近搜索")
-                                .size(15.0)
-                                .color(theme.text)
-                                .family(egui::FontFamily::Name("cjk-bold".into())),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        egui::RichText::new("清空").size(13.0).color(theme.muted),
-                                    )
-                                    .stroke(egui::Stroke::NONE),
-                                )
-                                .clicked()
-                            {
-                                clear_history = true;
-                            }
-                        });
-                    });
-                    ui.add_space(5.0);
-                    let history = dialog.history.clone();
-                    ui.horizontal_wrapped(|ui| {
-                        for entry in history {
-                            if ui
-                                .add(
-                                    egui::Button::new(format!(
-                                        "{}  · {}",
-                                        entry.query, entry.result_count
-                                    ))
-                                    .fill(theme.code_bg)
-                                    .stroke(egui::Stroke::new(1.0, theme.border)),
-                                )
-                                .clicked()
-                            {
-                                dialog.query = entry.query;
-                                submit = true;
-                            }
-                        }
-                    });
-                    ui.add_space(18.0);
-                }
-                ui.vertical_centered(|ui| {
-                    ui.add_space(55.0);
-                    ui.label(
-                        egui::RichText::new("在一个入口里找回所有阅读资料")
-                            .size(20.0)
-                            .color(theme.text)
-                            .family(egui::FontFamily::Name("cjk-bold".into())),
-                    );
-                    ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new("快捷键 Ctrl + F")
-                            .size(15.0)
-                            .color(theme.muted),
-                    );
-                });
-                return;
-            }
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(format!("找到 {} 条结果", dialog.results.len()))
-                        .size(15.0)
-                        .color(theme.text)
-                        .family(egui::FontFamily::Name("cjk-bold".into())),
-                );
-                ui.label(
-                    egui::RichText::new(format!("“{}”", dialog.searched_query))
-                        .size(13.0)
-                        .color(theme.muted),
-                );
-            });
-            ui.add_space(6.0);
-            if dialog.results.is_empty() {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(75.0);
-                    ui.label(egui::RichText::new("没有匹配内容").size(16.0));
-                    ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new("换一个更短或更常见的关键词试试。")
-                            .size(13.0)
-                            .color(theme.muted),
-                    );
-                });
-                return;
-            }
-
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    for hit in &dialog.results {
-                        let (kind, kind_color) = match hit.primary {
-                            PrimaryIdentity::Resource(_) => ("资源", theme.accent),
-                            PrimaryIdentity::Article(_) => ("文章", theme.link),
-                        };
-                        let response = egui::Frame::new()
-                            .fill(theme.code_bg)
-                            .stroke(egui::Stroke::new(1.0, theme.border))
-                            .corner_radius(egui::CornerRadius::same(7))
-                            .inner_margin(egui::Margin::symmetric(14, 11))
-                            .show(ui, |ui| {
-                                ui.set_width(ui.available_width());
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new(kind)
-                                            .size(13.0)
-                                            .color(kind_color)
-                                            .background_color(theme.selected_bg),
-                                    );
-                                    if hit.archived {
-                                        ui.label(
-                                            egui::RichText::new("已归档")
-                                                .size(13.0)
-                                                .color(theme.muted),
-                                        );
-                                    }
-                                    ui.label(
-                                        egui::RichText::new(format_timestamp(hit.updated_at))
-                                            .size(13.0)
-                                            .color(theme.muted),
-                                    );
-                                });
-                                ui.add_space(5.0);
-                                let title = hit
-                                    .title
-                                    .as_deref()
-                                    .filter(|title| !title.trim().is_empty())
-                                    .unwrap_or("未命名资料");
-                                ui.add(
-                                    egui::Label::new(search_highlight_layout_job(
-                                        title,
-                                        &dialog.searched_query,
-                                        15.0,
-                                        theme.text,
-                                        egui::FontFamily::Name("cjk-bold".into()),
-                                        theme,
-                                    ))
-                                    .wrap(),
-                                );
-                                ui.add_space(5.0);
-                                let preview = hit
-                                    .evidence
-                                    .first()
-                                    .map(|evidence| {
-                                        search_preview(&evidence.text, &dialog.searched_query, 180)
-                                    })
-                                    .unwrap_or_default();
-                                ui.add(
-                                    egui::Label::new(search_highlight_layout_job(
-                                        &preview,
-                                        &dialog.searched_query,
-                                        13.0,
-                                        theme.muted,
-                                        egui::FontFamily::Proportional,
-                                        theme,
-                                    ))
-                                    .wrap(),
-                                );
-                            })
-                            .response
-                            .interact(egui::Sense::click());
-                        if response.hovered() {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                            ui.painter().rect_stroke(
-                                response.rect,
-                                egui::CornerRadius::same(7),
-                                egui::Stroke::new(1.0, theme.accent),
-                                egui::StrokeKind::Inside,
-                            );
-                        }
-                        if response.clicked() {
-                            selected_hit = Some(hit.clone());
-                        }
-                        ui.add_space(9.0);
-                    }
-                });
-        });
-
-        self.apply_modal_host_action(response.action);
-
-        if clear_history {
-            if let Err(error) = LibrarySearch::new(&self.db).clear_history() {
-                self.notice(format!("清空搜索历史失败：{error}"));
-            }
-            if let Some(dialog) = self.search_dialog_mut() {
-                dialog.history.clear();
-            }
+        let outcome = search_feature.show_modal(ctx, dialog, db, &db_path);
+        self.apply_modal_host_action(outcome.modal_action);
+        for notice in outcome.notices {
+            self.notice(notice);
         }
-
-        if submit {
-            self.run_search(ctx);
-        } else if let Some(hit) = selected_hit {
+        if let Some(hit) = outcome.selected_hit {
             self.open_search_result(&hit);
         }
     }
@@ -4909,9 +4481,9 @@ fn resource_card<R>(
 mod tests {
     use super::excerpt_thought_feature;
     use super::{
-        ModalPayload, ModalState, PanelState, SelectedQuote, TagDialog, accepts_search_response,
-        feed_subscription_feature, projection_scope_for_route, reconcile_article_selection,
-        resource_card, search_match_ranges, search_preview, web_clipping_feature,
+        ModalPayload, ModalState, PanelState, SelectedQuote, TagDialog, feed_subscription_feature,
+        projection_scope_for_route, reconcile_article_selection, resource_card,
+        search_match_ranges, search_preview, web_clipping_feature,
     };
     use crate::article_library_lifecycle::ProjectionScope;
     use crate::excerpt_thought_lifecycle::ExcerptTarget;
@@ -5115,12 +4687,5 @@ mod tests {
         assert_eq!(multiple.len(), 4);
         assert!(search_match_ranges(text, "不存在").is_empty());
         assert!(search_match_ranges(text, "   ").is_empty());
-    }
-
-    #[test]
-    fn search_adapters_reject_late_background_results() {
-        assert!(accepts_search_response(Some(9), 9));
-        assert!(!accepts_search_response(Some(10), 9));
-        assert!(!accepts_search_response(None, 9));
     }
 }

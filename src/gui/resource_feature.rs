@@ -16,9 +16,9 @@ use crate::knowledge_workflow::{
 };
 use crate::resource_library_lifecycle::{
     Clock, CompleteManualEdit, CreateResource, FailureKind, ImportCandidate, LifecycleFailure,
-    ProcessingHandoff, ProjectionScope, Resource, ResourceCollection, ResourceDetail, ResourceKind,
-    ResourceLibraryLifecycle, ResourceLibraryProjection, ResourceLifecycleChange, ResourcePrivacy,
-    ResourceSource,
+    ProcessingHandoff, ProjectionScope, Resource, ResourceCollection, ResourceCurationState,
+    ResourceDetail, ResourceKind, ResourceLibraryLifecycle, ResourceLibraryProjection,
+    ResourceLifecycleChange, ResourcePrivacy, ResourceSource,
 };
 
 pub(super) struct Dependencies<'a> {
@@ -339,6 +339,26 @@ pub(super) fn show_panel(
         outcome.retry_resource_id = Some(resource_id);
     }
     outcome
+}
+
+pub(super) fn transition_curation(
+    resource_id: i64,
+    target: ResourceCurationState,
+    collection: ResourceCollection,
+    dependencies: &Dependencies<'_>,
+) -> Outcome {
+    match lifecycle(dependencies).apply(
+        ResourceLifecycleChange::SetCurationState {
+            resource_id,
+            target,
+        },
+        ProjectionScope::collection(collection),
+    ) {
+        Ok(result) => {
+            Outcome::lifecycle_success(InteractionIntent::None, result.projection, "资源状态已更新")
+        }
+        Err(error) => Outcome::notice(format!("操作失败：{error}")),
+    }
 }
 
 fn lifecycle<'a>(dependencies: &'a Dependencies<'a>) -> ResourceLibraryLifecycle<'a, 'a> {
@@ -891,15 +911,14 @@ mod tests {
         let (projection, count) = import_resources(&import, &dependencies).unwrap();
         assert_eq!(count, 1);
         let resource_id = projection.resources[0].id;
-        lifecycle(&dependencies)
-            .apply(
-                ResourceLifecycleChange::SetCurationState {
-                    resource_id,
-                    target: ResourceCurationState::Archived,
-                },
-                ProjectionScope::collection(ResourceCollection::Archived),
-            )
-            .unwrap();
+        let transitioned = transition_curation(
+            resource_id,
+            ResourceCurationState::Archived,
+            ResourceCollection::Archived,
+            &dependencies,
+        );
+        assert!(transitioned.projection.is_some());
+        assert_eq!(transitioned.notice.as_deref(), Some("资源状态已更新"));
 
         let deleted = delete_resource(resource_id, &dependencies).unwrap();
         assert!(deleted.resources.is_empty());
@@ -914,6 +933,7 @@ mod tests {
             "ResourceLifecycleChange::CompleteManualEdit",
             "ResourceLifecycleChange::ImportWebClippings",
             "ResourceLifecycleChange::Delete {",
+            "ResourceLifecycleChange::SetCurationState",
         ] {
             assert!(
                 !gui_root.contains(delegated_change),

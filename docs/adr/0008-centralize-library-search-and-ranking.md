@@ -53,6 +53,10 @@ The trade-off is deliberate SQLite coupling inside one deep module and a version
 
 Search History insert/update and clear operations now use the same fenced transaction as every other local-library mutation. A search may still return valid results while maintenance intent is active, but its non-critical history write becomes an explicit `HistoryNotRecorded` warning; clearing history returns a typed Maintenance failure. This closes the remaining mutation path that could bypass ADR-0003's maintenance authority.
 
+## Implementation record (2026-08-31)
+
+The private Desktop Library Search adapter was extracted to `src/gui/library_search_feature.rs`. It owns the Search Modal draft and rendering, resource-route query state, background search requests, request generations, late-result rejection, history refresh/clear handling, and presentation of non-fatal history warnings. `GuiApp` retains only Route navigation and result-opening behavior, while the adapter returns selected-result and Notice intents. The synchronous local Library Search interface, search corpus, ranking, CLI contract, and ADR-0002 request invalidation semantics are unchanged.
+
 ## Rejected alternatives
 
 - Keep separate Resource and Article search paths: preserves less refactoring, but keeps contradictory eligibility, ranking, and JSON behavior.

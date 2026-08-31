@@ -64,6 +64,10 @@ GUI and CLI now share one definition of Resource collections, transitions, impor
 
 The cost is an explicit projection read inside each write transaction. The module intentionally keeps SQLite concrete; real-database tests cover constraints, rollback, task races, migration, and cursor behavior instead of introducing a repository abstraction or cache. Search-index consistency is verified by ADR-0008.
 
+## Implementation record (2026-08-31)
+
+The Resource Collection curation adapter was completed in `src/gui/resource_feature.rs`. It owns the GUI transition intent for Pending Review, Active, and Archived Resources, invokes `SetCurationState`, and returns the authoritative projection and user-facing outcome. The GUI root retains collection rendering, filtering, pagination, navigation, and task retry presentation; it no longer calls the Resource lifecycle directly for curation transitions. This preserves the single lifecycle seam and the existing transaction, handoff, and Notice semantics.
+
 ## Rejected alternatives
 
 - Keep the broad `ResourceService`: convenient for callers, but exposes storage-shaped operations and lets them assemble invalid workflows.
