@@ -14,20 +14,15 @@ pub(crate) enum ArticleCollection {
     SearchResult(i64),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub(crate) enum Route {
+    #[default]
     Dashboard,
     Articles(ArticleCollection),
     Resources,
     Excerpts,
     Archive,
     Storage,
-}
-
-impl Default for Route {
-    fn default() -> Self {
-        Self::Articles(ArticleCollection::Feed(None))
-    }
 }
 
 impl Route {
@@ -62,7 +57,7 @@ impl Route {
     pub(crate) fn from_stable_key(value: &str) -> Option<Self> {
         match value {
             "dashboard" => Some(Self::Dashboard),
-            "articles" => Some(Self::default()),
+            "articles" => Some(Self::Articles(ArticleCollection::Feed(None))),
             "articles:saved" => Some(Self::Articles(ArticleCollection::Saved)),
             "articles:read-later" => Some(Self::Articles(ArticleCollection::ReadLater)),
             "resources" => Some(Self::Resources),
@@ -618,10 +613,7 @@ mod tests {
         let transient = Route::Articles(ArticleCollection::SearchResult(9));
         assert_eq!(transient.stable_key(), None);
         assert_eq!(Route::Dashboard.stable_key().as_deref(), Some("dashboard"));
-        assert_eq!(
-            Route::from_stable_key("dashboard"),
-            Some(Route::Dashboard)
-        );
+        assert_eq!(Route::from_stable_key("dashboard"), Some(Route::Dashboard));
         let route = Route::from_stable_key("articles:feed:42").unwrap();
         assert_eq!(route, Route::Articles(ArticleCollection::Feed(Some(42))));
     }
@@ -630,7 +622,7 @@ mod tests {
     fn every_modal_kind_has_an_explicit_route_compatibility_policy() {
         let routes = [
             Route::Dashboard,
-            Route::default(),
+            Route::Articles(ArticleCollection::Feed(None)),
             Route::Resources,
             Route::Excerpts,
             Route::Archive,
@@ -640,12 +632,30 @@ mod tests {
             (ModalKind::AddFeed, [true, true, true, true, true, true]),
             (ModalKind::DeleteFeed, [true, true, true, true, true, true]),
             (ModalKind::Search, [true, true, true, true, true, true]),
-            (ModalKind::EditTags, [false, true, false, false, false, false]),
-            (ModalKind::WriteThought, [false, true, false, true, false, false]),
-            (ModalKind::DeleteExcerpt, [false, true, false, true, false, false]),
-            (ModalKind::SaveWebPage, [false, true, false, false, false, false]),
-            (ModalKind::DeleteWebPage, [false, true, false, false, false, false]),
-            (ModalKind::AddResource, [false, false, true, false, false, false]),
+            (
+                ModalKind::EditTags,
+                [false, true, false, false, false, false],
+            ),
+            (
+                ModalKind::WriteThought,
+                [false, true, false, true, false, false],
+            ),
+            (
+                ModalKind::DeleteExcerpt,
+                [false, true, false, true, false, false],
+            ),
+            (
+                ModalKind::SaveWebPage,
+                [false, true, false, false, false, false],
+            ),
+            (
+                ModalKind::DeleteWebPage,
+                [false, true, false, false, false, false],
+            ),
+            (
+                ModalKind::AddResource,
+                [false, false, true, false, false, false],
+            ),
             (
                 ModalKind::DeleteResource,
                 [false, false, true, false, false, false],
@@ -654,8 +664,14 @@ mod tests {
                 ModalKind::ImportResources,
                 [false, false, true, false, false, false],
             ),
-            (ModalKind::RestoreBackup, [false, false, false, false, false, true]),
-            (ModalKind::ClearImages, [false, false, false, false, false, true]),
+            (
+                ModalKind::RestoreBackup,
+                [false, false, false, false, false, true],
+            ),
+            (
+                ModalKind::ClearImages,
+                [false, false, false, false, false, true],
+            ),
         ];
         for (kind, expected) in cases {
             for (route, expected) in routes.into_iter().zip(expected) {
@@ -667,6 +683,9 @@ mod tests {
     #[test]
     fn only_the_current_request_can_change_a_modal() {
         let mut state = State::default();
+        state.reduce(UiAction::Navigate(Route::Articles(
+            ArticleCollection::Feed(None),
+        )));
         state.reduce(UiAction::OpenModal(TestModal {
             kind: ModalKind::SaveWebPage,
             dirty: true,
@@ -681,6 +700,9 @@ mod tests {
     #[test]
     fn discarding_an_async_modal_invalidates_late_results() {
         let mut state = State::default();
+        state.reduce(UiAction::Navigate(Route::Articles(
+            ArticleCollection::Feed(None),
+        )));
         state.reduce(UiAction::OpenModal(TestModal {
             kind: ModalKind::SaveWebPage,
             dirty: true,
