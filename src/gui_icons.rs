@@ -7,6 +7,7 @@ use eframe::egui;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RemixIcon {
+    Dashboard,
     Search,
     Star,
     Resources,
@@ -23,6 +24,9 @@ pub(crate) enum RemixIcon {
 impl RemixIcon {
     fn source(self, filled: bool) -> egui::ImageSource<'static> {
         match (self, filled) {
+            (Self::Dashboard, _) => {
+                egui::include_image!("../assets/remixicon/dashboard-3-line.svg")
+            }
             (Self::Search, _) => egui::include_image!("../assets/remixicon/search-line.svg"),
             (Self::Star, false) => egui::include_image!("../assets/remixicon/star-line.svg"),
             (Self::Star, true) => egui::include_image!("../assets/remixicon/star-fill.svg"),

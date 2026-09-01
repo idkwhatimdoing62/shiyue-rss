@@ -16,6 +16,7 @@ pub(crate) enum ArticleCollection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Route {
+    Dashboard,
     Articles(ArticleCollection),
     Resources,
     Excerpts,
@@ -43,6 +44,7 @@ impl Route {
 
     pub(crate) fn stable_key(self) -> Option<String> {
         match self {
+            Self::Dashboard => Some("dashboard".to_owned()),
             Self::Articles(ArticleCollection::Feed(Some(feed_id))) => {
                 Some(format!("articles:feed:{feed_id}"))
             }
@@ -59,6 +61,7 @@ impl Route {
 
     pub(crate) fn from_stable_key(value: &str) -> Option<Self> {
         match value {
+            "dashboard" => Some(Self::Dashboard),
             "articles" => Some(Self::default()),
             "articles:saved" => Some(Self::Articles(ArticleCollection::Saved)),
             "articles:read-later" => Some(Self::Articles(ArticleCollection::ReadLater)),
@@ -614,6 +617,11 @@ mod tests {
     fn only_stable_routes_have_restore_keys() {
         let transient = Route::Articles(ArticleCollection::SearchResult(9));
         assert_eq!(transient.stable_key(), None);
+        assert_eq!(Route::Dashboard.stable_key().as_deref(), Some("dashboard"));
+        assert_eq!(
+            Route::from_stable_key("dashboard"),
+            Some(Route::Dashboard)
+        );
         let route = Route::from_stable_key("articles:feed:42").unwrap();
         assert_eq!(route, Route::Articles(ArticleCollection::Feed(Some(42))));
     }
@@ -621,6 +629,7 @@ mod tests {
     #[test]
     fn every_modal_kind_has_an_explicit_route_compatibility_policy() {
         let routes = [
+            Route::Dashboard,
             Route::default(),
             Route::Resources,
             Route::Excerpts,
@@ -628,25 +637,25 @@ mod tests {
             Route::Storage,
         ];
         let cases = [
-            (ModalKind::AddFeed, [true, true, true, true, true]),
-            (ModalKind::DeleteFeed, [true, true, true, true, true]),
-            (ModalKind::Search, [true, true, true, true, true]),
-            (ModalKind::EditTags, [true, false, false, false, false]),
-            (ModalKind::WriteThought, [true, false, true, false, false]),
-            (ModalKind::DeleteExcerpt, [true, false, true, false, false]),
-            (ModalKind::SaveWebPage, [true, false, false, false, false]),
-            (ModalKind::DeleteWebPage, [true, false, false, false, false]),
-            (ModalKind::AddResource, [false, true, false, false, false]),
+            (ModalKind::AddFeed, [true, true, true, true, true, true]),
+            (ModalKind::DeleteFeed, [true, true, true, true, true, true]),
+            (ModalKind::Search, [true, true, true, true, true, true]),
+            (ModalKind::EditTags, [false, true, false, false, false, false]),
+            (ModalKind::WriteThought, [false, true, false, true, false, false]),
+            (ModalKind::DeleteExcerpt, [false, true, false, true, false, false]),
+            (ModalKind::SaveWebPage, [false, true, false, false, false, false]),
+            (ModalKind::DeleteWebPage, [false, true, false, false, false, false]),
+            (ModalKind::AddResource, [false, false, true, false, false, false]),
             (
                 ModalKind::DeleteResource,
-                [false, true, false, false, false],
+                [false, false, true, false, false, false],
             ),
             (
                 ModalKind::ImportResources,
-                [false, true, false, false, false],
+                [false, false, true, false, false, false],
             ),
-            (ModalKind::RestoreBackup, [false, false, false, false, true]),
-            (ModalKind::ClearImages, [false, false, false, false, true]),
+            (ModalKind::RestoreBackup, [false, false, false, false, false, true]),
+            (ModalKind::ClearImages, [false, false, false, false, false, true]),
         ];
         for (kind, expected) in cases {
             for (route, expected) in routes.into_iter().zip(expected) {
