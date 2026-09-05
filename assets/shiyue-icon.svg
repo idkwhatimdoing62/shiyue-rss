@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <title>拾阅 Shiyue</title>
+  <rect width="256" height="256" rx="56" fill="#f6efe8"/>
+  <rect x="24" y="24" width="208" height="208" rx="44" fill="#182633"/>
+  <path d="M57 77c0-7.7 6.3-14 14-14h49c12.2 0 23.4 4.8 32 12.6C160.6 67.8 171.8 63 184 63h1c7.7 0 14 6.3 14 14v96c0 7.7-6.3 14-14 14h-1c-12.2 0-23.4 4.8-32 12.6-8.6-7.8-19.8-12.6-32-12.6H71c-7.7 0-14-6.3-14-14V77Z" fill="#fffaf4"/>
+  <path d="M128 76v101" stroke="#182633" stroke-width="7" stroke-linecap="round"/>
+  <path d="M74 92h42M74 111h38M74 130h31M182 92h-25M182 111h-25M182 130h-25" stroke="#a9b3b5" stroke-width="7" stroke-linecap="round"/>
+  <path d="M137 76h25v62l-12.5-10-12.5 10V76Z" fill="#ed6b5d"/>
+  <circle cx="184" cy="164" r="8" fill="#ed6b5d"/>
+</svg>

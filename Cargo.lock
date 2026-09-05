@@ -4342,7 +4342,7 @@ checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 
 [[package]]
 name = "rrss"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "chardetng",
@@ -4373,6 +4373,7 @@ dependencies = [
  "tray-icon",
  "unicode-normalization",
  "windows-sys 0.61.2",
+ "winresource",
 ]
 
 [[package]]
@@ -6297,6 +6298,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0592e1c9d151f854e6fd382574c3a0855250e1d9b2f99d9281c6e6391af352f1"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "winresource"
+version = "0.1.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0986a8b1d586b7d3e4fe3d9ea39fb451ae22869dcea4aa109d287a374d866087"
+dependencies = [
+ "toml 1.1.2+spec-1.1.0",
+ "version_check",
 ]
 
 [[package]]

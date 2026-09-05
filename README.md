@@ -30,7 +30,7 @@
 
 ## 下载
 
-前往 [Releases](https://github.com/idkwhatimdoing62/shiyue-rss/releases) 下载最新的 Windows 便携包。解压后双击 `shiyue.exe` 即可运行；`shiyue-cli.exe` 仅在需要终端管理订阅时使用。
+前往 [Releases](https://github.com/idkwhatimdoing62/shiyue-rss/releases) 下载最新版本。普通用户下载 `setup.exe` 安装即可；需要免安装运行时下载 Windows 便携 ZIP，解压后双击 `shiyue.exe`；`shiyue-cli.exe` 仅在需要终端管理订阅时使用。
 
 > Windows SmartScreen 可能提示“未知发布者”，这是因为当前发行文件尚未购买代码签名证书。可核对 Release 中提供的 SHA-256 后再运行。
 

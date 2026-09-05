@@ -44,15 +44,50 @@ jobs:
           & $signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certificate /p $env:CERTIFICATE_PASSWORD target/release/shiyue.exe
           & $signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certificate /p $env:CERTIFICATE_PASSWORD target/release/shiyue-cli.exe
           Remove-Item -LiteralPath $certificate -Force
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress --yes
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path -LiteralPath $iscc)) { throw "ISCC.exe was not found" }
+          & $iscc "/DMyAppVersion=$version" "installer\shiyue.iss"
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
+      - name: Sign Windows installer
+        if: ${{ env.SIGNING_CERTIFICATE != '' }}
+        shell: pwsh
+        env:
+          CERTIFICATE_BASE64: ${{ env.SIGNING_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $certificate = Join-Path $env:RUNNER_TEMP "shiyue-signing.pfx"
+          [IO.File]::WriteAllBytes($certificate, [Convert]::FromBase64String($env:CERTIFICATE_BASE64))
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+            Where-Object FullName -Match '\\x64\\signtool\.exe$' |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $signtool) { throw "signtool.exe was not found" }
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          $setup = "installer\Output\shiyue-$version-windows-x64-setup.exe"
+          & $signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certificate /p $env:CERTIFICATE_PASSWORD $setup
+          Remove-Item -LiteralPath $certificate -Force
       - name: Package
         shell: pwsh
         run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          $setup = "installer\Output\shiyue-$version-windows-x64-setup.exe"
+          if (-not (Test-Path -LiteralPath $setup)) { throw "Installer was not created: $setup" }
+          Copy-Item $setup -Destination "."
           $package = Join-Path $env:RUNNER_TEMP "shiyue-${env:GITHUB_REF_NAME}-windows-x64"
           New-Item -ItemType Directory -Path $package | Out-Null
-          Copy-Item target/release/shiyue.exe,target/release/shiyue-cli.exe,README.md,LICENSE,THIRD_PARTY_NOTICES.md -Destination $package
+          Copy-Item target/release/shiyue.exe,target/release/shiyue-cli.exe,README.md,LICENSE,THIRD_PARTY_NOTICES.md,$setup -Destination $package
           Compress-Archive -Path "$package\*" -DestinationPath "shiyue-${env:GITHUB_REF_NAME}-windows-x64.zip"
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: shiyue-*-windows-x64.zip
+          files: |
+            shiyue-*-windows-x64.zip
+            shiyue-*-windows-x64-setup.exe
