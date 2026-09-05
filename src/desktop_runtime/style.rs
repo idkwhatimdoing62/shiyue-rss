@@ -11,12 +11,26 @@ const JB_MONO_REGULAR: &[u8] = include_bytes!("../../assets/fonts/JetBrainsMono-
 const JB_MONO_BOLD: &[u8] = include_bytes!("../../assets/fonts/JetBrainsMono-Bold.ttf");
 const LXGW_WENKAI_REGULAR: &[u8] = include_bytes!("../../assets/fonts/LXGWWenKaiLite-Regular.ttf");
 const LXGW_WENKAI_MEDIUM: &[u8] = include_bytes!("../../assets/fonts/LXGWWenKaiLite-Medium.ttf");
+const APP_ICON_PNG: &[u8] = include_bytes!("../../assets/shiyue-icon.png");
+
+fn application_icon() -> egui::IconData {
+    let image = image::load_from_memory(APP_ICON_PNG)
+        .expect("embedded application icon must be a valid PNG")
+        .into_rgba8();
+    let (width, height) = image.dimensions();
+    egui::IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
+    }
+}
 
 pub(super) fn native_options() -> eframe::NativeOptions {
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(WINDOW_TITLE)
             .with_app_id("rrss-reading-optimized")
+            .with_icon(application_icon())
             .with_inner_size([1440.0, 860.0])
             .with_min_inner_size([1120.0, 680.0]),
         ..Default::default()

@@ -1,5 +1,6 @@
 fn main() {
     println!("cargo:rerun-if-changed=assets/shiyue-icon.ico");
+    println!("cargo:rerun-if-changed=assets/shiyue-icon.png");
 
     if std::env::var_os("CARGO_CFG_WINDOWS").is_some() {
         let mut resource = winresource::WindowsResource::new();

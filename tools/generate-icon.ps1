@@ -1,5 +1,6 @@
 param(
-    [string]$Output = (Join-Path $PSScriptRoot '..\assets\shiyue-icon.ico')
+    [string]$Output = (Join-Path $PSScriptRoot '..\assets\shiyue-icon.ico'),
+    [string]$PngOutput = (Join-Path $PSScriptRoot '..\assets\shiyue-icon.png')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -66,3 +67,9 @@ New-Item -ItemType Directory -Force -Path $parent | Out-Null
 $resolvedOutput = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Output)
 [IO.File]::WriteAllBytes($resolvedOutput, $outputBytes.ToArray())
 Write-Output "Generated $Output"
+
+$pngParent = Split-Path -Parent $PngOutput
+New-Item -ItemType Directory -Force -Path $pngParent | Out-Null
+$resolvedPngOutput = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($PngOutput)
+[IO.File]::WriteAllBytes($resolvedPngOutput, [byte[]]$images[0])
+Write-Output "Generated $PngOutput"
