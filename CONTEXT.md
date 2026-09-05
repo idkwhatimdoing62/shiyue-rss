@@ -1,5 +1,22 @@
 # Domain Context
 
+## Human-first Reading
+
+**Dashboard / 总览看板**:
+A formal desktop Route that summarizes actionable reading state for a person, including unread articles, Read Later items, Article Bookmarks, Excerpts and Thoughts, Resources, and failed feed refreshes. It is a work entry point rather than an AI report or passive statistics page.
+
+**Continue Reading / 继续阅读**:
+The Dashboard entry for the most recently opened Article, including its source and last known reading position; when that Article is unavailable, it falls back to the most recent unread Article.
+
+**Delayed Read Marking / 延迟已读**:
+The human-reading rule that marks an Article read only after its body has rendered successfully and remained selected in a focused desktop window for ten seconds. The timer pauses when the window is unfocused, minimized, blocked by a Modal, or the Article changes, and a failed or empty body never qualifies.
+
+**Reading Position / 阅读位置**:
+The latest local position a person reached in an Article, restored when the Article is opened again and safely reset to the top when the current body can no longer support the saved position.
+
+**Human Reading Loop / 人用阅读闭环**:
+The primary product path from Feed Subscription through RSS refresh, Article reading, reader-toolbar Bookmark/Read Later/Read/Archive actions, and later retrieval from the corresponding library. Article lists prioritize scanning and selection; durable actions live with the open Article. AI processing is an explicit enhancement outside this path and is never required for the loop to work.
+
 ## Article Bookmark / 文章收藏
 
 An article-level saved state for durable reference. It is independent of read state, archive state, excerpts, and the read-later queue.

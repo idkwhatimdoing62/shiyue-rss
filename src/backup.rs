@@ -246,6 +246,9 @@ fn protect_for_current_user(data: &[u8]) -> Result<Vec<u8>> {
         pbData: data.as_ptr() as *mut u8,
     };
     let mut output = CRYPT_INTEGER_BLOB::default();
+    // SAFETY: `input` points to the caller-owned `data` slice, which remains
+    // alive for the synchronous API call. `output` is a valid out-parameter
+    // initialized by `CryptProtectData` on success.
     let ok = unsafe {
         CryptProtectData(
             &input,
@@ -263,11 +266,19 @@ fn protect_for_current_user(data: &[u8]) -> Result<Vec<u8>> {
             std::io::Error::last_os_error()
         );
     }
-    let protected =
-        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
-    unsafe {
-        LocalFree(output.pbData.cast());
+    if output.cbData > 0 && output.pbData.is_null() {
+        bail!("Windows 用户凭据加密返回了无效数据");
     }
+    let protected = if output.cbData == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: Windows initialized `pbData` to a buffer of `cbData` bytes
+        // on successful return, and the buffer remains valid until LocalFree.
+        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() }
+    };
+    // SAFETY: `pbData` is the allocation returned by CryptProtectData and is
+    // released exactly once after the bytes have been copied.
+    unsafe { LocalFree(output.pbData.cast()) };
     Ok(protected)
 }
 
@@ -285,6 +296,9 @@ fn unprotect_for_current_user(data: &[u8]) -> Result<Vec<u8>> {
         pbData: data.as_ptr() as *mut u8,
     };
     let mut output = CRYPT_INTEGER_BLOB::default();
+    // SAFETY: `input` points to the caller-owned `data` slice, which remains
+    // alive for the synchronous API call. `output` is a valid out-parameter
+    // initialized by `CryptUnprotectData` on success.
     let ok = unsafe {
         CryptUnprotectData(
             &input,
@@ -302,11 +316,19 @@ fn unprotect_for_current_user(data: &[u8]) -> Result<Vec<u8>> {
             std::io::Error::last_os_error()
         );
     }
-    let plain =
-        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
-    unsafe {
-        LocalFree(output.pbData.cast());
+    if output.cbData > 0 && output.pbData.is_null() {
+        bail!("Windows 用户凭据解密返回了无效数据");
     }
+    let plain = if output.cbData == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: Windows initialized `pbData` to a buffer of `cbData` bytes
+        // on successful return, and the buffer remains valid until LocalFree.
+        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() }
+    };
+    // SAFETY: `pbData` is the allocation returned by CryptUnprotectData and
+    // is released exactly once after the bytes have been copied.
+    unsafe { LocalFree(output.pbData.cast()) };
     Ok(plain)
 }
 

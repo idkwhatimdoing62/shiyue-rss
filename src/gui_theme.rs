@@ -11,6 +11,7 @@ pub(crate) struct ReaderTheme {
     pub(crate) panel: egui::Color32,
     pub(crate) text: egui::Color32,
     pub(crate) muted: egui::Color32,
+    pub(crate) subtle: egui::Color32,
     pub(crate) accent: egui::Color32,
     pub(crate) link: egui::Color32,
     pub(crate) border: egui::Color32,
@@ -21,17 +22,19 @@ pub(crate) struct ReaderTheme {
 impl ReaderTheme {
     pub(crate) fn sspai() -> Self {
         Self {
-            canvas: egui::Color32::from_rgb(255, 255, 255),
-            panel: egui::Color32::from_rgb(250, 250, 250),
-            text: egui::Color32::from_rgb(51, 51, 51),
-            // Secondary labels are frequently rendered at 13 px. #666 keeps
-            // them clearly readable on white while remaining subordinate.
-            muted: egui::Color32::from_rgb(102, 102, 102),
-            accent: egui::Color32::from_rgb(255, 126, 121),
-            link: egui::Color32::from_rgb(242, 47, 39),
-            border: egui::Color32::from_rgb(238, 238, 238),
-            code_bg: egui::Color32::from_rgb(248, 248, 248),
-            selected_bg: egui::Color32::from_rgb(255, 241, 240),
+            // A warm neutral canvas gives the reading surface a clear edge
+            // without adding decoration or heavy shadows.
+            canvas: egui::Color32::from_rgb(247, 248, 250),
+            panel: egui::Color32::from_rgb(255, 255, 255),
+            text: egui::Color32::from_rgb(31, 41, 51),
+            muted: egui::Color32::from_rgb(91, 103, 115),
+            // Metadata should recede behind titles without becoming disabled-looking.
+            subtle: egui::Color32::from_rgb(132, 143, 155),
+            accent: egui::Color32::from_rgb(235, 103, 93),
+            link: egui::Color32::from_rgb(201, 67, 58),
+            border: egui::Color32::from_rgb(218, 224, 230),
+            code_bg: egui::Color32::from_rgb(241, 244, 247),
+            selected_bg: egui::Color32::from_rgb(255, 239, 236),
         }
     }
 }

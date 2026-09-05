@@ -4,6 +4,7 @@
 
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -11,11 +12,53 @@ use chardetng::EncodingDetector;
 use encoding_rs::Encoding;
 use reqwest::Url;
 use reqwest::blocking::{Client, Response};
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::CONTENT_TYPE;
 use reqwest::redirect::Policy;
 
 /// Maximum HTML response size after HTTP content decoding (gzip, Brotli, etc.).
 pub const MAX_HTML_BYTES: usize = 8 * 1024 * 1024;
+
+/// Resolve names at the moment the HTTP connector opens the socket, then
+/// return only the already-validated public addresses to reqwest. This keeps
+/// the address used by the connector tied to the validation result instead of
+/// performing a separate preflight lookup followed by another DNS lookup.
+#[derive(Debug, Default)]
+struct PublicDnsResolver;
+
+impl Resolve for PublicDnsResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let addresses = (host.as_str(), 0)
+                .to_socket_addrs()
+                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?
+                .collect::<Vec<_>>();
+            if addresses.is_empty() {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::AddrNotAvailable,
+                    "网页主机名没有可用的 IP 地址",
+                ))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            if addresses.iter().any(|address| !is_public_ip(address.ip())) {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "为保护本机数据，网页主机名不能解析到本机或内网地址",
+                ))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            let addrs: Addrs = Box::new(addresses.into_iter());
+            Ok(addrs)
+        })
+    }
+}
+
+pub(crate) fn with_public_dns_resolver(
+    builder: reqwest::blocking::ClientBuilder,
+) -> reqwest::blocking::ClientBuilder {
+    builder.dns_resolver(Arc::new(PublicDnsResolver))
+}
 
 /// A downloaded HTML snapshot and the URLs needed to preserve its provenance.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,7 +73,7 @@ pub struct FetchedWebClip {
 
 /// Build the blocking HTTP client intended for webpage clipping.
 pub fn client() -> Result<Client> {
-    Client::builder()
+    with_public_dns_resolver(Client::builder())
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(45))
         .redirect(Policy::custom(|attempt| {

@@ -1,11 +1,14 @@
 //! 抓取 + 解析（ADR-5 reqwest / ADR-6 feed-rs）。
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::time::Duration;
 
 use crate::model::NewArticle;
 
 const MAX_ATTEMPTS: usize = 3;
+const MAX_FEED_BYTES: usize = 16 * 1024 * 1024;
+const MAX_FEED_ENTRIES: usize = 2_000;
+const MAX_ARTICLE_CONTENT_BYTES: usize = 2 * 1024 * 1024;
 const RETRY_DELAYS: [Duration; MAX_ATTEMPTS - 1] =
     [Duration::from_millis(250), Duration::from_secs(1)];
 
@@ -38,16 +41,35 @@ async fn fetch_once(
     client: &reqwest::Client,
     url: &str,
 ) -> Result<(Option<String>, Vec<NewArticle>)> {
-    let bytes = client
-        .get(url)
-        .send()
-        .await?
-        .error_for_status()?
-        .bytes()
-        .await?;
-    let feed = feed_rs::parser::parse(bytes.as_ref()).context("解析订阅源失败")?;
+    let response = client.get(url).send().await?.error_for_status()?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_FEED_BYTES as u64)
+    {
+        bail!(
+            "订阅源响应超过大小限制（最多 {} MB）",
+            MAX_FEED_BYTES / (1024 * 1024)
+        );
+    }
+    let mut bytes = Vec::new();
+    let mut response = response;
+    while let Some(chunk) = response.chunk().await? {
+        if chunk.len() > MAX_FEED_BYTES.saturating_sub(bytes.len()) {
+            bail!(
+                "订阅源响应超过大小限制（最多 {} MB）",
+                MAX_FEED_BYTES / (1024 * 1024)
+            );
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let feed = feed_rs::parser::parse(std::io::Cursor::new(bytes)).context("解析订阅源失败")?;
     let title = feed.title.map(|t| t.content);
-    let articles = feed.entries.into_iter().map(entry_to_article).collect();
+    let articles = feed
+        .entries
+        .into_iter()
+        .take(MAX_FEED_ENTRIES)
+        .map(entry_to_article)
+        .collect();
     Ok((title, articles))
 }
 
@@ -124,6 +146,9 @@ fn entry_to_article(e: feed_rs::model::Entry) -> NewArticle {
             }
         }
     }
+    if let Some(value) = &mut content {
+        truncate_utf8(value, MAX_ARTICLE_CONTENT_BYTES);
+    }
     NewArticle {
         entry_id,
         url,
@@ -132,6 +157,19 @@ fn entry_to_article(e: feed_rs::model::Entry) -> NewArticle {
         published,
         content,
     }
+}
+
+fn truncate_utf8(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+    let end = value
+        .char_indices()
+        .take_while(|(index, character)| *index + character.len_utf8() <= max_bytes)
+        .map(|(index, character)| index + character.len_utf8())
+        .last()
+        .unwrap_or(0);
+    value.truncate(end);
 }
 
 #[cfg(test)]
@@ -172,5 +210,37 @@ mod tests {
         assert_eq!(title.as_deref(), Some("Retry Feed"));
         assert!(articles.is_empty());
         server.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejects_feed_responses_larger_than_the_memory_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            writeln!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/rss+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                MAX_FEED_BYTES + 1
+            )
+            .unwrap();
+        });
+
+        let error = fetch(&client().unwrap(), &format!("http://{address}/feed"))
+            .await
+            .expect_err("oversized feed must be rejected");
+        assert!(error.to_string().contains("超过大小限制"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn content_limit_keeps_utf8_boundaries() {
+        let mut value = "😀abc".to_owned();
+        truncate_utf8(&mut value, 4);
+        assert_eq!(value, "😀");
+        truncate_utf8(&mut value, 3);
+        assert!(value.is_empty());
     }
 }

@@ -201,10 +201,13 @@ impl Db {
     }
 
     pub(crate) fn fenced_transaction_for<'connection>(
-        &'connection self,
+        &'connection mut self,
         witness: &GenerationFence,
     ) -> Result<FencedTransaction<'connection>> {
-        witness.begin_write(&self.conn)
+        // Refresh commits must take the SQLite writer lock before reading any
+        // mutable feed state. Otherwise a settings update can land between
+        // the snapshot read and the result commit.
+        witness.begin_immediate_write(&mut self.conn)
     }
 
     pub(crate) fn library_generation(&self) -> LibraryGeneration {
@@ -222,6 +225,7 @@ impl Db {
         Ok(self.add_feed_with_disposition(url, now)?.0)
     }
 
+    #[cfg(test)]
     pub(crate) fn add_feed_with_disposition(&self, url: &str, now: i64) -> Result<(i64, bool)> {
         let tx = self.fenced_transaction()?;
         tx.execute(
@@ -229,9 +233,56 @@ impl Db {
             params![url, now],
         )?;
         let created = tx.changes() > 0;
-        let id = tx.query_row("SELECT id FROM feeds WHERE url = ?1", params![url], |r| {
-            r.get(0)
+        let id = tx.query_row("SELECT id FROM feeds WHERE url = ?1", params![url], |row| {
+            row.get(0)
         })?;
+        if created {
+            library_projection_revision::record(&tx, ProjectionImpact::article())?;
+        }
+        tx.commit()?;
+        Ok((id, created))
+    }
+
+    pub(crate) fn add_feed_with_disposition_matching<F>(
+        &mut self,
+        url: &str,
+        now: i64,
+        matches_existing: F,
+    ) -> Result<(i64, bool)>
+    where
+        F: Fn(&str) -> bool,
+    {
+        let tx = self.fenced_immediate_transaction()?;
+        let existing_id = tx
+            .query_row("SELECT id FROM feeds WHERE url = ?1", params![url], |row| {
+                row.get::<_, i64>(0)
+            })
+            .optional()?;
+        let existing_id = if let Some(id) = existing_id {
+            Some(id)
+        } else {
+            let mut statement = tx.prepare("SELECT id, url FROM feeds ORDER BY id")?;
+            let mut rows = statement.query([])?;
+            let mut found = None;
+            while let Some(row) = rows.next()? {
+                let id = row.get::<_, i64>(0)?;
+                let candidate = row.get::<_, String>(1)?;
+                if matches_existing(&candidate) {
+                    found = Some(id);
+                    break;
+                }
+            }
+            found
+        };
+        let (id, created) = if let Some(id) = existing_id {
+            (id, false)
+        } else {
+            tx.execute(
+                "INSERT INTO feeds (url, next_fetch) VALUES (?1, ?2)",
+                params![url, now],
+            )?;
+            (tx.last_insert_rowid(), true)
+        };
         if created {
             library_projection_revision::record(&tx, ProjectionImpact::article())?;
         }
@@ -609,11 +660,10 @@ impl Db {
                 }
             }
         }
-        let interval = feed.interval_secs.unwrap_or(cfg.default_interval_secs);
         conn.execute(
             "UPDATE feeds SET title = COALESCE(title, ?2), last_fetch = ?3, \
-             next_fetch = ?4, fail_count = 0, last_error = NULL WHERE id = ?1",
-            params![feed.id, title, now, now + interval],
+             next_fetch = ?3 + COALESCE(interval_secs, ?4), fail_count = 0, last_error = NULL WHERE id = ?1",
+            params![feed.id, title, now, cfg.default_interval_secs],
         )?;
         library_projection_revision::record(conn, impact)?;
         Ok(new)
@@ -634,7 +684,12 @@ impl Db {
         cfg: &Config,
         err: &str,
     ) -> Result<()> {
-        let fc = feed.fail_count + 1;
+        let current_fail_count: i64 = conn.query_row(
+            "SELECT fail_count FROM feeds WHERE id = ?1",
+            params![feed.id],
+            |row| row.get(0),
+        )?;
+        let fc = current_fail_count + 1;
         let mult = 2i64.saturating_pow(fc.clamp(0, 16) as u32);
         let backoff = cfg
             .backoff_base_secs
@@ -1099,6 +1154,24 @@ mod tests {
             .unwrap();
         assert_eq!(n, 1);
         assert_eq!(db.feeds_with_unread().unwrap()[0].1, 3);
+    }
+
+    #[test]
+    fn refresh_commit_uses_current_interval_and_failure_count() {
+        let db = mem();
+        let cfg = Config::default();
+        let feed_id = db.add_feed("http://x/current-state", 0).unwrap();
+        let stale = db.get_feed(feed_id).unwrap();
+
+        db.set_subscription_interval(feed_id, 3_600, 10).unwrap();
+        db.record_success(&stale, 20, &cfg, None, &[]).unwrap();
+        assert_eq!(db.get_feed(feed_id).unwrap().next_fetch, 3_620);
+
+        db.record_failure(&stale, 30, &cfg, "first").unwrap();
+        db.record_failure(&stale, 40, &cfg, "second").unwrap();
+        let current = db.get_feed(feed_id).unwrap();
+        assert_eq!(current.fail_count, 2);
+        assert_eq!(current.last_error.as_deref(), Some("second"));
     }
 
     #[test]

@@ -22,6 +22,8 @@ const QUERY_CHUNK: usize = 400;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ProjectionScope {
     Feed(i64),
+    All,
+    Unread,
     ArticleBookmarks,
     ReadLater,
     Archive,
@@ -675,6 +677,23 @@ fn load_articles(
             ),
             vec![WEB_CLIPPINGS_FEED_URL.to_owned().into()],
         ),
+        ProjectionScope::Unread => (
+            format!(
+                "SELECT {ARTICLE_COLUMNS}, f.url = ?1 FROM articles a \
+                 JOIN feeds f ON f.id = a.feed_id \
+                 WHERE a.archived = 0 AND a.is_read = 0 AND f.disabled = 0 \
+                 AND f.url != ?1 {order}"
+            ),
+            vec![WEB_CLIPPINGS_FEED_URL.to_owned().into()],
+        ),
+        ProjectionScope::All => (
+            format!(
+                "SELECT {ARTICLE_COLUMNS}, f.url = ?1 FROM articles a \
+                 JOIN feeds f ON f.id = a.feed_id \
+                 WHERE a.archived = 0 AND f.url != ?1 {order}"
+            ),
+            vec![WEB_CLIPPINGS_FEED_URL.to_owned().into()],
+        ),
         ProjectionScope::ReadLater => (
             format!(
                 "SELECT {ARTICLE_COLUMNS}, f.url = ?1 FROM articles a \
@@ -919,6 +938,30 @@ mod tests {
         assert!(article.read_later);
         assert!(article.is_read);
         assert!(!article.archived);
+    }
+
+    #[test]
+    fn unread_projection_is_recent_and_excludes_disabled_feeds() {
+        let library = TestLibrary::new();
+        let (feed_id, ids) = library.add_feed_articles(&["one", "two"]);
+        let lifecycle = ArticleLibraryLifecycle::new(library.db());
+
+        let unread = lifecycle.project(ProjectionScope::Unread).unwrap();
+        assert_eq!(unread.articles.len(), 2);
+        assert_eq!(unread.articles[0].id, ids[1]);
+
+        library
+            .db()
+            .conn
+            .execute("UPDATE feeds SET disabled = 1 WHERE id = ?1", [feed_id])
+            .unwrap();
+        assert!(
+            lifecycle
+                .project(ProjectionScope::Unread)
+                .unwrap()
+                .articles
+                .is_empty()
+        );
     }
 
     #[test]

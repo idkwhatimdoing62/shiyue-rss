@@ -374,7 +374,7 @@ impl GenerationFence {
         })
     }
 
-    fn begin_immediate_write<'connection>(
+    pub(crate) fn begin_immediate_write<'connection>(
         &self,
         connection: &'connection mut Connection,
     ) -> Result<FencedTransaction<'connection>> {

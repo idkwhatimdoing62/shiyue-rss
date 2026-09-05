@@ -876,9 +876,16 @@ fn commit_result(
     feed: &Feed,
     result: std::result::Result<FetchPayload, RefreshFailure>,
 ) -> Result<CommitResult> {
-    let db = Db::open(db_path)?;
+    let mut db = Db::open(db_path)?;
     let tx = db.fenced_transaction_for(generation)?;
-    if db.find_feed(feed.id)?.is_none() {
+    let feed_exists = |tx: &crate::local_data_maintenance::FencedTransaction<'_>| {
+        tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM feeds WHERE id = ?1)",
+            [feed.id],
+            |row| row.get::<_, bool>(0),
+        )
+    };
+    if !feed_exists(&tx)? {
         tx.commit()?;
         return Ok(CommitResult::Removed);
     }
@@ -889,7 +896,7 @@ fn commit_result(
                     new_articles,
                     failure: None,
                 },
-                Err(_error) if db.find_feed(feed.id)?.is_none() => CommitResult::Removed,
+                Err(_error) if !feed_exists(&tx)? => CommitResult::Removed,
                 Err(error) => return Err(error),
             }
         }
@@ -899,7 +906,7 @@ fn commit_result(
                 new_articles: 0,
                 failure: Some(failure),
             },
-            Err(_error) if db.find_feed(feed.id)?.is_none() => CommitResult::Removed,
+            Err(_error) if !feed_exists(&tx)? => CommitResult::Removed,
             Err(error) => return Err(error),
         },
     };

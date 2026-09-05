@@ -274,17 +274,31 @@ fn run_resource_cli(paths: &Paths, cfg: &config::Config, command: ResourceComman
             Ok(0)
         }
         Err(error) => {
-            let not_found = error
+            let (code, retryable, exit_code) = error
                 .downcast_ref::<resource_library_lifecycle::LifecycleFailure>()
-                .is_some_and(|failure| {
-                    failure.kind == resource_library_lifecycle::FailureKind::NotFound
-                });
+                .map(resource_failure_contract)
+                .unwrap_or(("RESOURCE_ERROR", false, 1));
+            let message = error.to_string();
             println!(
                 "{}",
-                serde_json::json!({"schema_version":1,"ok":false,"error":{"code":if not_found{"RESOURCE_NOT_FOUND"}else{"RESOURCE_ERROR"},"message":error.to_string(),"retryable":false}})
+                serde_json::json!({"schema_version":1,"ok":false,"error":{"code":code,"message":message,"retryable":retryable}})
             );
-            Ok(if not_found { 3 } else { 1 })
+            Ok(exit_code)
         }
+    }
+}
+
+fn resource_failure_contract(
+    failure: &resource_library_lifecycle::LifecycleFailure,
+) -> (&'static str, bool, i32) {
+    use resource_library_lifecycle::FailureKind;
+    match failure.kind {
+        FailureKind::Input => ("RESOURCE_INPUT", false, 2),
+        FailureKind::NotFound => ("RESOURCE_NOT_FOUND", false, 3),
+        FailureKind::InvalidTransition => ("RESOURCE_INVALID_TRANSITION", false, 1),
+        FailureKind::ProcessingActive => ("RESOURCE_PROCESSING_ACTIVE", true, 5),
+        FailureKind::Maintenance => ("RESOURCE_MAINTENANCE", true, 5),
+        FailureKind::Storage => ("RESOURCE_STORAGE", false, 1),
     }
 }
 
@@ -442,15 +456,19 @@ fn run_resource_retry_cli(
     })() {
         Ok(resource) => resource,
         Err(error) => {
+            let (code, retryable, exit_code) = error
+                .downcast_ref::<resource_library_lifecycle::LifecycleFailure>()
+                .map(resource_failure_contract)
+                .unwrap_or(("RESOURCE_ERROR", false, 1));
             println!(
                 "{}",
                 serde_json::json!({
                     "schema_version": 1,
                     "ok": false,
-                    "error": {"code":"RESOURCE_NOT_FOUND","message":error.to_string(),"retryable":false}
+                    "error": {"code":code,"message":error.to_string(),"retryable":retryable}
                 })
             );
-            return Ok(3);
+            return Ok(exit_code);
         }
     };
     let engine = if no_wait {

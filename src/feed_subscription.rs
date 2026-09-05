@@ -202,17 +202,15 @@ impl<'a> FeedSubscriptions<'a> {
     fn add(&self, input: &str) -> Result<SubscriptionOutcome, SubscriptionError> {
         let raw = input.trim();
         let url = normalize_feed_url(raw)?;
-        let db = Db::open(&self.database).map_err(SubscriptionError::storage)?;
+        let mut db = Db::open(&self.database).map_err(SubscriptionError::storage)?;
         let now = Utc::now().timestamp();
-        let legacy = db
-            .find_feed_by_url(raw)
+        let (id, created) = db
+            .add_feed_with_disposition_matching(&url, now, |candidate| {
+                normalize_feed_url(candidate)
+                    .ok()
+                    .is_some_and(|normalized| normalized == url)
+            })
             .map_err(SubscriptionError::storage)?;
-        let (id, created) = if let Some(existing) = legacy {
-            (existing.id, false)
-        } else {
-            db.add_feed_with_disposition(&url, now)
-                .map_err(SubscriptionError::storage)?
-        };
         if !created {
             db.request_subscription_refresh(id, now)
                 .map_err(SubscriptionError::storage)?;
@@ -432,6 +430,33 @@ mod tests {
             *refresh.requested.lock().unwrap(),
             vec![created_feed.id, created_feed.id]
         );
+
+        drop(subscriptions);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn adding_a_normalized_url_reuses_a_legacy_variant() {
+        let path = test_database("legacy-normalized-add");
+        let db = Db::open(&path).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO feeds (url, next_fetch) VALUES ('HTTPS://Example.com/feed', 0)",
+                [],
+            )
+            .unwrap();
+        let legacy_id = db.conn.last_insert_rowid();
+        drop(db);
+
+        let refresh = FakeRefresh::default();
+        let subscriptions = FeedSubscriptions::with_refresh(path.clone(), &refresh);
+        let outcome = subscriptions
+            .apply(SubscriptionChange::Add {
+                url: "https://example.com/feed".into(),
+            })
+            .unwrap();
+        assert_eq!(outcome.disposition, ChangeDisposition::Existing);
+        assert_eq!(outcome.subscription.unwrap().id, legacy_id);
 
         drop(subscriptions);
         let _ = std::fs::remove_file(path);

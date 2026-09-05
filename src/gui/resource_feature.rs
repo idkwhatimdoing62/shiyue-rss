@@ -15,10 +15,10 @@ use crate::knowledge_workflow::{
     TaskSnapshot, TaskStage as KnowledgeTaskStage, TaskStatus as KnowledgeTaskStatus,
 };
 use crate::resource_library_lifecycle::{
-    Clock, CompleteManualEdit, CreateResource, FailureKind, ImportCandidate, LifecycleFailure,
-    ProcessingHandoff, ProjectionScope, Resource, ResourceCollection, ResourceCurationState,
-    ResourceDetail, ResourceKind, ResourceLibraryLifecycle, ResourceLibraryProjection,
-    ResourceLifecycleChange, ResourcePrivacy, ResourceSource,
+    Clock, CompleteManualEdit, CreateResource, FailureKind, HandoffDisposition, ImportCandidate,
+    LifecycleFailure, ProcessingHandoff, ProjectionScope, Resource, ResourceCollection,
+    ResourceCurationState, ResourceDetail, ResourceKind, ResourceLibraryLifecycle,
+    ResourceLibraryProjection, ResourceLifecycleChange, ResourcePrivacy, ResourceSource,
 };
 
 pub(super) struct Dependencies<'a> {
@@ -354,9 +354,11 @@ pub(super) fn transition_curation(
         },
         ProjectionScope::collection(collection),
     ) {
-        Ok(result) => {
-            Outcome::lifecycle_success(InteractionIntent::None, result.projection, "资源状态已更新")
-        }
+        Ok(result) => Outcome::lifecycle_success(
+            InteractionIntent::None,
+            result.projection,
+            resource_saved_notice("资源状态已更新", &result.handoffs),
+        ),
         Err(error) => Outcome::notice(format!("操作失败：{error}")),
     }
 }
@@ -407,21 +409,38 @@ fn show_add_modal(
     if response.inner != Some(true) {
         return outcome;
     }
-    match create_resource(draft, dependencies) {
-        Ok(projection) => {
+    match create_resource_with_handoff(draft, dependencies) {
+        Ok((projection, handoffs)) => {
             outcome.interaction = InteractionIntent::CompleteModal;
             outcome.projection = Some(projection);
-            outcome.notice = Some("资源网址已保存；断网也不会丢失".into());
+            outcome.notice = Some(resource_saved_notice(
+                "资源网址已保存；断网也不会丢失",
+                &handoffs,
+            ));
         }
         Err(error) => draft.error = Some(error.to_string()),
     }
     outcome
 }
 
+#[cfg(test)]
 fn create_resource(
     draft: &AddDraft,
     dependencies: &Dependencies<'_>,
 ) -> Result<ResourceLibraryProjection, LifecycleFailure> {
+    Ok(create_resource_with_handoff(draft, dependencies)?.0)
+}
+
+fn create_resource_with_handoff(
+    draft: &AddDraft,
+    dependencies: &Dependencies<'_>,
+) -> Result<
+    (
+        ResourceLibraryProjection,
+        Vec<crate::resource_library_lifecycle::ResourceHandoff>,
+    ),
+    LifecycleFailure,
+> {
     let outcome = lifecycle(dependencies).apply(
         ResourceLifecycleChange::Create(CreateResource {
             url: draft.url.clone(),
@@ -440,7 +459,7 @@ fn create_resource(
         }),
         ProjectionScope::collection(ResourceCollection::Active),
     )?;
-    Ok(outcome.projection)
+    Ok((outcome.projection, outcome.handoffs))
 }
 
 fn show_delete_modal(
@@ -547,21 +566,40 @@ fn show_import_modal(
     if response.inner != Some(true) {
         return outcome;
     }
-    match import_resources(draft, dependencies) {
-        Ok((projection, count)) => {
+    match import_resources_with_handoff(draft, dependencies) {
+        Ok((projection, count, handoffs)) => {
             outcome.interaction = InteractionIntent::CompleteModal;
             outcome.projection = Some(projection);
-            outcome.notice = Some(format!("已导入 {count} 个资源，正在后台补全描述"));
+            outcome.notice = Some(resource_saved_notice(
+                &format!("已导入 {count} 个资源，正在后台补全描述"),
+                &handoffs,
+            ));
         }
         Err(error) => outcome.notice = Some(format!("导入失败：{error}")),
     }
     outcome
 }
 
+#[cfg(test)]
 fn import_resources(
     draft: &ImportDraft,
     dependencies: &Dependencies<'_>,
 ) -> Result<(ResourceLibraryProjection, usize), LifecycleFailure> {
+    let (projection, count, _) = import_resources_with_handoff(draft, dependencies)?;
+    Ok((projection, count))
+}
+
+fn import_resources_with_handoff(
+    draft: &ImportDraft,
+    dependencies: &Dependencies<'_>,
+) -> Result<
+    (
+        ResourceLibraryProjection,
+        usize,
+        Vec<crate::resource_library_lifecycle::ResourceHandoff>,
+    ),
+    LifecycleFailure,
+> {
     let outcome = lifecycle(dependencies).apply(
         ResourceLifecycleChange::ImportWebClippings {
             article_ids: draft.selected.iter().copied().collect(),
@@ -569,7 +607,26 @@ fn import_resources(
         ProjectionScope::collection(ResourceCollection::Active),
     )?;
     let count = outcome.affected_resource_ids.len();
-    Ok((outcome.projection, count))
+    Ok((outcome.projection, count, outcome.handoffs))
+}
+
+fn resource_saved_notice(
+    base: &str,
+    handoffs: &[crate::resource_library_lifecycle::ResourceHandoff],
+) -> String {
+    let deferred = handoffs
+        .iter()
+        .find_map(|handoff| match &handoff.disposition {
+            HandoffDisposition::Deferred {
+                user_message,
+                technical_detail,
+            } => Some(format!(
+                "{user_message}（技术详情：{}）",
+                technical_detail.chars().take(240).collect::<String>()
+            )),
+            _ => None,
+        });
+    deferred.map_or_else(|| base.to_owned(), |message| format!("{base}；{message}"))
 }
 
 fn save_editor(
@@ -923,6 +980,22 @@ mod tests {
         let deleted = delete_resource(resource_id, &dependencies).unwrap();
         assert!(deleted.resources.is_empty());
         assert_eq!(deleted.counts.active, 0);
+    }
+
+    #[test]
+    fn deferred_processing_handoff_is_visible_in_save_notice() {
+        let message = resource_saved_notice(
+            "资源网址已保存；断网也不会丢失",
+            &[crate::resource_library_lifecycle::ResourceHandoff {
+                resource_id: 7,
+                disposition: HandoffDisposition::Deferred {
+                    user_message: "资源已保存，后台整理暂未启动，可稍后重试".into(),
+                    technical_detail: "KNOWLEDGE_PROCESSING_NOT_CONNECTED".into(),
+                },
+            }],
+        );
+        assert!(message.contains("后台整理暂未启动"));
+        assert!(message.contains("KNOWLEDGE_PROCESSING_NOT_CONNECTED"));
     }
 
     #[test]

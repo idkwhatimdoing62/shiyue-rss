@@ -306,7 +306,9 @@ impl<'db, 'adapter> ResourceLibraryLifecycle<'db, 'adapter> {
         let mut candidates = Vec::new();
         for article in self.db.web_clippings().map_err(LifecycleFailure::storage)? {
             let Some(url) = article.url else { continue };
-            let canonical = store::canonicalize_url(&url).map_err(LifecycleFailure::storage)?;
+            let canonical = store::canonicalize_url(&url).map_err(|error| {
+                LifecycleFailure::input("网页收藏网址格式无效", error.to_string())
+            })?;
             let existing = self
                 .db
                 .conn
@@ -469,8 +471,9 @@ fn apply_change(
 ) -> Result<(ChangeDisposition, Vec<i64>), LifecycleFailure> {
     match change {
         ResourceLifecycleChange::Create(input) => {
-            let canonical =
-                store::canonicalize_url(&input.url).map_err(LifecycleFailure::storage)?;
+            let canonical = store::canonicalize_url(&input.url).map_err(|error| {
+                LifecycleFailure::input("资源网址格式无效，请使用 HTTP(S) 地址", error.to_string())
+            })?;
             if let Some(id) = conn
                 .query_row(
                     "SELECT id FROM resources WHERE canonical_url=?1",
@@ -707,7 +710,8 @@ fn import_web_clippings(
                     format!("INVALID_WEB_CLIPPING: {article_id}"),
                 )
             })?;
-        let canonical = store::canonicalize_url(&row.0).map_err(LifecycleFailure::storage)?;
+        let canonical = store::canonicalize_url(&row.0)
+            .map_err(|error| LifecycleFailure::input("网页收藏网址格式无效", error.to_string()))?;
         if let Some(id) = conn
             .query_row(
                 "SELECT id FROM resources WHERE canonical_url=?1 OR

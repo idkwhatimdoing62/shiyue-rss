@@ -154,7 +154,7 @@ archived -> active | physical delete
 
 `shiyue-cli resource add <url> [--note <text>] [--private] --json`
 
-- 复用相同 service 和安全抓取队列。
+- 复用相同 service 和安全抓取队列；但代理添加的 Resource 在人工确认前保持 `pending_review`，不提前启动抓取或云端整理。确认进入 `active` 后，才通过同一安全抓取与 Knowledge Processing 交接路径处理。
 - 初始状态固定为 `pending_review`。
 - 返回成功表示 Resource 已持久化，不表示抓取或整理成功。
 - 记录添加来源为 `cli_agent`。
@@ -368,7 +368,7 @@ shiyue-cli resource add <url> [--note <text>] [--private] --json
 - 中文用途/标签可以命中英文网站 Resource
 - 手工评分只对已有文本候选做有限 boost
 - CLI envelope、退出码及 stdout/stderr 隔离
-- CLI add 落库后即成功，后台失败可重试
+- CLI add 落库后即成功；代理添加的条目先等待人工确认，确认后的后台失败可重试
 - 旧网页收藏导入可重跑且不重复
 - 删除 Resource 不删除关联 Article
 

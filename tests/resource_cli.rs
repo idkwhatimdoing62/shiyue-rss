@@ -73,3 +73,24 @@ fn json_envelopes_keep_stdout_clean_and_use_documented_exit_codes() {
 
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn malformed_resource_url_is_reported_as_input_error() {
+    let root = std::env::temp_dir().join(format!(
+        "shiyue-resource-cli-invalid-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+
+    let output = run(&root, &["resource", "add", "not-a-url", "--json"]);
+    assert_eq!(output.status.code(), Some(2));
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["error"]["code"], "RESOURCE_INPUT");
+    assert_eq!(envelope["error"]["retryable"], false);
+
+    std::fs::remove_dir_all(root).unwrap();
+}

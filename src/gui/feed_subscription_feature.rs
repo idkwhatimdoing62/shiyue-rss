@@ -263,6 +263,36 @@ fn subscriptions<'a>(dependencies: &'a Dependencies<'a>) -> FeedSubscriptions<'a
     FeedSubscriptions::session(dependencies.database.to_path_buf(), dependencies.refresh)
 }
 
+/// Re-enable a disabled feed and request its immediate refresh through the
+/// shared Feed Subscription Lifecycle. Keeping this action in the adapter
+/// prevents the GUI root from reaching into persistence or refresh details.
+pub(super) fn retry_disabled_feed(feed_id: i64, dependencies: &Dependencies<'_>) -> Outcome {
+    match subscriptions(dependencies).apply(SubscriptionChange::Enable { id: feed_id }) {
+        Ok(result) => Outcome {
+            reload: result.disposition != ChangeDisposition::NotFound,
+            notice: Some(retry_notice(result.disposition, result.refresh)),
+            ..Outcome::idle(ModalHostAction::None)
+        },
+        Err(error) => {
+            tracing::warn!(detail = %error.technical_detail, "retry disabled subscription failed");
+            Outcome {
+                notice: Some(error.user_message),
+                ..Outcome::idle(ModalHostAction::None)
+            }
+        }
+    }
+}
+
+pub(super) fn disabled_feed_status(disabled: bool, fail_count: i64) -> String {
+    if !disabled {
+        String::new()
+    } else if fail_count > 0 {
+        format!("已暂停（连续失败 {fail_count} 次）")
+    } else {
+        "已暂停".into()
+    }
+}
+
 fn show_add_modal(
     context: &egui::Context,
     draft: &mut AddDraft,
@@ -393,6 +423,21 @@ fn settings_notice(refresh: Option<InitialRefreshOutcome>) -> String {
     }
 }
 
+fn retry_notice(disposition: ChangeDisposition, refresh: Option<InitialRefreshOutcome>) -> String {
+    if disposition == ChangeDisposition::NotFound {
+        return "没有找到该订阅".into();
+    }
+    match refresh {
+        Some(InitialRefreshOutcome::Queued) => "订阅已重新启用，正在刷新".into(),
+        Some(InitialRefreshOutcome::Deferred) => "订阅已重新启用，将在资料维护结束后刷新".into(),
+        Some(InitialRefreshOutcome::Succeeded { .. }) => "订阅已重新启用并刷新成功".into(),
+        Some(InitialRefreshOutcome::Degraded { .. }) => {
+            "订阅已重新启用，但刷新失败，请查看错误详情".into()
+        }
+        None => "订阅已重新启用".into(),
+    }
+}
+
 fn discard_guard_controls(ui: &mut egui::Ui, visible: bool) -> Option<InteractionIntent> {
     if !visible {
         return None;
@@ -448,6 +493,40 @@ mod tests {
     fn settings_interval_uses_the_shared_duration_parser() {
         assert_eq!(parse_duration("30m").unwrap(), 1800);
         assert_eq!(parse_duration("0s").unwrap(), 0);
+    }
+
+    #[test]
+    fn disabled_feed_status_explains_failure_state_and_manual_pause() {
+        assert_eq!(disabled_feed_status(true, 10), "已暂停（连续失败 10 次）");
+        assert_eq!(disabled_feed_status(true, 0), "已暂停");
+        assert!(disabled_feed_status(false, 10).is_empty());
+    }
+
+    #[test]
+    fn retry_notice_explains_refresh_lifecycle() {
+        assert_eq!(
+            retry_notice(
+                ChangeDisposition::Changed,
+                Some(InitialRefreshOutcome::Queued)
+            ),
+            "订阅已重新启用，正在刷新"
+        );
+        assert_eq!(
+            retry_notice(
+                ChangeDisposition::Changed,
+                Some(InitialRefreshOutcome::Deferred)
+            ),
+            "订阅已重新启用，将在资料维护结束后刷新"
+        );
+        assert_eq!(
+            retry_notice(
+                ChangeDisposition::Changed,
+                Some(InitialRefreshOutcome::Degraded {
+                    technical_detail: Some("timeout".into()),
+                })
+            ),
+            "订阅已重新启用，但刷新失败，请查看错误详情"
+        );
     }
 
     #[test]

@@ -296,30 +296,49 @@ fn windows_credential(target: &str) -> Result<Option<String>> {
     };
     let wide = target.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
     let mut ptr: *mut CREDENTIALW = std::ptr::null_mut();
+    // SAFETY: `wide` is a NUL-terminated UTF-16 buffer that remains alive for
+    // the duration of the Windows API call, and `ptr` is an out-parameter owned
+    // by the credential manager on success.
     let ok = unsafe { CredReadW(wide.as_ptr(), CRED_TYPE_GENERIC, 0, &mut ptr) };
     if ok == 0 {
         return Ok(None);
     }
+    if ptr.is_null() {
+        bail!("Windows 凭据 API 返回了空指针");
+    }
+    // SAFETY: `CredReadW` succeeded and returned a valid credential pointer;
+    // the pointed-to structure remains owned by the credential manager until
+    // `CredFree` below.
     let credential = unsafe { &*ptr };
-    let bytes = unsafe {
-        std::slice::from_raw_parts(
-            credential.CredentialBlob,
-            credential.CredentialBlobSize as usize,
-        )
+    let blob_size = credential.CredentialBlobSize as usize;
+    if blob_size > 0 && credential.CredentialBlob.is_null() {
+        // SAFETY: `ptr` was returned by CredReadW and is released exactly once.
+        unsafe { CredFree(ptr.cast()) };
+        bail!("Windows 凭据内容指针为空");
+    }
+    let bytes = if blob_size == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: the credential manager guarantees this buffer is valid for
+        // CredentialBlobSize bytes while the credential is owned by this call.
+        unsafe { std::slice::from_raw_parts(credential.CredentialBlob, blob_size).to_vec() }
     };
-    let value = String::from_utf8(bytes.to_vec())
-        .or_else(|_| {
-            let words = bytes
+    // SAFETY: `ptr` was returned by CredReadW and is released exactly once.
+    unsafe { CredFree(ptr.cast()) };
+    let value = match String::from_utf8(bytes) {
+        Ok(value) => value,
+        Err(error) => {
+            let words = error
+                .as_bytes()
                 .chunks(2)
                 .filter_map(|pair| match pair {
                     [low, high] => Some(u16::from_le_bytes([*low, *high])),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            String::from_utf16(&words)
-        })
-        .context("credential is not text")?;
-    unsafe { CredFree(ptr.cast()) };
+            String::from_utf16(&words).context("credential is not text")?
+        }
+    };
     Ok((!value.trim().is_empty()).then_some(value))
 }
 #[cfg(not(windows))]
@@ -335,6 +354,8 @@ fn write_windows_credential(target: &str, value: &str) -> Result<()> {
     let mut target = target.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
     let mut username = "Shiyue".encode_utf16().chain(Some(0)).collect::<Vec<_>>();
     let mut blob = value.as_bytes().to_vec();
+    // SAFETY: CREDENTIALW is a plain Windows FFI struct whose fields are
+    // initialized immediately below before the API call.
     let mut credential: CREDENTIALW = unsafe { std::mem::zeroed() };
     credential.Type = CRED_TYPE_GENERIC;
     credential.TargetName = target.as_mut_ptr();
@@ -342,6 +363,8 @@ fn write_windows_credential(target: &str, value: &str) -> Result<()> {
     credential.CredentialBlob = blob.as_mut_ptr();
     credential.Persist = CRED_PERSIST_LOCAL_MACHINE;
     credential.UserName = username.as_mut_ptr();
+    // SAFETY: all pointers in `credential` point into UTF-16/blob buffers that
+    // remain alive and writable for the duration of this synchronous call.
     let ok = unsafe { CredWriteW(&credential, 0) };
     if ok == 0 {
         return Err(std::io::Error::last_os_error()).context("保存 Windows 凭据失败");
@@ -359,6 +382,8 @@ fn delete_windows_credential(target: &str) -> Result<()> {
     use windows_sys::Win32::Foundation::ERROR_NOT_FOUND;
     use windows_sys::Win32::Security::Credentials::{CRED_TYPE_GENERIC, CredDeleteW};
     let target = target.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+    // SAFETY: `target` is a NUL-terminated UTF-16 buffer that remains alive for
+    // the duration of the synchronous API call.
     let ok = unsafe { CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0) };
     if ok == 0 {
         let error = std::io::Error::last_os_error();

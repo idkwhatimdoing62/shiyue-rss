@@ -10,11 +10,14 @@ mod parser;
 use anyhow::Result;
 use eframe::egui;
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::error::Error as _;
 use std::hash::{Hash, Hasher};
+use std::io::Cursor;
 use std::io::Read as _;
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -58,6 +61,8 @@ const PREPARED_DOCUMENT_CACHE_LIMIT: usize = 24;
 const IMAGE_WORKER_COUNT: usize = 4;
 const IMAGE_MAX_ATTEMPTS: u8 = 3;
 const IMAGE_MAX_BYTES: u64 = 25 * 1024 * 1024;
+const IMAGE_MAX_DIMENSION: u32 = 16_384;
+const IMAGE_MAX_DECODE_BYTES: u64 = 128 * 1024 * 1024;
 const BODY_GALLEY_MAX_PARAGRAPHS: usize = 16;
 const BODY_GALLEY_MAX_CHARS: usize = 1_600;
 
@@ -140,12 +145,12 @@ pub(crate) struct PresentOutcome {
     pub(crate) intents: Vec<PresentationIntent>,
     pub(crate) restored_span_top: Option<f32>,
     pub(crate) restore_failed: bool,
+    pub(crate) body_rendered: bool,
+    pub(crate) scroll_adjustment_y: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ArticleDocCursor {
-    span_index: usize,
-    local_char: usize,
     char_index: usize,
 }
 
@@ -167,26 +172,80 @@ struct RenderedArticleSpan {
 }
 
 #[derive(Default)]
+struct LayoutHeightCache {
+    fingerprint: Option<ContentFingerprint>,
+    heights: HashMap<(usize, ArticleTextStyle, u32), f32>,
+}
+
+impl LayoutHeightCache {
+    fn prepare(&mut self, fingerprint: &ContentFingerprint) {
+        if self.fingerprint.as_ref() != Some(fingerprint) {
+            self.fingerprint = Some(fingerprint.clone());
+            self.heights.clear();
+        }
+    }
+}
+
+#[derive(Default)]
 struct ArticleSelectionFrame {
     plain_text: String,
+    cached_plain_text: Option<Arc<str>>,
     char_len: usize,
     spans: Vec<RenderedArticleSpan>,
+    capture_all_geometry: bool,
+    layout_heights: Rc<RefCell<LayoutHeightCache>>,
 }
 
 impl ArticleSelectionFrame {
-    fn push_span(&mut self, text: &str, mut span: RenderedArticleSpan) {
-        if text.is_empty() {
-            return;
+    fn new(
+        capture_all_geometry: bool,
+        cached_plain_text: Option<Arc<str>>,
+        layout_heights: Rc<RefCell<LayoutHeightCache>>,
+    ) -> Self {
+        Self {
+            capture_all_geometry,
+            cached_plain_text,
+            layout_heights,
+            ..Self::default()
         }
-        if !self.plain_text.is_empty() {
-            self.plain_text.push_str("\n\n");
+    }
+
+    fn push_text(&mut self, text: &str) -> Option<Range<usize>> {
+        if text.is_empty() {
+            return None;
+        }
+        if self.char_len > 0 {
+            if self.cached_plain_text.is_none() {
+                self.plain_text.push_str("\n\n");
+            }
             self.char_len += 2;
         }
         let start = self.char_len;
-        self.plain_text.push_str(text);
+        if self.cached_plain_text.is_none() {
+            self.plain_text.push_str(text);
+        }
         self.char_len += text.chars().count();
-        span.chars = start..self.char_len;
+        Some(start..self.char_len)
+    }
+
+    fn push_span(&mut self, text: &str, mut span: RenderedArticleSpan) {
+        let Some(chars) = self.push_text(text) else {
+            return;
+        };
+        span.chars = chars;
         self.spans.push(span);
+    }
+
+    fn plain_text(&self) -> &str {
+        self.cached_plain_text
+            .as_deref()
+            .unwrap_or(self.plain_text.as_str())
+    }
+
+    fn canonical_text(&self) -> Arc<str> {
+        self.cached_plain_text
+            .clone()
+            .unwrap_or_else(|| Arc::from(self.plain_text.as_str()))
     }
 }
 
@@ -204,6 +263,11 @@ struct ImageFailure {
     retryable: bool,
 }
 
+struct LoadedImage {
+    bytes: Arc<[u8]>,
+    dimensions: (u32, u32),
+}
+
 enum ImageEvent {
     Progress {
         uri: String,
@@ -211,7 +275,7 @@ enum ImageEvent {
     },
     Complete {
         uri: String,
-        result: std::result::Result<Arc<[u8]>, ImageFailure>,
+        result: std::result::Result<LoadedImage, ImageFailure>,
     },
 }
 
@@ -251,8 +315,13 @@ pub(crate) struct ArticleDocumentPresenter {
     active: Option<Arc<PreparedDocument>>,
     prepared_by_fingerprint: HashMap<ContentFingerprint, Arc<PreparedDocument>>,
     recency: VecDeque<ContentFingerprint>,
+    active_selection_text: Option<(ContentFingerprint, Arc<str>)>,
+    layout_heights: Rc<RefCell<LayoutHeightCache>>,
     selection_drag: Option<ArticleSelectionDrag>,
     image_cache: HashMap<String, ImageState>,
+    image_layout_heights: HashMap<(String, u32), f32>,
+    image_layout_fingerprint: Option<ContentFingerprint>,
+    scroll_adjustment_y: f32,
     image_job_tx: std_mpsc::Sender<String>,
     image_event_rx: std_mpsc::Receiver<ImageEvent>,
     formula_cache: HashMap<String, FormulaState>,
@@ -262,6 +331,8 @@ pub(crate) struct ArticleDocumentPresenter {
     last_frame_max_layout_chars: usize,
     #[cfg(test)]
     last_frame_layout_calls: usize,
+    #[cfg(test)]
+    last_frame_elapsed: Duration,
 }
 
 impl ArticleDocumentPresenter {
@@ -277,8 +348,13 @@ impl ArticleDocumentPresenter {
             active: None,
             prepared_by_fingerprint: HashMap::new(),
             recency: VecDeque::new(),
+            active_selection_text: None,
+            layout_heights: Rc::new(RefCell::new(LayoutHeightCache::default())),
             selection_drag: None,
             image_cache: HashMap::new(),
+            image_layout_heights: HashMap::new(),
+            image_layout_fingerprint: None,
+            scroll_adjustment_y: 0.0,
             image_job_tx,
             image_event_rx,
             formula_cache: HashMap::new(),
@@ -288,6 +364,8 @@ impl ArticleDocumentPresenter {
             last_frame_max_layout_chars: 0,
             #[cfg(test)]
             last_frame_layout_calls: 0,
+            #[cfg(test)]
+            last_frame_elapsed: Duration::ZERO,
         })
     }
 
@@ -301,13 +379,32 @@ impl ArticleDocumentPresenter {
         F: FnOnce(&mut egui::Ui),
     {
         #[cfg(test)]
+        let frame_started = Instant::now();
+        #[cfg(test)]
         {
             self.last_frame_max_layout_chars = 0;
             self.last_frame_layout_calls = 0;
         }
         self.receive_media(ui.ctx());
         let document = self.prepare(request.source);
-        let mut frame = ArticleSelectionFrame::default();
+        self.scroll_adjustment_y = 0.0;
+        if self.image_layout_fingerprint.as_ref() != Some(&document.fingerprint) {
+            self.image_layout_fingerprint = Some(document.fingerprint.clone());
+            self.image_layout_heights.clear();
+        }
+        let cached_selection_text = self
+            .active_selection_text
+            .as_ref()
+            .filter(|(fingerprint, _)| fingerprint == &document.fingerprint)
+            .map(|(_, text)| Arc::clone(text));
+        self.layout_heights
+            .borrow_mut()
+            .prepare(&document.fingerprint);
+        let mut frame = ArticleSelectionFrame::new(
+            request.restore_selection.is_some(),
+            cached_selection_text,
+            Rc::clone(&self.layout_heights),
+        );
         let (title_response, _) = selectable_text_block_with_style(
             ui,
             request.source.article_id,
@@ -337,10 +434,13 @@ impl ArticleDocumentPresenter {
             );
         }
 
-        let mut outcome = PresentOutcome::default();
+        let mut outcome = PresentOutcome {
+            body_rendered: !document.blocks.is_empty(),
+            ..PresentOutcome::default()
+        };
         if let Some(restore) = request.restore_selection {
             if let Some(range) =
-                resolve_excerpt_anchor(&frame.plain_text, &restore.selected_text, &restore.anchor)
+                resolve_excerpt_anchor(frame.plain_text(), &restore.selected_text, &restore.anchor)
             {
                 outcome.restored_span_top = frame
                     .spans
@@ -350,6 +450,19 @@ impl ArticleDocumentPresenter {
             } else {
                 outcome.restore_failed = true;
             }
+        }
+        if self
+            .active_selection_text
+            .as_ref()
+            .is_none_or(|(fingerprint, _)| fingerprint != &document.fingerprint)
+        {
+            self.active_selection_text =
+                Some((document.fingerprint.clone(), frame.canonical_text()));
+        }
+        outcome.scroll_adjustment_y = self.scroll_adjustment_y;
+        #[cfg(test)]
+        {
+            self.last_frame_elapsed = frame_started.elapsed();
         }
         outcome.intents = self.selection_intents(
             ui.ctx(),
@@ -413,17 +526,9 @@ impl ArticleDocumentPresenter {
                 }
                 ImageEvent::Complete { uri, result } => {
                     let state = match result {
-                        Ok(bytes) => match image::load_from_memory(bytes.as_ref()) {
-                            Ok(decoded) => ImageState::Ready {
-                                dimensions: Some((decoded.width(), decoded.height())),
-                                bytes,
-                            },
-                            Err(error) => ImageState::Failed(ImageFailure {
-                                message: "图片格式无法显示".to_owned(),
-                                detail: error.to_string(),
-                                attempts: 1,
-                                retryable: false,
-                            }),
+                        Ok(image) => ImageState::Ready {
+                            dimensions: Some(image.dimensions),
+                            bytes: image.bytes,
                         },
                         Err(error) => ImageState::Failed(error),
                     };
@@ -980,7 +1085,7 @@ impl ArticleDocumentPresenter {
             && let Some(drag) = self.selection_drag.take()
             && let Some(quote) = selected_quote_from_article_text(
                 article_id,
-                &frame.plain_text,
+                frame.plain_text(),
                 drag.anchor.char_index,
                 drag.focus.char_index,
             )
@@ -1141,7 +1246,7 @@ fn needs_typographic_space(left: char, right: char) -> bool {
     left_word && right_word && (left.is_ascii() || right.is_ascii())
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ArticleTextStyle {
     Title,
     Body,
@@ -1196,22 +1301,62 @@ fn selectable_text_block_with_inline_style(
         0.0
     };
     let available_width = ui.available_width().max(1.0);
-    let job = article_layout_job(
-        style,
-        text,
-        strong_ranges,
-        inline_code_ranges,
-        link_ranges,
-        (available_width - heading_inset).max(1.0),
-    );
-    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+    let wrap_width = (available_width - heading_inset).max(1.0);
+    let cache_key = (block_index, style, wrap_width.to_bits());
+    let cached_height = selection_frame
+        .layout_heights
+        .borrow()
+        .heights
+        .get(&cache_key)
+        .copied();
+    let mut galley = cached_height.is_none().then(|| {
+        let job = article_layout_job(
+            style,
+            text,
+            strong_ranges,
+            inline_code_ranges,
+            link_ranges,
+            wrap_width,
+        );
+        ui.fonts_mut(|fonts| fonts.layout_job(job))
+    });
+    let height = cached_height.unwrap_or_else(|| {
+        let height = galley
+            .as_ref()
+            .expect("未命中高度缓存时必须先完成文本布局")
+            .size()
+            .y;
+        selection_frame
+            .layout_heights
+            .borrow_mut()
+            .heights
+            .insert(cache_key, height);
+        height
+    });
     let mut sense = egui::Sense::click_and_drag();
     sense -= egui::Sense::FOCUSABLE;
     let (row_rect, mut response) = ui
         .push_id(("article-document-label", article_id, block_index), |ui| {
-            ui.allocate_exact_size(egui::vec2(available_width, galley.size().y), sense)
+            ui.allocate_exact_size(egui::vec2(available_width, height), sense)
         })
         .inner;
+    let visible = selection_frame.capture_all_geometry
+        || row_rect.intersects(ui.clip_rect().expand2(egui::vec2(0.0, 160.0)));
+    if !visible {
+        selection_frame.push_text(text);
+        return (response, None);
+    }
+    let galley = galley.take().unwrap_or_else(|| {
+        let job = article_layout_job(
+            style,
+            text,
+            strong_ranges,
+            inline_code_ranges,
+            link_ranges,
+            wrap_width,
+        );
+        ui.fonts_mut(|fonts| fonts.layout_job(job))
+    });
     response.set_intrinsic_size(galley.intrinsic_size());
     let galley_pos = row_rect.left_top() + egui::vec2(heading_inset, 0.0);
     if matches!(style, ArticleTextStyle::Heading) {
@@ -1386,6 +1531,12 @@ fn append_inline_layout(
     );
     boundaries.sort_unstable();
     boundaries.dedup();
+    let merged_strong_ranges = merge_inline_ranges(strong_ranges.iter().cloned());
+    let merged_code_ranges = merge_inline_ranges(inline_code_ranges.iter().cloned());
+    let merged_link_ranges = merge_inline_ranges(link_ranges.iter().map(|link| link.range.clone()));
+    let mut strong_cursor = 0;
+    let mut code_cursor = 0;
+    let mut link_cursor = 0;
     let mut link = normal.clone();
     link.color = ReaderTheme::sspai().link;
     let mut code = normal.clone();
@@ -1400,26 +1551,51 @@ fn append_inline_layout(
         if start >= end || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
             continue;
         }
-        let format = if link_ranges
-            .iter()
-            .any(|range| range.range.start <= start && end <= range.range.end)
-        {
+        let format = if inline_range_covers(&merged_link_ranges, &mut link_cursor, start, end) {
             link.clone()
-        } else if inline_code_ranges
-            .iter()
-            .any(|range| range.start <= start && end <= range.end)
-        {
+        } else if inline_range_covers(&merged_code_ranges, &mut code_cursor, start, end) {
             code.clone()
-        } else if strong_ranges
-            .iter()
-            .any(|range| range.start <= start && end <= range.end)
-        {
+        } else if inline_range_covers(&merged_strong_ranges, &mut strong_cursor, start, end) {
             strong.clone()
         } else {
             normal.clone()
         };
         job.append(&text[start..end], 0.0, format);
     }
+}
+
+fn merge_inline_ranges(ranges: impl IntoIterator<Item = Range<usize>>) -> Vec<Range<usize>> {
+    let mut ranges = ranges
+        .into_iter()
+        .filter(|range| range.start < range.end)
+        .collect::<Vec<_>>();
+    ranges.sort_unstable_by_key(|range| (range.start, range.end));
+
+    let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if let Some(previous) = merged.last_mut()
+            && range.start <= previous.end
+        {
+            previous.end = previous.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+    merged
+}
+
+fn inline_range_covers(
+    ranges: &[Range<usize>],
+    cursor: &mut usize,
+    start: usize,
+    end: usize,
+) -> bool {
+    while ranges.get(*cursor).is_some_and(|range| range.end <= start) {
+        *cursor += 1;
+    }
+    ranges
+        .get(*cursor)
+        .is_some_and(|range| range.start <= start && end <= range.end)
 }
 
 fn article_cursor_for_pointer(
@@ -1444,28 +1620,24 @@ fn article_cursor_under_pointer(
     frame: &ArticleSelectionFrame,
     position: egui::Pos2,
 ) -> Option<ArticleDocCursor> {
-    if let Some((span_index, span)) = frame
+    if let Some(span) = frame
         .spans
         .iter()
-        .enumerate()
-        .find(|(_, span)| span.pointer_local_char.is_some())
+        .find(|span| span.pointer_local_char.is_some())
     {
         let local_char = span
             .pointer_local_char
             .unwrap_or_default()
             .min(span.chars.end.saturating_sub(span.chars.start));
         return Some(ArticleDocCursor {
-            span_index,
-            local_char,
             char_index: span.chars.start + local_char,
         });
     }
     frame
         .spans
         .iter()
-        .enumerate()
-        .find(|(_, span)| span.global_rect.contains(position))
-        .map(|(index, span)| article_cursor_in_span(index, span, position))
+        .find(|span| span.global_rect.contains(position))
+        .map(|span| article_cursor_in_span(span, position))
 }
 
 fn article_cursor_nearest(
@@ -1475,12 +1647,11 @@ fn article_cursor_nearest(
     frame
         .spans
         .iter()
-        .enumerate()
-        .min_by(|(_, left), (_, right)| {
+        .min_by(|left, right| {
             rect_distance(left.global_rect, position)
                 .total_cmp(&rect_distance(right.global_rect, position))
         })
-        .map(|(index, span)| article_cursor_in_span(index, span, position))
+        .map(|span| article_cursor_in_span(span, position))
 }
 
 fn rect_distance(rect: egui::Rect, position: egui::Pos2) -> f32 {
@@ -1501,17 +1672,11 @@ fn rect_distance(rect: egui::Rect, position: egui::Pos2) -> f32 {
     x * x + y * y
 }
 
-fn article_cursor_in_span(
-    span_index: usize,
-    span: &RenderedArticleSpan,
-    position: egui::Pos2,
-) -> ArticleDocCursor {
+fn article_cursor_in_span(span: &RenderedArticleSpan, position: egui::Pos2) -> ArticleDocCursor {
     let local = span.global_from_galley.inverse() * position;
     let span_len = span.chars.end.saturating_sub(span.chars.start);
     let local_char = usize::from(span.galley.cursor_from_pos(local.to_vec2()).index).min(span_len);
     ArticleDocCursor {
-        span_index,
-        local_char,
         char_index: span.chars.start + local_char,
     }
 }
@@ -1520,9 +1685,12 @@ fn article_cursor_anchor(
     frame: &ArticleSelectionFrame,
     cursor: ArticleDocCursor,
 ) -> Option<(egui::Rect, egui::LayerId)> {
-    let span = frame.spans.get(cursor.span_index)?;
+    let span = frame.spans.iter().find(|span| {
+        span.chars.start <= cursor.char_index && cursor.char_index <= span.chars.end
+    })?;
     let local = cursor
-        .local_char
+        .char_index
+        .saturating_sub(span.chars.start)
         .min(span.chars.end.saturating_sub(span.chars.start));
     let rect = span.galley.pos_from_cursor(egui::text::CCursor::new(local));
     Some((
@@ -1636,6 +1804,13 @@ impl ArticleDocumentPresenter {
         let (rect, response) =
             ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
         let content_rect = rect.translate(-ui.max_rect().min.to_vec2());
+        let image_key = (uri.to_owned(), width.to_bits());
+        if let Some(previous_height) = self.image_layout_heights.insert(image_key, height) {
+            let delta = height - previous_height;
+            if delta.abs() > 0.1 && content_rect.bottom() <= viewport.min.y {
+                self.scroll_adjustment_y += delta;
+            }
+        }
         let visible = content_rect.intersects(viewport.expand2(egui::vec2(0.0, 600.0)));
         if visible && !self.image_cache.contains_key(uri) {
             if self.image_job_tx.send(uri.to_owned()).is_ok() {
@@ -1760,23 +1935,25 @@ impl ArticleDocumentPresenter {
 }
 
 fn image_client() -> Result<reqwest::blocking::Client> {
-    Ok(reqwest::blocking::Client::builder()
-        .http1_only()
-        .connect_timeout(Duration::from_secs(8))
-        .timeout(Duration::from_secs(30))
-        .pool_idle_timeout(Duration::from_secs(30))
-        .pool_max_idle_per_host(IMAGE_WORKER_COUNT)
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() > 10 {
-                return attempt.error("图片重定向次数过多");
-            }
-            if let Err(message) = crate::web_clip::validate_public_url(attempt.url()) {
-                return attempt.error(message);
-            }
-            attempt.follow()
-        }))
-        .user_agent(concat!("Shiyue/", env!("CARGO_PKG_VERSION")))
-        .build()?)
+    Ok(
+        crate::web_clip::with_public_dns_resolver(reqwest::blocking::Client::builder())
+            .http1_only()
+            .connect_timeout(Duration::from_secs(8))
+            .timeout(Duration::from_secs(30))
+            .pool_idle_timeout(Duration::from_secs(30))
+            .pool_max_idle_per_host(IMAGE_WORKER_COUNT)
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() > 10 {
+                    return attempt.error("图片重定向次数过多");
+                }
+                if let Err(message) = crate::web_clip::validate_public_url(attempt.url()) {
+                    return attempt.error(message);
+                }
+                attempt.follow()
+            }))
+            .user_agent(concat!("Shiyue/", env!("CARGO_PKG_VERSION")))
+            .build()?,
+    )
 }
 
 /// Private seam around the only remote dependency in document presentation.
@@ -1876,17 +2053,27 @@ fn load_cached_or_download_image(
     store: &ImageStore,
     uri: &str,
     events: &std_mpsc::Sender<ImageEvent>,
-) -> std::result::Result<Arc<[u8]>, ImageFailure> {
+) -> std::result::Result<LoadedImage, ImageFailure> {
     match store.get(uri) {
-        Ok(Some(bytes)) if image::load_from_memory(&bytes).is_ok() => {
-            return Ok(Arc::from(bytes));
+        Ok(Some(bytes)) => {
+            if let Ok(decoded) = decode_image(&bytes) {
+                return Ok(LoadedImage {
+                    bytes: Arc::from(bytes),
+                    dimensions: (decoded.width(), decoded.height()),
+                });
+            }
         }
         Ok(_) => {}
         Err(error) => tracing::warn!("读取图片缓存失败：{error:#}"),
     }
     let bytes = download_image_with_retry(fetch, uri, events)?;
-    image::load_from_memory(bytes.as_ref()).map_err(|error| ImageFailure {
-        message: "图片格式无法解码".to_owned(),
+    let decoded = decode_image(bytes.as_ref()).map_err(|error| ImageFailure {
+        message: if matches!(&error, image::ImageError::Limits(_)) {
+            "图片尺寸或解码内存超过限制"
+        } else {
+            "图片格式无法解码"
+        }
+        .to_owned(),
         detail: error.to_string(),
         attempts: 1,
         retryable: false,
@@ -1896,7 +2083,20 @@ fn load_cached_or_download_image(
     } else if let Err(error) = store.prune_to(DEFAULT_LIMIT_BYTES) {
         tracing::warn!("清理图片缓存失败：{error:#}");
     }
-    Ok(bytes)
+    Ok(LoadedImage {
+        bytes,
+        dimensions: (decoded.width(), decoded.height()),
+    })
+}
+
+fn decode_image(bytes: &[u8]) -> image::ImageResult<image::DynamicImage> {
+    let mut reader = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(IMAGE_MAX_DIMENSION);
+    limits.max_image_height = Some(IMAGE_MAX_DIMENSION);
+    limits.max_alloc = Some(IMAGE_MAX_DECODE_BYTES);
+    reader.limits(limits);
+    reader.decode()
 }
 
 fn download_image_with_retry(
@@ -2061,17 +2261,21 @@ fn reqwest_error_chain(error: &reqwest::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArticleDocumentPresenter, ArticleDocumentSource, ArticleTextStyle, BODY_GALLEY_MAX_CHARS,
-        ContentFingerprint, FormulaEvent, FormulaJob, IMAGE_MAX_ATTEMPTS, ImageEvent, ImageFailure,
-        ImageFetch, PresentRequest, RestoreSelection, article_layout_job, body_block_separator,
+        ArticleDocumentPresenter, ArticleDocumentSource, ArticleLinkRange, ArticleTextStyle,
+        BODY_GALLEY_MAX_CHARS, ContentFingerprint, FormulaEvent, FormulaJob, IMAGE_MAX_ATTEMPTS,
+        ImageEvent, ImageFailure, ImageFetch, ImageState, LayoutHeightCache, PresentRequest,
+        ReaderTheme, RestoreSelection, article_layout_job, body_block_separator,
         body_fragment_separator, download_image_with_retry, load_cached_or_download_image,
-        selected_quote_from_article_text,
+        merge_inline_ranges, selected_quote_from_article_text,
     };
     use crate::image_store::ImageStore;
     use crate::model::TextAnchor;
     use eframe::egui;
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use std::sync::atomic::{AtomicU8, Ordering};
     use std::sync::{Arc, mpsc};
+    use std::time::{Duration, Instant};
 
     fn presenter_without_workers() -> ArticleDocumentPresenter {
         let (image_job_tx, _image_jobs) = mpsc::channel::<String>();
@@ -2082,8 +2286,13 @@ mod tests {
             active: None,
             prepared_by_fingerprint: Default::default(),
             recency: Default::default(),
+            active_selection_text: None,
+            layout_heights: Rc::new(RefCell::new(LayoutHeightCache::default())),
             selection_drag: None,
             image_cache: Default::default(),
+            image_layout_heights: Default::default(),
+            image_layout_fingerprint: None,
+            scroll_adjustment_y: 0.0,
             image_job_tx,
             image_event_rx,
             formula_cache: Default::default(),
@@ -2091,6 +2300,7 @@ mod tests {
             formula_event_rx,
             last_frame_max_layout_chars: 0,
             last_frame_layout_calls: 0,
+            last_frame_elapsed: Duration::ZERO,
         }
     }
 
@@ -2212,10 +2422,55 @@ mod tests {
                     |_| {},
                 );
                 assert!(!outcome.restore_failed);
+                assert!(outcome.body_rendered);
             });
         }
 
         assert_eq!(presenter.prepared_by_fingerprint.len(), 1);
+    }
+
+    #[test]
+    fn presentation_reports_empty_semantic_documents_as_not_rendered() {
+        let mut presenter = presenter_without_workers();
+        let context = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        let fallback = fonts
+            .families
+            .get(&egui::FontFamily::Proportional)
+            .cloned()
+            .unwrap_or_default();
+        fonts
+            .families
+            .insert(egui::FontFamily::Name("cjk-bold".into()), fallback);
+        context.set_fonts(fonts);
+        let source = ArticleDocumentSource {
+            article_id: 10,
+            title: "Script only",
+            html: "<script>console.log('hidden')</script>",
+            base_url: Some("https://example.com/article"),
+        };
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let _ = context.run_ui(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let outcome = presenter.show(
+                    ui,
+                    PresentRequest {
+                        source,
+                        viewport: ui.clip_rect(),
+                        restore_selection: None,
+                        scroll_title_into_view: false,
+                    },
+                    |_| {},
+                );
+                assert!(!outcome.body_rendered);
+            });
+        });
     }
 
     #[test]
@@ -2276,6 +2531,229 @@ mod tests {
             presenter.last_frame_layout_calls <= 80,
             "向下滚动的一帧仍完整布局了 {} 个段落",
             presenter.last_frame_layout_calls
+        );
+    }
+
+    #[test]
+    fn scrolling_long_document_keeps_painted_shape_count_bounded() {
+        let mut presenter = presenter_without_workers();
+        let context = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        let fallback = fonts
+            .families
+            .get(&egui::FontFamily::Proportional)
+            .cloned()
+            .unwrap_or_default();
+        fonts
+            .families
+            .insert(egui::FontFamily::Name("cjk-bold".into()), fallback);
+        context.set_fonts(fonts);
+        let html = (0..1_200)
+            .map(|index| format!("<p>第 {index} 段包含足够长的正文，用于模拟真实长文章滚动。</p>"))
+            .collect::<String>();
+        let source = ArticleDocumentSource {
+            article_id: 78,
+            title: "Long document paint budget",
+            html: &html,
+            base_url: Some("https://example.com/long-paint"),
+        };
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(820.0, 900.0),
+            )),
+            ..Default::default()
+        };
+
+        let output = context.run_ui(input, |ui| {
+            ui.set_width(820.0);
+            ui.set_height(900.0);
+            egui::ScrollArea::vertical()
+                .id_salt("article-paint-budget-regression")
+                .scroll_offset(egui::vec2(0.0, 24_000.0))
+                .show_viewport(ui, |ui, viewport| {
+                    presenter.show(
+                        ui,
+                        PresentRequest {
+                            source,
+                            viewport,
+                            restore_selection: None,
+                            scroll_title_into_view: false,
+                        },
+                        |_| {},
+                    );
+                });
+        });
+
+        assert!(
+            output.shapes.len() <= 24,
+            "滚动一帧仍向渲染器提交了整篇文章的 {} 个图形",
+            output.shapes.len()
+        );
+    }
+
+    #[test]
+    fn human_reading_fixture_keeps_scroll_frame_metrics_bounded() {
+        let mut presenter = presenter_without_workers();
+        let context = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        let fallback = fonts
+            .families
+            .get(&egui::FontFamily::Proportional)
+            .cloned()
+            .unwrap_or_default();
+        fonts
+            .families
+            .insert(egui::FontFamily::Name("cjk-bold".into()), fallback);
+        context.set_fonts(fonts);
+        let html = (0..900)
+            .map(|index| {
+                format!(
+                    "<p>第 {index} 段用于稳定性回归，包含足够长的中文正文和一个 <a href=\"https://example.com/{index}\">链接</a>。</p>"
+                )
+            })
+            .collect::<String>();
+        let source = ArticleDocumentSource {
+            article_id: 80,
+            title: "Human reading performance fixture",
+            html: &html,
+            base_url: Some("https://example.com/performance"),
+        };
+        let mut heights = Vec::new();
+
+        for offset in [0.0, 8_000.0, 16_000.0, 8_000.0] {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(820.0, 900.0),
+                )),
+                ..Default::default()
+            };
+            let mut content_height = 0.0;
+            let _ = context.run_ui(input, |ui| {
+                ui.set_width(820.0);
+                ui.set_height(900.0);
+                let output = egui::ScrollArea::vertical()
+                    .id_salt("human-reading-performance-fixture")
+                    .scroll_offset(egui::vec2(0.0, offset))
+                    .show_viewport(ui, |ui, viewport| {
+                        presenter.show(
+                            ui,
+                            PresentRequest {
+                                source,
+                                viewport,
+                                restore_selection: None,
+                                scroll_title_into_view: false,
+                            },
+                            |_| {},
+                        );
+                    });
+                content_height = output.content_size.y;
+            });
+            heights.push(content_height);
+            assert!(
+                presenter.last_frame_layout_calls <= 80,
+                "正文滚动帧布局了 {} 个段落",
+                presenter.last_frame_layout_calls
+            );
+            assert!(
+                presenter.last_frame_max_layout_chars <= BODY_GALLEY_MAX_CHARS,
+                "正文滚动帧包含 {} 个字符的单一布局",
+                presenter.last_frame_max_layout_chars
+            );
+            if !heights.is_empty() {
+                // Wall-clock timing is diagnostic rather than a hard unit-test gate:
+                // parallel test execution and cold caches can briefly add scheduler
+                // contention on CI. Structural budgets above remain deterministic
+                // regression gates; this generous ceiling only catches pathological
+                // hangs while keeping the fixture stable across machines.
+                assert!(
+                    presenter.last_frame_elapsed < Duration::from_secs(3),
+                    "正文滚动帧耗时 {:?}，疑似出现卡顿或阻塞",
+                    presenter.last_frame_elapsed
+                );
+            }
+        }
+
+        let min_height = heights.iter().copied().fold(f32::INFINITY, f32::min);
+        let max_height = heights.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            max_height - min_height <= 1.0,
+            "滚动改变正文总高度 {} px，位置可能发生漂移",
+            max_height - min_height
+        );
+    }
+
+    #[test]
+    fn image_height_change_above_viewport_reports_scroll_anchor_adjustment() {
+        let mut presenter = presenter_without_workers();
+        let context = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        let fallback = fonts
+            .families
+            .get(&egui::FontFamily::Proportional)
+            .cloned()
+            .unwrap_or_default();
+        fonts
+            .families
+            .insert(egui::FontFamily::Name("cjk-bold".into()), fallback);
+        context.set_fonts(fonts);
+        let source = ArticleDocumentSource {
+            article_id: 91,
+            title: "Image anchor",
+            html: "<p>上方正文</p><img src=\"https://example.com/photo.png\"><p>下方正文</p>",
+            base_url: Some("https://example.com/article"),
+        };
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(820.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let _ = context.run_ui(input.clone(), |ui| {
+            presenter.show(
+                ui,
+                PresentRequest {
+                    source,
+                    viewport: egui::Rect::from_min_size(
+                        egui::pos2(0.0, 1_000.0),
+                        egui::vec2(820.0, 900.0),
+                    ),
+                    restore_selection: None,
+                    scroll_title_into_view: false,
+                },
+                |_| {},
+            );
+        });
+        presenter.image_cache.insert(
+            "https://example.com/photo.png".into(),
+            ImageState::Ready {
+                dimensions: Some((100, 900)),
+                bytes: Arc::from([]),
+            },
+        );
+        let mut adjustment = 0.0;
+        let _ = context.run_ui(input, |ui| {
+            adjustment = presenter
+                .show(
+                    ui,
+                    PresentRequest {
+                        source,
+                        viewport: egui::Rect::from_min_size(
+                            egui::pos2(0.0, 1_000.0),
+                            egui::vec2(820.0, 900.0),
+                        ),
+                        restore_selection: None,
+                        scroll_title_into_view: false,
+                    },
+                    |_| {},
+                )
+                .scroll_adjustment_y;
+        });
+        assert!(
+            adjustment > 0.0,
+            "视口上方图片高度增加后没有报告滚动锚点修正"
         );
     }
 
@@ -2484,6 +2962,76 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn inline_layout_keeps_link_code_and_strong_precedence_with_unsorted_overlaps() {
+        let text = "abcdefghij";
+        let code_range = 3..7;
+        let job = article_layout_job(
+            ArticleTextStyle::Body,
+            text,
+            &[2..9, 0..4],
+            std::slice::from_ref(&code_range),
+            &[ArticleLinkRange {
+                range: 5..8,
+                url: "https://example.com".to_owned(),
+            }],
+            1200.0,
+        );
+        let format_for = |start, end| {
+            &job.sections
+                .iter()
+                .find(|section| {
+                    usize::from(section.byte_range.start) == start
+                        && usize::from(section.byte_range.end) == end
+                })
+                .unwrap_or_else(|| panic!("missing layout section {start}..{end}"))
+                .format
+        };
+
+        assert_eq!(
+            format_for(0, 3).font_id.family,
+            egui::FontFamily::Name("cjk-bold".into())
+        );
+        assert_eq!(format_for(3, 5).font_id.family, egui::FontFamily::Monospace);
+        assert_eq!(format_for(5, 8).color, ReaderTheme::sspai().link);
+        assert_eq!(
+            format_for(8, 9).font_id.family,
+            egui::FontFamily::Name("cjk-bold".into())
+        );
+        assert_eq!(merge_inline_ranges([6..9, 0..4, 2..7]), vec![0..9]);
+    }
+
+    #[test]
+    #[ignore = "local performance benchmark; run explicitly before release"]
+    fn dense_inline_ranges_layout_benchmark() {
+        let mut text = String::new();
+        let mut strong = Vec::new();
+        let mut code = Vec::new();
+        let mut links = Vec::new();
+        for index in 0..800 {
+            let start = text.len();
+            text.push_str("inline-range ");
+            let range = start..text.len() - 1;
+            match index % 3 {
+                0 => strong.push(range),
+                1 => code.push(range),
+                _ => links.push(ArticleLinkRange {
+                    range,
+                    url: format!("https://example.com/{index}"),
+                }),
+            }
+        }
+
+        let started = Instant::now();
+        for _ in 0..40 {
+            let job =
+                article_layout_job(ArticleTextStyle::Body, &text, &strong, &code, &links, 800.0);
+            std::hint::black_box(job.sections.len());
+        }
+        let elapsed = started.elapsed();
+        eprintln!("Dense inline layout benchmark: {elapsed:?}");
+    }
+
     struct SequenceFetch {
         calls: AtomicU8,
         bytes: Arc<[u8]>,
@@ -2556,8 +3104,9 @@ mod tests {
         store.put(uri, encoded.get_ref()).unwrap();
         let (events, received) = mpsc::channel();
 
-        let bytes = load_cached_or_download_image(&PanicFetch, &store, uri, &events).unwrap();
-        assert!(image::load_from_memory(bytes.as_ref()).is_ok());
+        let image = load_cached_or_download_image(&PanicFetch, &store, uri, &events).unwrap();
+        assert_eq!(image.dimensions, (1, 1));
+        assert!(!image.bytes.is_empty());
         assert!(received.try_recv().is_err());
 
         drop(store);

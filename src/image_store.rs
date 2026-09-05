@@ -45,8 +45,10 @@ impl ImageStore {
     pub fn get(&self, url: &str) -> Result<Option<Vec<u8>>> {
         let _guard = self.mutation.lock().unwrap_or_else(|err| err.into_inner());
         let reference = self.references.join(digest(url.as_bytes()));
-        let Ok(hash) = fs::read_to_string(&reference) else {
-            return Ok(None);
+        let hash = match fs::read_to_string(&reference) {
+            Ok(hash) => hash,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
         };
         let hash = hash.trim();
         if !valid_digest(hash) {
@@ -54,9 +56,13 @@ impl ImageStore {
             return Ok(None);
         }
         let object = self.objects.join(hash);
-        let Ok(bytes) = fs::read(&object) else {
-            let _ = fs::remove_file(reference);
-            return Ok(None);
+        let bytes = match fs::read(&object) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let _ = fs::remove_file(reference);
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
         };
         if digest(&bytes) != hash {
             let _ = fs::remove_file(object);
@@ -87,6 +93,11 @@ impl ImageStore {
     }
 
     pub fn stats(&self) -> Result<CacheStats> {
+        let _guard = self.mutation.lock().unwrap_or_else(|err| err.into_inner());
+        self.stats_unlocked()
+    }
+
+    fn stats_unlocked(&self) -> Result<CacheStats> {
         Ok(CacheStats {
             objects: regular_files(&self.objects)?.len(),
             references: regular_files(&self.references)?.len(),
@@ -101,7 +112,7 @@ impl ImageStore {
     /// no longer reachable from any reference.
     pub fn prune_to(&self, limit: u64) -> Result<u64> {
         let _guard = self.mutation.lock().unwrap_or_else(|err| err.into_inner());
-        let before = self.stats()?.bytes;
+        let before = self.stats_unlocked()?.bytes;
         let mut refs = self.reference_entries()?;
         refs.sort_by_key(|entry| entry.0);
         while referenced_bytes(&self.objects, &refs) > limit && !refs.is_empty() {
@@ -109,12 +120,12 @@ impl ImageStore {
             fs::remove_file(path)?;
         }
         self.sweep_unreferenced(&refs)?;
-        Ok(before.saturating_sub(self.stats()?.bytes))
+        Ok(before.saturating_sub(self.stats_unlocked()?.bytes))
     }
 
     pub fn clear(&self) -> Result<u64> {
         let _guard = self.mutation.lock().unwrap_or_else(|err| err.into_inner());
-        let before = self.stats()?.bytes;
+        let before = self.stats_unlocked()?.bytes;
         for directory in [&self.references, &self.objects] {
             for path in regular_files(directory)? {
                 fs::remove_file(path)?;
@@ -229,6 +240,23 @@ mod tests {
         assert_eq!(store.stats().unwrap().objects, 1);
         assert_eq!(store.stats().unwrap().references, 2);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prune_and_clear_do_not_reenter_the_mutation_lock() {
+        let root = temp_root("lock-reentry");
+        let store = ImageStore::open(&root).unwrap();
+        store
+            .put("https://example.com/image.png", b"image-bytes")
+            .unwrap();
+
+        assert!(store.prune_to(0).unwrap() > 0);
+        store
+            .put("https://example.com/image.png", b"image-bytes")
+            .unwrap();
+        assert!(store.clear().unwrap() > 0);
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
