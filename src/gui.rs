@@ -4625,12 +4625,17 @@ impl eframe::App for GuiApp {
                                 (None, None) => String::new(),
                             };
                             if !meta.is_empty() {
-                                ui.add(
+                                ui.add_sized(
+                                    egui::vec2(ui.available_width(), 18.0),
                                     egui::Label::new(
                                         egui::RichText::new(meta).size(12.5).color(theme.subtle),
                                     )
                                     .truncate(),
                                 );
+                            } else {
+                                // show_rows assumes 68 points for every row, including
+                                // historical entries whose source has no date or author.
+                                ui.add_space(18.0);
                             }
                             ui.add_space(ARTICLE_ROW_HEIGHT - 38.0 - 18.0);
                         }

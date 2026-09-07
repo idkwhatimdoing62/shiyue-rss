@@ -1,4 +1,4 @@
-//! Session-bound historical import for 阮一峰的网络日志.
+//! Session-bound historical import with automatic archive discovery.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -12,8 +12,9 @@ use chrono::Utc;
 use crate::article_document_presentation::prepare_article_html;
 use crate::config::NetworkMode;
 use crate::db::Db;
+use crate::history_discovery::{self, Entry, Pager, SourceKind};
 use crate::model::NewArticle;
-use crate::ruanyifeng_archive::{self, ArchiveEntry, BATCH_SIZE};
+const BATCH_SIZE: usize = 50;
 use crate::web_clip;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +38,7 @@ pub(crate) struct BackfillSnapshot {
     pub(crate) batch_size: usize,
     pub(crate) has_more: bool,
     pub(crate) last_error: Option<String>,
+    pub(crate) source_description: String,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +80,7 @@ impl HistoryBackfillWorkflow {
             batch_size: BATCH_SIZE,
             has_more: false,
             last_error: None,
+            source_description: "自动检测归档页，未发现时使用 RSS/Atom 分页".into(),
         }));
         let shared = Arc::clone(&snapshot);
         let repaint = Arc::new(repaint);
@@ -139,12 +142,13 @@ impl Drop for HistoryBackfillWorkflow {
 
 struct State {
     feed_id: i64,
-    entries: Vec<ArchiveEntry>,
+    entries: Vec<Entry>,
     seen_urls: HashSet<String>,
-    failed_entries: Vec<ArchiveEntry>,
+    failed_entries: Vec<Entry>,
     cursor: usize,
-    month_url: Option<String>,
+    pager: Pager,
     paused: bool,
+    shutdown: bool,
 }
 
 fn worker(
@@ -163,6 +167,7 @@ fn worker(
         match command {
             Command::Shutdown => break,
             Command::Start { feed_id, feed_url } => {
+                state = None;
                 let result = start_state(&client, mode, feed_id, feed_url, &snapshot);
                 match result {
                     Ok(next) => {
@@ -219,6 +224,9 @@ fn worker(
                 notify(&notice_tx, &repaint);
             }
         }
+        if state.as_ref().is_some_and(|current| current.shutdown) {
+            break;
+        }
     }
 }
 
@@ -229,49 +237,32 @@ fn start_state(
     feed_url: String,
     snapshot: &Arc<Mutex<BackfillSnapshot>>,
 ) -> Result<State> {
+    {
+        let mut current = snapshot.lock().expect("backfill snapshot poisoned");
+        current.feed_id = Some(feed_id);
+        current.status = BackfillStatus::Fetching;
+        current.discovered = 0;
+        current.processed = 0;
+        current.inserted = 0;
+        current.failed = 0;
+        current.has_more = false;
+        current.last_error = None;
+        current.source_description = "正在自动检测归档页…".into();
+    }
+    let (pager, entries) = history_discovery::discover(&feed_url, &mut |url, kind| {
+        fetch_source(client, mode, url, kind)
+    })?;
     let mut state = State {
         feed_id,
         entries: Vec::new(),
         seen_urls: HashSet::new(),
         failed_entries: Vec::new(),
         cursor: 0,
-        month_url: None,
+        pager,
         paused: false,
+        shutdown: false,
     };
-    if ruanyifeng_archive::is_supported_feed_url(&feed_url) {
-        let root =
-            web_clip::fetch_html_with_mode(client, ruanyifeng_archive::DEFAULT_ARCHIVE_URL, mode)?;
-        let page = ruanyifeng_archive::parse_archive_page(&root.html, &root.final_url)?;
-        state.month_url = page
-            .month_url
-            .or_else(|| Some(ruanyifeng_archive::DEFAULT_ARCHIVE_URL.into()));
-        append_page(client, mode, &mut state)?;
-    } else {
-        let root = web_clip::fetch_html_with_mode(client, &feed_url, mode)?;
-        let parsed = feed_rs::parser::parse(std::io::Cursor::new(root.html.as_bytes()))
-            .map_err(|error| anyhow!("解析订阅源失败：{error}"))?;
-        for item in parsed.entries {
-            let Some(link) = item.links.first().map(|link| link.href.clone()) else {
-                continue;
-            };
-            if state.seen_urls.insert(link.clone()) {
-                state.entries.push(ArchiveEntry {
-                    url: link,
-                    title: item
-                        .title
-                        .map(|title| title.content)
-                        .unwrap_or_else(|| "未命名文章".into()),
-                });
-            }
-        }
-        // RSS/Atom feeds commonly expose older pages through rel=next. Keep
-        // the URL in month_url so append_page can continue paging uniformly.
-        state.month_url = parsed
-            .links
-            .iter()
-            .find(|link| link.rel.as_deref() == Some("next"))
-            .map(|link| link.href.clone());
-    }
+    append_entries(&mut state, entries);
     let mut current = snapshot.lock().expect("backfill snapshot poisoned");
     current.status = BackfillStatus::Fetching;
     current.feed_id = Some(feed_id);
@@ -279,9 +270,46 @@ fn start_state(
     current.processed = 0;
     current.inserted = 0;
     current.failed = 0;
-    current.has_more = !state.entries.is_empty() || state.month_url.is_some();
+    current.has_more = !state.entries.is_empty() || state.pager.has_more();
     current.last_error = None;
+    current.source_description = state.pager.description.clone();
     Ok(state)
+}
+
+fn fetch_source(
+    client: &reqwest::blocking::Client,
+    mode: NetworkMode,
+    url: &str,
+    kind: SourceKind,
+) -> Result<web_clip::FetchedWebClip> {
+    match kind {
+        SourceKind::Feed => {
+            let mut last_error = None;
+            for candidate in
+                std::iter::once(url.to_owned()).chain(crate::fetch::feed_fallback_urls(url))
+            {
+                match web_clip::fetch_feed_document_with_mode(client, &candidate, mode) {
+                    Ok(document) => return Ok(document),
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            Err(last_error.unwrap_or_else(|| anyhow!("订阅源地址为空")))
+        }
+        SourceKind::Archive => web_clip::fetch_html_with_mode(client, url, mode),
+    }
+}
+
+fn append_entries(state: &mut State, entries: Vec<Entry>) {
+    for entry in entries {
+        let identity = entry
+            .article
+            .url
+            .clone()
+            .unwrap_or_else(|| entry.article.entry_id.clone());
+        if state.seen_urls.insert(identity) {
+            state.entries.push(entry);
+        }
+    }
 }
 
 fn append_page(
@@ -289,43 +317,12 @@ fn append_page(
     mode: NetworkMode,
     state: &mut State,
 ) -> Result<()> {
-    let Some(url) = state.month_url.take() else {
-        return Ok(());
-    };
-    let fetched = web_clip::fetch_html_with_mode(client, &url, mode)?;
-    if let Ok(page) = ruanyifeng_archive::parse_archive_page(&fetched.html, &fetched.final_url) {
-        for entry in page.entries {
-            if state.seen_urls.insert(entry.url.clone()) {
-                state.entries.push(entry);
-            }
-        }
-        state.month_url = page.previous_month;
-    } else {
-        let parsed = feed_rs::parser::parse(std::io::Cursor::new(fetched.html.as_bytes()))
-            .map_err(|error| anyhow!("解析分页订阅源失败：{error}"))?;
-        for item in parsed.entries {
-            let Some(link) = item.links.first().map(|link| link.href.clone()) else {
-                continue;
-            };
-            if state.seen_urls.insert(link.clone()) {
-                state.entries.push(ArchiveEntry {
-                    url: link,
-                    title: item
-                        .title
-                        .map(|title| title.content)
-                        .unwrap_or_else(|| "未命名文章".into()),
-                });
-            }
-        }
-        state.month_url = parsed
-            .links
-            .iter()
-            .find(|link| link.rel.as_deref() == Some("next"))
-            .map(|link| link.href.clone());
-    }
+    let entries = state
+        .pager
+        .next_page(&mut |url, kind| fetch_source(client, mode, url, kind))?;
+    append_entries(state, entries);
     Ok(())
 }
-
 fn process_batch(
     db_path: &Path,
     mode: NetworkMode,
@@ -344,12 +341,27 @@ fn process_batch(
         return;
     }
     set_status(snapshot, BackfillStatus::Fetching);
+    snapshot
+        .lock()
+        .expect("backfill snapshot poisoned")
+        .last_error = None;
     let target = current.cursor.saturating_add(BATCH_SIZE);
-    while current.entries.len() < target && current.month_url.is_some() {
-        if let Err(error) = append_page(client, mode, current) {
-            fail_snapshot(snapshot, error.to_string());
+    let mut pages = 0;
+    while current.entries.len() < target && current.pager.has_more() && pages < 10 {
+        if drain_control(command_rx, current, snapshot) {
+            notify(notice_tx, repaint);
             return;
         }
+        if let Err(error) = append_page(client, mode, current) {
+            fail_snapshot(snapshot, error.to_string());
+            snapshot
+                .lock()
+                .expect("backfill snapshot poisoned")
+                .has_more = true;
+            notify(notice_tx, repaint);
+            return;
+        }
+        pages += 1;
     }
     while current.cursor < current.entries.len().min(target) {
         if drain_control(command_rx, current, snapshot) {
@@ -384,7 +396,7 @@ fn process_batch(
         drop(view);
         notify(notice_tx, repaint);
     }
-    let has_more = current.cursor < current.entries.len() || current.month_url.is_some();
+    let has_more = current.cursor < current.entries.len() || current.pager.has_more();
     let mut view = snapshot.lock().expect("backfill snapshot poisoned");
     view.has_more = has_more;
     view.status = if has_more {
@@ -392,14 +404,24 @@ fn process_batch(
     } else {
         BackfillStatus::Completed
     };
+    drop(view);
+    notify(notice_tx, repaint);
 }
 
 fn fetch_article(
     client: &reqwest::blocking::Client,
     mode: NetworkMode,
-    entry: &ArchiveEntry,
+    entry: &Entry,
 ) -> Result<NewArticle> {
-    let fetched = web_clip::fetch_html_with_mode(client, &entry.url, mode)?;
+    if !entry.fetch_body {
+        return Ok(entry.article.clone());
+    }
+    let url = entry
+        .article
+        .url
+        .as_deref()
+        .ok_or_else(|| anyhow!("文章地址缺失"))?;
+    let fetched = web_clip::fetch_html_with_mode(client, url, mode)?;
     let readable = prepare_article_html(&fetched.html);
     if readable.content.trim().is_empty() {
         return Err(anyhow!("没有提取到正文"));
@@ -407,7 +429,7 @@ fn fetch_article(
     Ok(NewArticle {
         entry_id: fetched.final_url.clone(),
         url: Some(fetched.final_url.clone()),
-        title: readable.title.or_else(|| Some(entry.title.clone())),
+        title: readable.title.or_else(|| entry.article.title.clone()),
         author: None,
         published: extract_published(&fetched.html),
         content: Some(readable.content),
@@ -471,8 +493,13 @@ fn retry_failed(
     }
     let mut view = snapshot.lock().expect("backfill snapshot poisoned");
     view.failed = current.failed_entries.len();
+    view.has_more = current.cursor < current.entries.len() || current.pager.has_more();
     view.status = if view.failed == 0 {
-        BackfillStatus::WaitingNextBatch
+        if view.has_more {
+            BackfillStatus::WaitingNextBatch
+        } else {
+            BackfillStatus::Completed
+        }
     } else {
         BackfillStatus::Failed
     };
@@ -492,6 +519,7 @@ fn drain_control(
             }
             Ok(Command::Shutdown) => {
                 state.paused = true;
+                state.shutdown = true;
                 return true;
             }
             Ok(Command::Resume) => state.paused = false,

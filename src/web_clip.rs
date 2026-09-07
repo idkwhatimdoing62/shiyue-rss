@@ -147,8 +147,29 @@ pub(crate) fn fetch_html_with_mode(
 
 fn response_to_clip(
     original: Url,
+    response: Response,
+    mode: NetworkMode,
+) -> Result<FetchedWebClip> {
+    response_to_document(original, response, mode, false)
+}
+
+/// Feed discovery accepts XML while retaining the same public-target and size guards.
+pub(crate) fn fetch_feed_document_with_mode(
+    client: &Client,
+    input: &str,
+    mode: NetworkMode,
+) -> Result<FetchedWebClip> {
+    let original = Url::parse(input.trim()).context("订阅地址格式不正确")?;
+    validate_public_url_with_mode(&original, mode).map_err(anyhow::Error::msg)?;
+    let response = client.get(original.clone()).send()?;
+    response_to_document(original, response, mode, true)
+}
+
+fn response_to_document(
+    original: Url,
     mut response: Response,
     mode: NetworkMode,
+    feed: bool,
 ) -> Result<FetchedWebClip> {
     let status = response.status();
     if !status.is_success() {
@@ -173,7 +194,7 @@ fn response_to_clip(
                 .map(str::to_owned)
         })
         .transpose()?;
-    if let Some(content_type) = content_type.as_deref() {
+    if let Some(content_type) = content_type.as_deref().filter(|_| !feed) {
         validate_html_content_type(content_type)?;
     }
 
@@ -183,7 +204,7 @@ fn response_to_clip(
 
     // Some small/personal sites omit this header entirely. In that case the
     // response is accepted only when its first bytes actually look like HTML.
-    if content_type.is_none() && !looks_like_html(&bytes) {
+    if !feed && content_type.is_none() && !looks_like_html(&bytes) {
         bail!("该地址没有返回可识别的 HTML");
     }
 

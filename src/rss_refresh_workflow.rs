@@ -228,7 +228,7 @@ impl FeedFetcher for HttpFeedFetcher {
         let client = self.client.clone();
         let mode = self.mode;
         Box::pin(async move {
-            crate::fetch::fetch_with_mode(&client, &feed.url, mode)
+            crate::fetch::fetch_with_feed_fallback(&client, &feed.url, mode)
                 .await
                 .map(|(title, articles)| FetchPayload { title, articles })
                 .map_err(classify_fetch_error)

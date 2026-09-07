@@ -182,7 +182,23 @@ pub(super) fn show_panel(
     {
         ui.separator();
         ui.label(egui::RichText::new("历史文章").strong());
-        let history = dependencies.history.snapshot();
+        let mut history = dependencies.history.snapshot();
+        let other_busy =
+            history.feed_id != Some(draft.feed_id) && history.status == BackfillStatus::Fetching;
+        if history.feed_id != Some(draft.feed_id) {
+            history.status = BackfillStatus::Idle;
+            history.discovered = 0;
+            history.processed = 0;
+            history.inserted = 0;
+            history.failed = 0;
+            history.has_more = false;
+            history.last_error = None;
+            history.source_description = "自动检测归档页，未发现时使用 RSS/Atom 分页".into();
+        }
+        ui.weak(&history.source_description);
+        if other_busy {
+            ui.weak("另一个订阅正在回补，请完成或暂停后再开始。");
+        }
         ui.weak(format!(
             "按每批 {} 篇抓取，历史文章默认标记为已读。",
             history.batch_size
@@ -191,37 +207,48 @@ pub(super) fn show_panel(
             "已发现 {} · 已处理 {} · 新增 {} · 失败 {}",
             history.discovered, history.processed, history.inserted, history.failed
         ));
-        ui.horizontal_wrapped(|ui| {
-            match history.status {
-                BackfillStatus::Idle | BackfillStatus::Completed | BackfillStatus::Failed => {
-                    if ui.button("开始历史回补").clicked() {
-                        history_action = Some(HistoryAction::Start);
+        ui.add_enabled_ui(!other_busy, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                match history.status {
+                    BackfillStatus::Idle | BackfillStatus::Completed | BackfillStatus::Failed => {
+                        if history.status == BackfillStatus::Failed
+                            && history.has_more
+                            && ui.button("重试当前分页").clicked()
+                        {
+                            history_action = Some(HistoryAction::Next);
+                        }
+                        if ui.button("开始历史回补").clicked() {
+                            history_action = Some(HistoryAction::Start);
+                        }
+                    }
+                    BackfillStatus::WaitingNextBatch => {
+                        if history.has_more && ui.button("抓取下一批（50 篇）").clicked() {
+                            history_action = Some(HistoryAction::Next);
+                        }
+                        if ui.button("暂停").clicked() {
+                            history_action = Some(HistoryAction::Pause);
+                        }
+                    }
+                    BackfillStatus::Fetching => {
+                        ui.spinner();
+                        if ui.button("暂停").clicked() {
+                            history_action = Some(HistoryAction::Pause);
+                        }
+                    }
+                    BackfillStatus::Paused => {
+                        if ui.button("继续").clicked() {
+                            history_action = Some(HistoryAction::Resume);
+                        }
                     }
                 }
-                BackfillStatus::WaitingNextBatch => {
-                    if history.has_more && ui.button("抓取下一批（50 篇）").clicked() {
-                        history_action = Some(HistoryAction::Next);
-                    }
-                    if ui.button("暂停").clicked() {
-                        history_action = Some(HistoryAction::Pause);
-                    }
+                if history.failed > 0 && ui.button("重试失败").clicked() {
+                    history_action = Some(HistoryAction::Retry);
                 }
-                BackfillStatus::Fetching => {
-                    ui.spinner();
-                    if ui.button("暂停").clicked() {
-                        history_action = Some(HistoryAction::Pause);
-                    }
-                }
-                BackfillStatus::Paused => {
-                    if ui.button("继续").clicked() {
-                        history_action = Some(HistoryAction::Resume);
-                    }
-                }
-            }
-            if history.failed > 0 && ui.button("重试失败").clicked() {
-                history_action = Some(HistoryAction::Retry);
-            }
+            })
         });
+        if history.status == BackfillStatus::Completed {
+            ui.weak("已读完发现的页面；不代表网站全部历史文章。");
+        }
         if let Some(error) = &history.last_error {
             ui.colored_label(egui::Color32::RED, error);
         }

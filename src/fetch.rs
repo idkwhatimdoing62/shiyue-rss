@@ -101,6 +101,38 @@ pub(crate) async fn fetch_with_mode(
     }
 }
 
+/// Return publisher feed addresses for providers that are known to have
+/// retired or intermittently unavailable mirrors. The stored subscription
+/// address remains unchanged; callers use these only after the primary fails.
+pub(crate) fn feed_fallback_urls(url: &str) -> Vec<String> {
+    let normalized = url.trim().trim_end_matches('/').to_ascii_lowercase();
+    if normalized == "http://feeds.feedburner.com/ruanyifeng"
+        || normalized == "https://feeds.feedburner.com/ruanyifeng"
+    {
+        vec!["https://www.ruanyifeng.com/blog/atom.xml".into()]
+    } else {
+        Vec::new()
+    }
+}
+
+pub(crate) async fn fetch_with_feed_fallback(
+    client: &reqwest::Client,
+    url: &str,
+    mode: NetworkMode,
+) -> Result<(Option<String>, Vec<NewArticle>)> {
+    match fetch_with_mode(client, url, mode).await {
+        Ok(result) => Ok(result),
+        Err(primary) => {
+            for fallback in feed_fallback_urls(url) {
+                if let Ok(result) = fetch_with_mode(client, &fallback, mode).await {
+                    return Ok(result);
+                }
+            }
+            Err(primary.context("备用订阅源也无法访问"))
+        }
+    }
+}
+
 async fn fetch_once_inner(
     client: &reqwest::Client,
     url: &str,
@@ -166,7 +198,7 @@ fn is_retryable_request_error(error: &anyhow::Error) -> bool {
 }
 
 /// feed-rs 的 Entry → 待入库 NewArticle。entry_id 优先 guid/id，回退链接、再回退标题（ADR-8）。
-fn entry_to_article(e: feed_rs::model::Entry) -> NewArticle {
+pub(crate) fn entry_to_article(e: feed_rs::model::Entry) -> NewArticle {
     let url = e
         .links
         .iter()
