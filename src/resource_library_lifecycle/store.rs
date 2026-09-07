@@ -267,9 +267,12 @@ pub(super) fn enrichment_input(
     };
     Ok(Some(crate::resource_enrichment::EnrichmentInput {
         resource_id: id,
-        url: resource.url,
+        // Re-validate persisted data before crossing the provider boundary.
+        // Older databases may contain URLs created before userinfo was rejected.
+        url: canonicalize_url(&resource.url)?,
         title: resource.title,
-        private_note: resource.private_note,
+        // Private notes are local-only metadata and are never sent to providers.
+        private_note: None,
         cleaned_content: content,
     }))
 }
@@ -500,6 +503,9 @@ pub(crate) fn canonicalize_url(raw: &str) -> Result<String> {
     if !matches!(url.scheme(), "http" | "https") {
         bail!("resource URL must use HTTP(S)")
     }
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("resource URL must not contain credentials")
+    }
     url.set_fragment(None);
     let remove_port = (url.scheme() == "http" && url.port() == Some(80))
         || (url.scheme() == "https" && url.port() == Some(443));
@@ -511,4 +517,15 @@ pub(crate) fn canonicalize_url(raw: &str) -> Result<String> {
         url.set_path("/");
     }
     Ok(url.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonicalize_url;
+
+    #[test]
+    fn canonicalize_url_rejects_embedded_credentials() {
+        assert!(canonicalize_url("https://alice:secret@example.com/path").is_err());
+        assert!(canonicalize_url("https://alice@example.com/path").is_err());
+    }
 }

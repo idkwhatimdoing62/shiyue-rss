@@ -18,6 +18,9 @@ use crate::resource_library_lifecycle::canonicalize_url;
 const DEFAULT_BUDGET: Duration = Duration::from_secs(2);
 const MAX_RESULTS: usize = 200;
 const MAX_EVIDENCE: usize = 6;
+const SEARCH_BATCH_SIZE: usize = 256;
+// Keep relevance ordering while bounding OFFSET scans on large libraries.
+const MAX_SEARCH_DOCUMENTS: usize = 10_000;
 
 const SEARCH_INDEX_SCHEMA: &str = r#"
 CREATE VIRTUAL TABLE library_search_fts USING fts5(
@@ -595,7 +598,6 @@ impl<'db> LibrarySearch<'db> {
             .split_whitespace()
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        let documents = self.load_documents(&terms, request.limit)?;
         anyhow::ensure!(
             Instant::now() < deadline,
             "interrupted: LIBRARY_SEARCH_BUDGET_EXPIRED"
@@ -609,26 +611,44 @@ impl<'db> LibrarySearch<'db> {
         let eligible_resources = eligible_resource_maps(&resources, request.scope, request.origin);
         let mut groups: HashMap<PrimaryIdentity, GroupBuilder> = HashMap::new();
 
-        for document in documents {
+        let mut offset = 0usize;
+        let mut scanned = 0usize;
+        loop {
             anyhow::ensure!(
                 Instant::now() < deadline,
                 "interrupted: LIBRARY_SEARCH_BUDGET_EXPIRED"
             );
-            let Some(scored) = score_document(&document, normalized_query, &terms) else {
-                continue;
-            };
-            let placement = place_document(
-                &document,
-                request,
-                &resources,
-                &articles,
-                &eligible_resources,
-            );
-            let Some(placement) = placement else { continue };
-            let group = groups
-                .entry(placement.primary)
-                .or_insert_with(|| GroupBuilder::from_placement(&placement, &resources, &articles));
-            group.absorb(document, scored, placement.article_target);
+            if scanned >= MAX_SEARCH_DOCUMENTS {
+                break;
+            }
+            let batch_size = SEARCH_BATCH_SIZE.min(MAX_SEARCH_DOCUMENTS - scanned);
+            let documents = self.load_documents(&terms, batch_size, offset)?;
+            if documents.is_empty() {
+                break;
+            }
+            scanned = scanned.saturating_add(documents.len());
+            for document in documents {
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "interrupted: LIBRARY_SEARCH_BUDGET_EXPIRED"
+                );
+                let Some(scored) = score_document(&document, normalized_query, &terms) else {
+                    continue;
+                };
+                let placement = place_document(
+                    &document,
+                    request,
+                    &resources,
+                    &articles,
+                    &eligible_resources,
+                );
+                let Some(placement) = placement else { continue };
+                let group = groups.entry(placement.primary).or_insert_with(|| {
+                    GroupBuilder::from_placement(&placement, &resources, &articles)
+                });
+                group.absorb(document, scored, placement.article_target);
+            }
+            offset = offset.saturating_add(SEARCH_BATCH_SIZE);
         }
 
         let mut results = groups
@@ -645,8 +665,12 @@ impl<'db> LibrarySearch<'db> {
         Ok(results)
     }
 
-    fn load_documents(&self, terms: &[String], limit: usize) -> anyhow::Result<Vec<RawDocument>> {
-        let candidate_limit = limit.saturating_mul(50).clamp(1_000, 10_000);
+    fn load_documents(
+        &self,
+        terms: &[String],
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<Vec<RawDocument>> {
         let long_terms = terms
             .iter()
             .filter(|term| term.chars().count() >= 3)
@@ -662,13 +686,10 @@ impl<'db> LibrarySearch<'db> {
                         identity_text,title_text,metadata_text,note_text,excerpt_text,body_text
                  FROM library_search_fts WHERE library_search_fts MATCH ?1
                  ORDER BY bm25(library_search_fts,9.0,8.0,5.0,6.0,4.0,1.0)
-                 LIMIT ?2",
+                 LIMIT ?2 OFFSET ?3",
             )?;
             let rows = stmt.query_map(
-                params![
-                    match_query,
-                    i64::try_from(candidate_limit).unwrap_or(i64::MAX)
-                ],
+                params![match_query, limit as i64, offset as i64],
                 map_document,
             )?;
             return Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?);
@@ -680,15 +701,18 @@ impl<'db> LibrarySearch<'db> {
             .collect::<Vec<_>>()
             .join(" AND ");
         let limit_parameter = terms.len() + 1;
+        let offset_parameter = terms.len() + 2;
         let sql = format!(
             "SELECT source_kind,source_id,article_id,canonical_url,updated_at,
                     identity_text,title_text,metadata_text,note_text,excerpt_text,body_text
-             FROM library_search_fts
+                    FROM library_search_fts
              WHERE {predicates}
-             ORDER BY updated_at DESC LIMIT ?{limit_parameter}"
+             ORDER BY updated_at DESC
+             LIMIT ?{limit_parameter} OFFSET ?{offset_parameter}"
         );
         let mut values = terms.to_vec();
-        values.push(candidate_limit.to_string());
+        values.push(limit.to_string());
+        values.push(offset.to_string());
         let mut stmt = self.db.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(values), map_document)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)

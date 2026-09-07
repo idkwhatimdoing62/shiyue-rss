@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 use crate::config::Config;
+use crate::config::NetworkMode;
 use crate::db::Db;
 use crate::local_data_maintenance::{GenerationFence, MaintenanceFence, MaintenanceParticipant};
 use crate::model::{Feed, NewArticle};
@@ -210,12 +211,14 @@ impl RefreshClock for SystemClock {
 
 struct HttpFeedFetcher {
     client: reqwest::Client,
+    mode: NetworkMode,
 }
 
 impl HttpFeedFetcher {
-    fn new() -> Result<Self> {
+    fn new(mode: NetworkMode) -> Result<Self> {
         Ok(Self {
-            client: crate::fetch::client()?,
+            client: crate::fetch::client_with_mode(mode)?,
+            mode,
         })
     }
 }
@@ -223,8 +226,9 @@ impl HttpFeedFetcher {
 impl FeedFetcher for HttpFeedFetcher {
     fn fetch(&self, feed: Feed) -> FetchFuture {
         let client = self.client.clone();
+        let mode = self.mode;
         Box::pin(async move {
-            crate::fetch::fetch(&client, &feed.url)
+            crate::fetch::fetch_with_mode(&client, &feed.url, mode)
                 .await
                 .map(|(title, articles)| FetchPayload { title, articles })
                 .map_err(classify_fetch_error)
@@ -309,11 +313,12 @@ impl RssRefreshWorkflow {
         cfg: Config,
         wake: impl Fn() + Send + Sync + 'static,
     ) -> Result<Self> {
+        let network_mode = cfg.network_mode;
         Self::start_with(
             db_path,
             cfg,
             WorkerMode::Scheduled,
-            Arc::new(HttpFeedFetcher::new()?),
+            Arc::new(HttpFeedFetcher::new(network_mode)?),
             Arc::new(SystemClock),
             Arc::new(wake),
         )
@@ -419,11 +424,12 @@ impl RssRefreshWorkflow {
     }
 
     fn run_once(db_path: &Path, cfg: &Config, intent: RefreshIntent) -> Result<RefreshRunSnapshot> {
+        let network_mode = cfg.network_mode;
         let workflow = Self::start_with(
             db_path.to_path_buf(),
             cfg.clone(),
             WorkerMode::OneShot,
-            Arc::new(HttpFeedFetcher::new()?),
+            Arc::new(HttpFeedFetcher::new(network_mode)?),
             Arc::new(SystemClock),
             Arc::new(|| {}),
         )?;

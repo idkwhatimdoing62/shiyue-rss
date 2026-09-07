@@ -16,6 +16,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::article_document_presentation::prepare_article_html;
 use crate::article_library_lifecycle::{ArticleLibraryProjection, ProjectionScope, project_on};
+use crate::config::NetworkMode;
 use crate::db::{Db, WEB_CLIPPINGS_FEED_URL};
 use crate::library_projection_revision::{
     self, LibraryGeneration, ProjectionFamily, ProjectionImpact, ProjectionStamp,
@@ -260,7 +261,9 @@ trait WebPageFetch: Send + Sync {
     ) -> std::result::Result<FetchedPage, CaptureFailure>;
 }
 
-struct ProductionHttpFetch;
+struct ProductionHttpFetch {
+    mode: NetworkMode,
+}
 
 impl WebPageFetch for ProductionHttpFetch {
     fn fetch(
@@ -271,9 +274,9 @@ impl WebPageFetch for ProductionHttpFetch {
         if cancellation.load(Ordering::Acquire) {
             return Err(CaptureFailure::cancelled("CANCELLED_BEFORE_FETCH"));
         }
-        let client = crate::web_clip::client().map_err(classify_fetch_error)?;
-        let fetched =
-            crate::web_clip::fetch_html(&client, &request.url).map_err(classify_fetch_error)?;
+        let client = crate::web_clip::client_with_mode(self.mode).map_err(classify_fetch_error)?;
+        let fetched = crate::web_clip::fetch_html_with_mode(&client, &request.url, self.mode)
+            .map_err(classify_fetch_error)?;
         if cancellation.load(Ordering::Acquire) {
             return Err(CaptureFailure::cancelled("CANCELLED_AFTER_FETCH"));
         }
@@ -390,8 +393,13 @@ impl Drop for CaptureLease {
 }
 
 impl WebClippingLifecycle {
+    #[allow(dead_code)]
     pub(crate) fn start(database: PathBuf) -> Self {
-        Self::with_fetch(database, Arc::new(ProductionHttpFetch))
+        Self::start_with_mode(database, NetworkMode::Strict)
+    }
+
+    pub(crate) fn start_with_mode(database: PathBuf, mode: NetworkMode) -> Self {
+        Self::with_fetch(database, Arc::new(ProductionHttpFetch { mode }))
     }
 
     fn with_fetch(database: PathBuf, fetch: Arc<dyn WebPageFetch>) -> Self {

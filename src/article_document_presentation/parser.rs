@@ -752,6 +752,7 @@ pub(super) fn content_blocks(html: &str, base: Option<&str>) -> Vec<Block> {
     let mut math_buf = String::new();
     let mut sup_depth = 0usize;
     let mut link: Option<LinkState> = None;
+    let mut plain_anchor_boundary = false;
     let mut pending_link_boundary: Option<(usize, bool)> = None;
     let mut seen_images = std::collections::HashSet::new();
     let mut chars = html.chars().peekable();
@@ -1033,12 +1034,24 @@ pub(super) fn content_blocks(html: &str, base: Option<&str>) -> Vec<Block> {
                     // keeps their text in the surrounding paragraph instead
                     // of splitting `前<a href="#">锚点</a>后` into two blocks.
                     if let Some(url) = link_href(&tag, base) {
+                        if plain_anchor_boundary {
+                            flush_text_kind(&mut buf, &mut blocks, strong, heading);
+                            plain_anchor_boundary = false;
+                        }
                         let prefix = std::mem::take(&mut buf);
                         link = Some(LinkState {
                             url,
                             prefix,
                             text: String::new(),
                         });
+                    } else if attr(&tag, "href")
+                        .map(|href| is_non_web_absolute_href(href.trim()))
+                        .unwrap_or(false)
+                    {
+                        // Keep visible text from an unsafe anchor as plain text
+                        // and prevent it from becoming the prefix of a later
+                        // safe link in the same paragraph.
+                        plain_anchor_boundary = true;
                     }
                 }
                 continue;
@@ -1738,6 +1751,11 @@ fn link_href(tag: &str, base: Option<&str>) -> Option<String> {
     if lower.starts_with("http://") || lower.starts_with("https://") {
         return Some(href.to_owned());
     }
+    // Explicit non-web schemes must never reach the shell opener. Relative
+    // paths are still supported when there is no article base URL.
+    if is_non_web_absolute_href(href) {
+        return None;
+    }
     if href.starts_with('#') {
         return Some(match base {
             Some(base) => format!("{base}{href}"),
@@ -1747,6 +1765,11 @@ fn link_href(tag: &str, base: Option<&str>) -> Option<String> {
     // Keep the original relative target when the feed did not provide a base
     // URL; the UI can still expose/copy the citation instead of dropping it.
     resolve(href, base).or_else(|| Some(href.to_owned()))
+}
+
+fn is_non_web_absolute_href(href: &str) -> bool {
+    href.find(':')
+        .is_some_and(|colon| !href[..colon].contains(['/', '?', '#']))
 }
 
 /// Sites commonly put a tiny placeholder in `src` and the real image in a lazy-loading
@@ -3005,6 +3028,17 @@ mod tests {
             Block::Link { text, url, link_start, .. }
                 if text == "链接" && *link_start == 0 && url == "relative.html"
         ));
+    }
+
+    #[test]
+    fn drops_non_web_absolute_link_schemes() {
+        let blocks = content_blocks(
+            "<p><a href=\"file:///C:/secret.txt\">file</a><a href=\"ms-settings:privacy\">settings</a><a href=\"https://example.com\">web</a></p>",
+            None,
+        );
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(&blocks[0], Block::Text(text) if text == "filesettings"));
+        assert!(matches!(&blocks[1], Block::Link { url, .. } if url == "https://example.com"));
     }
 
     #[test]

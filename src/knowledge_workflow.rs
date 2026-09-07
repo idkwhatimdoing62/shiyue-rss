@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::article_document_presentation::prepare_article_html;
-use crate::config::ResourceEnrichmentConfig;
+use crate::config::{NetworkMode, ResourceEnrichmentConfig};
 use crate::db::Db;
 use crate::library_projection_revision::{self, ProjectionImpact};
 use crate::local_data_maintenance::MaintenanceParticipant;
@@ -117,8 +117,22 @@ impl KnowledgeProjectionObserver {
             .expect("knowledge projection state poisoned")
             .residents
             .insert(key);
-        if inserted {
-            let _ = self.command_tx.send(EngineCommand::Observe { key });
+        if inserted
+            && self
+                .command_tx
+                .send(EngineCommand::Observe { key })
+                .is_err()
+        {
+            // Do not leave a resident behind when the worker has already
+            // exited. Otherwise a later frame sees the key as observed but
+            // no Observe command can ever materialize its snapshot, leaving
+            // the desktop projection in Loading forever.
+            let mut state = self
+                .state
+                .write()
+                .expect("knowledge projection state poisoned");
+            state.residents.remove(&key);
+            state.snapshots.remove(&key);
         }
     }
 
@@ -162,12 +176,35 @@ impl KnowledgeProjectionObserver {
     }
 
     #[cfg(test)]
+    pub(crate) fn connected_for_test() -> Self {
+        let (command_tx, command_rx) = std_mpsc::channel();
+        // Keep the receiver alive for the duration of the test observer so
+        // Observe sends exercise the connected path without starting an engine.
+        std::mem::forget(command_rx);
+        let (_changed_tx, changed_rx) = std_mpsc::channel();
+        Self {
+            command_tx,
+            state: Arc::new(RwLock::new(KnowledgeProjectionState::default())),
+            changed_rx: Arc::new(Mutex::new(changed_rx)),
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn is_resident(&self, key: TaskKey) -> bool {
         self.state
             .read()
             .expect("knowledge projection state poisoned")
             .residents
             .contains(&key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_snapshot_for_test(&self, key: TaskKey, snapshot: Option<TaskSnapshot>) {
+        self.state
+            .write()
+            .expect("knowledge projection state poisoned")
+            .snapshots
+            .insert(key, snapshot);
     }
 }
 
@@ -208,21 +245,53 @@ impl MaintenanceParticipant for KnowledgeMaintenanceParticipant {
 }
 
 impl KnowledgeEngine {
+    #[allow(dead_code)]
     pub(crate) fn start(db_path: PathBuf, config: ResourceEnrichmentConfig) -> Result<Self> {
-        Self::start_with_mode(
+        Self::start_with_mode_and_network(
             db_path,
             config,
             ProviderMode::System,
             ExecutorPolicy::Acquire,
+            NetworkMode::Strict,
         )
     }
 
+    pub(crate) fn start_with_network_mode(
+        db_path: PathBuf,
+        config: ResourceEnrichmentConfig,
+        network_mode: NetworkMode,
+    ) -> Result<Self> {
+        Self::start_with_mode_and_network(
+            db_path,
+            config,
+            ProviderMode::System,
+            ExecutorPolicy::Acquire,
+            network_mode,
+        )
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn start_client(db_path: PathBuf, config: ResourceEnrichmentConfig) -> Result<Self> {
-        Self::start_with_mode(
+        Self::start_with_mode_and_network(
             db_path,
             config,
             ProviderMode::System,
             ExecutorPolicy::ObserveOnly,
+            NetworkMode::Strict,
+        )
+    }
+
+    pub(crate) fn start_client_with_network_mode(
+        db_path: PathBuf,
+        config: ResourceEnrichmentConfig,
+        network_mode: NetworkMode,
+    ) -> Result<Self> {
+        Self::start_with_mode_and_network(
+            db_path,
+            config,
+            ProviderMode::System,
+            ExecutorPolicy::ObserveOnly,
+            network_mode,
         )
     }
 
@@ -232,19 +301,37 @@ impl KnowledgeEngine {
         config: ResourceEnrichmentConfig,
         provider: Arc<dyn EnrichmentProvider>,
     ) -> Result<Self> {
-        Self::start_with_mode(
+        Self::start_with_mode_and_network(
             db_path,
             config,
             ProviderMode::Fixed(provider),
             ExecutorPolicy::Acquire,
+            NetworkMode::Strict,
         )
     }
 
+    #[allow(dead_code)]
     fn start_with_mode(
         db_path: PathBuf,
         config: ResourceEnrichmentConfig,
         provider_mode: ProviderMode,
         policy: ExecutorPolicy,
+    ) -> Result<Self> {
+        Self::start_with_mode_and_network(
+            db_path,
+            config,
+            provider_mode,
+            policy,
+            NetworkMode::Strict,
+        )
+    }
+
+    fn start_with_mode_and_network(
+        db_path: PathBuf,
+        config: ResourceEnrichmentConfig,
+        provider_mode: ProviderMode,
+        policy: ExecutorPolicy,
+        network_mode: NetworkMode,
     ) -> Result<Self> {
         Db::open(&db_path).context("知识处理模块无法打开数据库")?;
         let (command_tx, command_rx) = std_mpsc::channel();
@@ -318,6 +405,7 @@ impl KnowledgeEngine {
                         config.clone(),
                         provider_mode.clone(),
                         policy,
+                        network_mode,
                         &command_rx,
                         notice_tx.clone(),
                         &projection_publication,
@@ -1110,11 +1198,13 @@ impl ProjectionPublication {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn engine_loop(
     db_path: PathBuf,
     config: ResourceEnrichmentConfig,
     provider_mode: ProviderMode,
     policy: ExecutorPolicy,
+    network_mode: NetworkMode,
     command_rx: &std_mpsc::Receiver<EngineCommand>,
     notice_tx: std_mpsc::Sender<KnowledgeNotice>,
     projection: &ProjectionPublication,
@@ -1300,6 +1390,7 @@ fn engine_loop(
                     task,
                     config.clone(),
                     provider_mode.clone(),
+                    network_mode,
                     done_tx.clone(),
                 );
             }
@@ -1328,6 +1419,7 @@ fn engine_loop(
                                 config.clone(),
                                 provider_mode.clone(),
                                 current,
+                                network_mode,
                                 done_tx.clone(),
                             );
                             let _ = notice_tx
@@ -1400,10 +1492,18 @@ fn spawn_task(
     task: ClaimedTask,
     config: ResourceEnrichmentConfig,
     provider_mode: ProviderMode,
+    network_mode: NetworkMode,
     done_tx: std_mpsc::Sender<WorkDone>,
 ) {
     std::thread::spawn(move || {
-        let result = execute_task(&db_path, &owner_id, &task, &config, &provider_mode);
+        let result = execute_task(
+            &db_path,
+            &owner_id,
+            &task,
+            &config,
+            &provider_mode,
+            network_mode,
+        );
         if let Err(error) = result
             && let Ok(db) = Db::open(&db_path)
         {
@@ -1420,12 +1520,15 @@ fn execute_task(
     task: &ClaimedTask,
     config: &ResourceEnrichmentConfig,
     provider_mode: &ProviderMode,
+    network_mode: NetworkMode,
 ) -> Result<()> {
     match task.key.kind {
         TaskKind::ResourceCompletion => {
-            execute_resource(db_path, owner_id, task, config, provider_mode)
+            execute_resource(db_path, owner_id, task, config, provider_mode, network_mode)
         }
-        TaskKind::ArticleSummary => execute_article(db_path, owner_id, task, config, provider_mode),
+        TaskKind::ArticleSummary => {
+            execute_article(db_path, owner_id, task, config, provider_mode, network_mode)
+        }
     }
 }
 
@@ -1435,6 +1538,7 @@ fn execute_resource(
     task: &ClaimedTask,
     config: &ResourceEnrichmentConfig,
     provider_mode: &ProviderMode,
+    network_mode: NetworkMode,
 ) -> Result<()> {
     let mut resource = {
         let db = Db::open(db_path)?;
@@ -1442,8 +1546,10 @@ fn execute_resource(
     };
     if resource.latest_snapshot_id.is_none() && resource.linked_article_id.is_none() {
         // Never hold a database writer lease while waiting on the network.
-        let fetched = crate::web_clip::client()
-            .and_then(|client| crate::web_clip::fetch_html(&client, &resource.url))
+        let fetched = crate::web_clip::client_with_mode(network_mode)
+            .and_then(|client| {
+                crate::web_clip::fetch_html_with_mode(&client, &resource.url, network_mode)
+            })
             .context("资源网页抓取失败")?;
         let snapshot = prepare_article_html(&fetched.html);
         if snapshot.content.trim().is_empty() {
@@ -1488,7 +1594,7 @@ fn execute_resource(
             .context("EXECUTOR_FENCE_LOST")?;
         (input, run_id)
     };
-    let output = match with_provider(config, provider_mode, |provider| {
+    let output = match with_provider(config, provider_mode, network_mode, |provider| {
         crate::resource_enrichment::enrich_with(provider, &input, config.max_input_chars)
     }) {
         Ok(output) => output,
@@ -1509,13 +1615,14 @@ fn execute_article(
     task: &ClaimedTask,
     config: &ResourceEnrichmentConfig,
     provider_mode: &ProviderMode,
+    network_mode: NetworkMode,
 ) -> Result<()> {
     let article = {
         let db = Db::open(db_path)?;
         db.get_article(task.key.target_id)
             .context("目标 Article 不存在")?
     };
-    let output = with_provider(config, provider_mode, |provider| {
+    let output = with_provider(config, provider_mode, network_mode, |provider| {
         crate::resource_enrichment::summarize_and_translate(
             provider,
             article.title.as_deref().unwrap_or(""),
@@ -1539,10 +1646,11 @@ fn spawn_connection_test(
     config: ResourceEnrichmentConfig,
     provider_mode: ProviderMode,
     generation: i64,
+    network_mode: NetworkMode,
     done_tx: std_mpsc::Sender<WorkDone>,
 ) {
     std::thread::spawn(move || {
-        let result = with_provider(&config, &provider_mode, |provider| {
+        let result = with_provider(&config, &provider_mode, network_mode, |provider| {
             let raw = provider.enrich(&ProviderRequest {
                 system_prompt: "Return one JSON object with key ok and boolean true.".into(),
                 data_json: "{\"purpose\":\"connection_test\"}".into(),
@@ -1560,6 +1668,7 @@ fn spawn_connection_test(
 fn with_provider<T>(
     config: &ResourceEnrichmentConfig,
     mode: &ProviderMode,
+    network_mode: NetworkMode,
     run: impl FnOnce(&dyn EnrichmentProvider) -> Result<T>,
 ) -> Result<T> {
     match mode {
@@ -1568,7 +1677,11 @@ fn with_provider<T>(
                 .api_key()?
                 .context("请先在“资料库管理”中保存 DeepSeek API Key")?;
             let provider =
-                crate::resource_enrichment::OpenAiCompatibleProvider::new(config.clone(), key)?;
+                crate::resource_enrichment::OpenAiCompatibleProvider::new_with_network_mode(
+                    config.clone(),
+                    key,
+                    network_mode,
+                )?;
             run(&provider)
         }
         #[cfg(test)]
@@ -1692,6 +1805,17 @@ mod tests {
         ENGINE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn failed_observe_command_does_not_leave_a_resident() {
+        let observer = KnowledgeProjectionObserver::disconnected_for_test();
+        let key = TaskKey::new(TaskKind::ArticleSummary, 42);
+
+        observer.observe(key);
+
+        assert!(!observer.is_resident(key));
+        assert!(observer.snapshot(key).is_none());
     }
 
     struct TestClock(i64);

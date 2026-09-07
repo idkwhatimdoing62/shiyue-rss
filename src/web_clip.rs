@@ -7,6 +7,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::config::NetworkMode;
 use anyhow::{Context, Result, bail};
 use chardetng::EncodingDetector;
 use encoding_rs::Encoding;
@@ -24,11 +25,18 @@ pub const MAX_HTML_BYTES: usize = 8 * 1024 * 1024;
 /// the address used by the connector tied to the validation result instead of
 /// performing a separate preflight lookup followed by another DNS lookup.
 #[derive(Debug, Default)]
-struct PublicDnsResolver;
+pub(crate) struct PublicDnsResolver {
+    mode: NetworkMode,
+}
+
+pub(crate) fn public_dns_resolver(mode: NetworkMode) -> Arc<PublicDnsResolver> {
+    Arc::new(PublicDnsResolver { mode })
+}
 
 impl Resolve for PublicDnsResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let host = name.as_str().to_owned();
+        let mode = self.mode;
         Box::pin(async move {
             let addresses = (host.as_str(), 0)
                 .to_socket_addrs()
@@ -41,7 +49,10 @@ impl Resolve for PublicDnsResolver {
                 ))
                     as Box<dyn std::error::Error + Send + Sync>);
             }
-            if addresses.iter().any(|address| !is_public_ip(address.ip())) {
+            if addresses
+                .iter()
+                .any(|address| !is_allowed_ip(address.ip(), mode))
+            {
                 return Err(Box::new(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     "为保护本机数据，网页主机名不能解析到本机或内网地址",
@@ -54,10 +65,18 @@ impl Resolve for PublicDnsResolver {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn with_public_dns_resolver(
     builder: reqwest::blocking::ClientBuilder,
 ) -> reqwest::blocking::ClientBuilder {
-    builder.dns_resolver(Arc::new(PublicDnsResolver))
+    with_network_dns_resolver(builder, NetworkMode::Strict)
+}
+
+pub(crate) fn with_network_dns_resolver(
+    builder: reqwest::blocking::ClientBuilder,
+    mode: NetworkMode,
+) -> reqwest::blocking::ClientBuilder {
+    builder.dns_resolver(public_dns_resolver(mode))
 }
 
 /// A downloaded HTML snapshot and the URLs needed to preserve its provenance.
@@ -72,16 +91,21 @@ pub struct FetchedWebClip {
 }
 
 /// Build the blocking HTTP client intended for webpage clipping.
+#[allow(dead_code)]
 pub fn client() -> Result<Client> {
-    with_public_dns_resolver(Client::builder())
+    client_with_mode(NetworkMode::Strict)
+}
+
+pub(crate) fn client_with_mode(mode: NetworkMode) -> Result<Client> {
+    with_network_dns_resolver(Client::builder(), mode)
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(45))
-        .redirect(Policy::custom(|attempt| {
+        .redirect(Policy::custom(move |attempt| {
             // `previous` includes the initial URL. This permits at most ten redirects.
             if attempt.previous().len() > 10 {
                 return attempt.error("网页重定向次数过多");
             }
-            if let Err(message) = validate_public_url(attempt.url()) {
+            if let Err(message) = validate_public_url_with_mode(attempt.url(), mode) {
                 return attempt.error(message);
             }
             attempt.follow()
@@ -99,9 +123,18 @@ pub fn client() -> Result<Client> {
 ///
 /// The supplied client should normally come from [`client`]. Keeping it as a
 /// parameter lets a GUI worker reuse connection pools across multiple saves.
+#[allow(dead_code)]
 pub fn fetch_html(client: &Client, input: &str) -> Result<FetchedWebClip> {
+    fetch_html_with_mode(client, input, NetworkMode::Strict)
+}
+
+pub(crate) fn fetch_html_with_mode(
+    client: &Client,
+    input: &str,
+    mode: NetworkMode,
+) -> Result<FetchedWebClip> {
     let mut original = Url::parse(input.trim()).context("网页地址格式不正确")?;
-    validate_public_url(&original).map_err(anyhow::Error::msg)?;
+    validate_public_url_with_mode(&original, mode).map_err(anyhow::Error::msg)?;
     // Fragments are local document locations and are never sent to the server.
     original.set_fragment(None);
 
@@ -109,19 +142,23 @@ pub fn fetch_html(client: &Client, input: &str) -> Result<FetchedWebClip> {
         .get(original.clone())
         .send()
         .context("无法连接网页")?;
-    response_to_clip(original, response)
+    response_to_clip(original, response, mode)
 }
 
-fn response_to_clip(original: Url, mut response: Response) -> Result<FetchedWebClip> {
+fn response_to_clip(
+    original: Url,
+    mut response: Response,
+    mode: NetworkMode,
+) -> Result<FetchedWebClip> {
     let status = response.status();
     if !status.is_success() {
         bail!("网页返回 HTTP {}", status.as_u16());
     }
 
     let final_url = response.url().clone();
-    validate_public_url(&final_url).map_err(anyhow::Error::msg)?;
+    validate_public_url_with_mode(&final_url, mode).map_err(anyhow::Error::msg)?;
     if let Some(peer) = response.remote_addr()
-        && !is_public_ip(peer.ip())
+        && !is_allowed_ip(peer.ip(), mode)
     {
         bail!("为保护本机数据，已阻止网页连接到本机或内网地址");
     }
@@ -178,7 +215,15 @@ fn read_body_limited(reader: &mut impl Read) -> Result<Vec<u8>> {
 /// callers that download secondary resources (for example article images) can
 /// reuse the same check. The connected peer is still checked separately after
 /// the request to narrow the DNS-rebinding window.
+#[allow(dead_code)]
 pub(crate) fn validate_public_url(url: &Url) -> std::result::Result<(), String> {
+    validate_public_url_with_mode(url, NetworkMode::Strict)
+}
+
+pub(crate) fn validate_public_url_with_mode(
+    url: &Url,
+    mode: NetworkMode,
+) -> std::result::Result<(), String> {
     if !matches!(url.scheme(), "http" | "https") {
         return Err("只支持 http:// 或 https:// 网页地址".to_owned());
     }
@@ -200,6 +245,9 @@ pub(crate) fn validate_public_url(url: &Url) -> std::result::Result<(), String> 
     // 0x7f000001) before exposing `host_str`, so parsing the normalized value
     // also covers those common loopback-filter bypasses.
     if let Ok(address) = normalized_host.parse::<IpAddr>() {
+        // A literal address is an explicit user target.  TUN mode only
+        // relaxes answers returned for hostnames; it must never turn a
+        // synthetic/private literal into an allowed destination.
         return if is_public_ip(address) {
             Ok(())
         } else {
@@ -216,7 +264,7 @@ pub(crate) fn validate_public_url(url: &Url) -> std::result::Result<(), String> 
     let mut found = false;
     for address in addresses {
         found = true;
-        if !is_public_ip(address.ip()) {
+        if !is_allowed_ip(address.ip(), mode) {
             return Err("为保护本机数据，网页主机名不能解析到本机或内网地址".to_owned());
         }
     }
@@ -224,6 +272,10 @@ pub(crate) fn validate_public_url(url: &Url) -> std::result::Result<(), String> 
         return Err("网页主机名没有可用的 IP 地址".to_owned());
     }
     Ok(())
+}
+
+fn is_allowed_ip(address: IpAddr, mode: NetworkMode) -> bool {
+    is_public_ip(address) || mode.allows_synthetic_ip(address)
 }
 
 /// Reject addresses that are not globally routable. This check is also used
@@ -260,6 +312,16 @@ fn is_public_ipv6(address: Ipv6Addr) -> bool {
     !(address.is_unspecified()
         || address.is_loopback()
         || address.is_multicast()
+        // IANA special-purpose IPv6 ranges: discard-only, benchmarking,
+        // Teredo/ORCHID, and documentation space are not global targets.
+        || (segments[0] == 0x0100
+            && segments[1] == 0
+            && segments[2] == 0
+            && segments[3] == 0)
+        || ((segments[0] == 0x2001 && matches!(segments[1], 0 | 1))
+            || (segments[0] == 0x2001 && segments[1] == 2 && segments[2] == 0)
+            || (segments[0] == 0x2001 && (segments[1] & 0xfff0) == 0x0010)
+            || (segments[0] & 0xfff0) == 0x3ff0)
         || (segments[0] & 0xfe00) == 0xfc00
         || (segments[0] & 0xffc0) == 0xfe80
         || (segments[0] == 0x2001 && segments[1] == 0x0db8))
@@ -413,6 +475,23 @@ mod tests {
     }
 
     #[test]
+    fn tun_mode_allows_only_synthetic_dns_answers_not_explicit_literals() {
+        assert!(NetworkMode::TunCompatible.allows_synthetic_ip("198.18.0.41".parse().unwrap()));
+        assert!(!NetworkMode::Strict.allows_synthetic_ip("198.18.0.41".parse().unwrap()));
+        for target in [
+            "http://127.0.0.1/",
+            "http://192.168.1.1/",
+            "http://198.18.0.41/",
+        ] {
+            let url = Url::parse(target).unwrap();
+            assert!(
+                validate_public_url_with_mode(&url, NetworkMode::TunCompatible).is_err(),
+                "explicit private/synthetic literal must remain blocked: {target}"
+            );
+        }
+    }
+
+    #[test]
     fn public_ip_filter_covers_private_special_and_documentation_ranges() {
         for address in [
             "0.0.0.0",
@@ -430,6 +509,12 @@ mod tests {
             "fc00::1",
             "fe80::1",
             "2001:db8::1",
+            "100::1",
+            "2001:0::1",
+            "2001:1::1",
+            "2001:2::1",
+            "2001:10::1",
+            "3fff::1",
             "::ffff:127.0.0.1",
         ] {
             assert!(!is_public_ip(address.parse().unwrap()), "{address}");

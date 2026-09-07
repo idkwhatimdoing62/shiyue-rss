@@ -14,7 +14,7 @@ use std::fs::OpenOptions;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use crate::config::{Config, UI_SCALE_OPTIONS};
+use crate::config::{Config, NetworkMode, UI_SCALE_OPTIONS};
 use host::{HostEffect, HostEvent, HostState, NativeTray};
 use settings::{AtomicTomlSettingsStore, SettingsStore};
 
@@ -28,6 +28,7 @@ pub(crate) enum DesktopIntent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SettingsChange {
     UiScale(u16),
+    NetworkMode(NetworkMode),
 }
 
 trait NotificationHost {
@@ -88,6 +89,7 @@ impl DesktopSession {
         let mut candidate = self.settings.clone();
         match change {
             SettingsChange::UiScale(percent) => candidate.ui_scale_percent = percent,
+            SettingsChange::NetworkMode(mode) => candidate.network_mode = mode,
         }
         candidate.validate()?;
         // Persistence comes first: a failed write leaves the active snapshot

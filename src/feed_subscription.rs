@@ -371,6 +371,9 @@ fn normalize_feed_url(input: &str) -> Result<String, SubscriptionError> {
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(SubscriptionError::input("订阅地址只支持 HTTP 或 HTTPS"));
     }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(SubscriptionError::input("订阅地址不能包含用户名或密码"));
+    }
     Ok(parsed.to_string())
 }
 
@@ -557,5 +560,11 @@ mod tests {
 
         drop(subscriptions);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_feed_urls_with_embedded_credentials() {
+        assert!(normalize_feed_url("https://alice:secret@example.com/feed").is_err());
+        assert!(normalize_feed_url("https://alice@example.com/feed").is_err());
     }
 }

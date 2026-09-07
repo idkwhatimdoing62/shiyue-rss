@@ -7,6 +7,7 @@ fn run(root: &std::path::Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_shiyue-cli"))
         .args(args)
         .env("SHIYUE_TEST_ROOT", root)
+        .env("SHIYUE_TEST_FEED_FIXTURE", "loopback-v1")
         .output()
         .unwrap()
 }
@@ -84,6 +85,7 @@ fn feed_cli_routes_the_subscription_lifecycle_through_one_consistent_seam() {
             .as_nanos()
     ));
     std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join(".shiyue-loopback-fixture"), b"fixture").unwrap();
     let (url, server) = rss_server(2);
 
     let added = run(&root, &["add", &url]);

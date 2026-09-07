@@ -472,9 +472,17 @@ fn run_resource_retry_cli(
         }
     };
     let engine = if no_wait {
-        KnowledgeEngine::start_client(paths.db_file.clone(), cfg.resource_enrichment.clone())?
+        KnowledgeEngine::start_client_with_network_mode(
+            paths.db_file.clone(),
+            cfg.resource_enrichment.clone(),
+            cfg.network_mode,
+        )?
     } else {
-        KnowledgeEngine::start(paths.db_file.clone(), cfg.resource_enrichment.clone())?
+        KnowledgeEngine::start_with_network_mode(
+            paths.db_file.clone(),
+            cfg.resource_enrichment.clone(),
+            cfg.network_mode,
+        )?
     };
     let key = TaskKey::new(TaskKind::ResourceCompletion, id);
     let receipt = match engine.request(key) {
@@ -507,7 +515,9 @@ fn run_resource_retry_cli(
         return Ok(0);
     }
 
-    let timeout = std::time::Duration::from_secs(config::parse_duration(timeout)? as u64);
+    let timeout_seconds = config::parse_duration(timeout)?;
+    anyhow::ensure!(timeout_seconds > 0, "等待超时必须大于 0");
+    let timeout = std::time::Duration::from_secs(timeout_seconds as u64);
     let snapshot = match engine.wait_terminal(key, timeout) {
         Ok(snapshot) => snapshot,
         Err(error) if error.to_string().contains("WORKFLOW_WAIT_TIMEOUT") => {

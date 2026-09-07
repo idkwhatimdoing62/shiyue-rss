@@ -137,6 +137,10 @@ pub(crate) enum DesktopProjectionFact {
     RetryResource(ResourceProjectionDemand),
     LoadMoreResources(ResourceCollection),
     MaintenanceStarted,
+    /// Cancel a maintenance transition that failed before the worker was
+    /// quiesced. This restores the projection's scheduling state so a failed
+    /// request cannot strand the UI in a permanent maintenance view.
+    MaintenanceEnded,
 }
 
 impl DesktopProjectionFact {
@@ -355,6 +359,9 @@ impl DesktopLibraryProjection {
             DesktopProjectionFact::MaintenanceStarted => {
                 self.enter_maintenance();
             }
+            DesktopProjectionFact::MaintenanceEnded => {
+                self.leave_maintenance();
+            }
         }
     }
 
@@ -507,7 +514,11 @@ impl DesktopLibraryProjection {
                     } else {
                         ProjectionFreshness::Loading
                     },
-                    data: materialized.flatten(),
+                    // A maintenance frame must not expose workflow-owned
+                    // snapshots from before the database was closed.
+                    data: (!self.maintenance)
+                        .then(|| materialized.flatten())
+                        .flatten(),
                 },
             );
         }
@@ -618,6 +629,12 @@ impl DesktopLibraryProjection {
             let Ok(event) = self.event_rx.try_recv() else {
                 break;
             };
+            if self.maintenance && !matches!(&event, WorkerEvent::Maintenance(false)) {
+                // Events queued before the maintenance fence are stale. The
+                // worker may still flush them after Maintenance(true), so
+                // discard them while the fence is active.
+                continue;
+            }
             match event {
                 WorkerEvent::ArticleLoaded { scope, projection } => {
                     self.adopt_article_for(scope, *projection)
@@ -679,16 +696,7 @@ impl DesktopLibraryProjection {
                     if active {
                         self.enter_maintenance();
                     } else {
-                        self.maintenance = false;
-                        for slot in self.articles.values_mut() {
-                            slot.freshness = ProjectionFreshness::Loading;
-                        }
-                        for slot in self.resources.values_mut() {
-                            slot.freshness = ProjectionFreshness::Loading;
-                        }
-                        for slot in self.excerpts.values_mut() {
-                            slot.freshness = ProjectionFreshness::Loading;
-                        }
+                        self.leave_maintenance();
                     }
                 }
             }
@@ -715,6 +723,38 @@ impl DesktopLibraryProjection {
             slot.data = None;
             slot.in_flight = false;
             slot.freshness = ProjectionFreshness::Maintenance;
+        }
+    }
+
+    fn leave_maintenance(&mut self) {
+        let was_maintenance = self.maintenance;
+        self.maintenance = false;
+        if was_maintenance {
+            self.active_generation = None;
+            self.known_article_revision = 0;
+            self.known_resource_revision = 0;
+            self.known_excerpt_revision = 0;
+        }
+        for slot in self.articles.values_mut() {
+            if was_maintenance {
+                slot.data = None;
+            }
+            slot.in_flight = false;
+            slot.freshness = ProjectionFreshness::Loading;
+        }
+        for slot in self.resources.values_mut() {
+            if was_maintenance {
+                slot.data = None;
+            }
+            slot.in_flight = false;
+            slot.freshness = ProjectionFreshness::Loading;
+        }
+        for slot in self.excerpts.values_mut() {
+            if was_maintenance {
+                slot.data = None;
+            }
+            slot.in_flight = false;
+            slot.freshness = ProjectionFreshness::Loading;
         }
     }
 
@@ -805,6 +845,9 @@ impl DesktopLibraryProjection {
         scope: ArticleProjectionScope,
         mut projection: ArticleLibraryProjection,
     ) {
+        if self.maintenance {
+            return;
+        }
         let stamp = &projection.stamp;
         if let Some(generation) = &self.active_generation
             && generation != &stamp.generation
@@ -852,6 +895,9 @@ impl DesktopLibraryProjection {
         mut projection: ResourceLibraryProjection,
         append: bool,
     ) {
+        if self.maintenance {
+            return;
+        }
         let stamp = &projection.stamp;
         if let Some(generation) = &self.active_generation
             && generation != &stamp.generation
@@ -917,6 +963,9 @@ impl DesktopLibraryProjection {
         scope: ExcerptProjectionScope,
         mut projection: ExcerptThoughtProjection,
     ) {
+        if self.maintenance {
+            return;
+        }
         let stamp = &projection.stamp;
         if let Some(generation) = &self.active_generation
             && generation != &stamp.generation
@@ -1336,7 +1385,7 @@ mod tests {
             DesktopLibraryProjection {
                 command_tx,
                 event_rx,
-                knowledge: KnowledgeProjectionObserver::disconnected_for_test(),
+                knowledge: KnowledgeProjectionObserver::connected_for_test(),
                 articles: HashMap::new(),
                 resources: HashMap::new(),
                 excerpts: HashMap::new(),
@@ -1545,6 +1594,54 @@ mod tests {
         let excerpt = frame.excerpt(excerpt_scope).unwrap();
         assert_eq!(excerpt.freshness, ProjectionFreshness::Maintenance);
         assert!(excerpt.data.is_none());
+    }
+
+    #[test]
+    fn maintenance_rejects_queued_results_and_hides_knowledge_snapshots() {
+        let (mut module, _commands, _events) = harness();
+        let scope = ProjectionScope::collection(ResourceCollection::Active);
+        let key = TaskKey::new(crate::knowledge_workflow::TaskKind::ResourceCompletion, 9);
+        module.accept(DesktopProjectionFact::adopt_resource(projection(
+            scope, "one", 1,
+        )));
+        module.knowledge.set_snapshot_for_test(
+            key,
+            Some(TaskSnapshot {
+                key,
+                status: crate::knowledge_workflow::TaskStatus::Succeeded,
+                current_stage: None,
+                attempt_number: 1,
+                task_id: 9,
+                automatic_retry: false,
+                error_kind: None,
+                user_message: None,
+                technical_detail: None,
+                change_seq: 1,
+            }),
+        );
+        let demand = DesktopProjectionDemand {
+            resources: vec![ResourceProjectionDemand::Collection(
+                ResourceCollection::Active,
+            )],
+            knowledge: vec![key],
+            ..DesktopProjectionDemand::default()
+        };
+        module.accept(DesktopProjectionFact::MaintenanceStarted);
+        // A same-generation result arriving after the fence is still stale.
+        module.accept(DesktopProjectionFact::adopt_resource(projection(
+            scope, "one", 99,
+        )));
+        let frame = module.frame(demand);
+        assert!(
+            frame
+                .resource(ResourceProjectionDemand::Collection(
+                    ResourceCollection::Active
+                ))
+                .unwrap()
+                .data
+                .is_none()
+        );
+        assert!(frame.knowledge(key).unwrap().data.is_none());
     }
 
     #[test]

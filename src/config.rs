@@ -2,9 +2,32 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
 
 pub const UI_SCALE_OPTIONS: [u16; 4] = [90, 100, 110, 125];
 pub const CURRENT_SETTINGS_VERSION: u32 = 1;
+
+/// 网络请求如何处理本机代理/TUN 提供的合成 DNS 地址。
+///
+/// Strict 保持默认的公网地址校验；TunCompatible 只额外信任代理
+/// TUN 常用的 198.18.0.0/15 合成地址，明确写出的私有 IP 仍会被拒绝。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkMode {
+    #[default]
+    Strict,
+    TunCompatible,
+}
+
+impl NetworkMode {
+    pub fn allows_synthetic_ip(self, address: IpAddr) -> bool {
+        matches!(self, Self::TunCompatible)
+            && matches!(address, IpAddr::V4(address) if {
+                let [a, b, _, _] = address.octets();
+                a == 198 && (b == 18 || b == 19)
+            })
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -23,6 +46,8 @@ pub struct Config {
     pub notifications: bool,
     /// GUI logical-point zoom. Kept in the shared config so it survives restarts.
     pub ui_scale_percent: u16,
+    /// 外部网络请求的地址校验模式。
+    pub network_mode: NetworkMode,
     pub resource_enrichment: ResourceEnrichmentConfig,
 }
 
@@ -62,6 +87,7 @@ impl Default for Config {
             disable_after_failures: 10,
             notifications: true,
             ui_scale_percent: 100,
+            network_mode: NetworkMode::default(),
             resource_enrichment: ResourceEnrichmentConfig::default(),
         }
     }
@@ -101,6 +127,7 @@ impl Config {
 
 /// 把 "30s" / "5m" / "6h" / "2d" 解析成秒；纯数字按秒。
 pub fn parse_duration(s: &str) -> Result<i64> {
+    const MAX_DURATION_SECONDS: i64 = 365 * 24 * 60 * 60;
     let s = s.trim();
     let (num, mult) = if let Some(n) = s.strip_suffix('s') {
         (n, 1)
@@ -117,12 +144,17 @@ pub fn parse_duration(s: &str) -> Result<i64> {
         .trim()
         .parse()
         .map_err(|_| anyhow::anyhow!("无法解析时长: {s}"))?;
-    Ok(v * mult)
+    anyhow::ensure!(v >= 0, "时长必须为非负数: {s}");
+    let seconds = v
+        .checked_mul(mult)
+        .ok_or_else(|| anyhow::anyhow!("时长超出范围: {s}"))?;
+    anyhow::ensure!(seconds <= MAX_DURATION_SECONDS, "时长不能超过 365 天: {s}");
+    Ok(seconds)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, parse_duration};
+    use super::{Config, NetworkMode, parse_duration};
     #[test]
     fn durations() {
         assert_eq!(parse_duration("30s").unwrap(), 30);
@@ -131,6 +163,9 @@ mod tests {
         assert_eq!(parse_duration("2d").unwrap(), 172800);
         assert_eq!(parse_duration("45").unwrap(), 45);
         assert!(parse_duration("abc").is_err());
+        assert!(parse_duration("-1s").is_err());
+        assert!(parse_duration("999999999999999999999d").is_err());
+        assert!(parse_duration("366d").is_err());
     }
 
     #[test]
@@ -141,5 +176,18 @@ mod tests {
 
         let invalid: Config = toml::from_str("ui_scale_percent = 777").unwrap();
         assert_eq!(invalid.ui_scale_factor(), 1.0);
+    }
+
+    #[test]
+    fn network_mode_defaults_to_strict_and_round_trips() {
+        let legacy: Config = toml::from_str("notifications = false").unwrap();
+        assert_eq!(legacy.network_mode, NetworkMode::Strict);
+        let config = Config {
+            network_mode: NetworkMode::TunCompatible,
+            ..Config::default()
+        };
+        let encoded = toml::to_string(&config).unwrap();
+        let decoded: Config = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded.network_mode, NetworkMode::TunCompatible);
     }
 }

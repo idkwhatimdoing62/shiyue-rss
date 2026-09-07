@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use self::parser::Block;
+use crate::config::NetworkMode;
 use crate::gui_theme::ReaderTheme;
 use crate::image_store::{DEFAULT_LIMIT_BYTES, ImageStore};
 use crate::model::{TextAnchor, resolve_excerpt_anchor};
@@ -298,6 +299,17 @@ struct FormulaJob {
     display: bool,
 }
 
+const MAX_FORMULA_SOURCE_CHARS: usize = 16_384;
+const MAX_FORMULA_SVG_BYTES: usize = 512 * 1024;
+const MAX_FORMULA_RENDER_TIME: Duration = Duration::from_secs(2);
+
+fn validate_formula_source(source: &str) -> Result<(), String> {
+    if source.chars().count() > MAX_FORMULA_SOURCE_CHARS {
+        return Err("公式内容过长".to_owned());
+    }
+    Ok(())
+}
+
 enum FormulaEvent {
     Complete {
         key: String,
@@ -336,12 +348,15 @@ pub(crate) struct ArticleDocumentPresenter {
 }
 
 impl ArticleDocumentPresenter {
-    pub(crate) fn new(image_store: Arc<ImageStore>) -> Result<Self> {
+    pub(crate) fn new(image_store: Arc<ImageStore>, network_mode: NetworkMode) -> Result<Self> {
         let (image_job_tx, image_job_rx) = std_mpsc::channel();
         let (image_event_tx, image_event_rx) = std_mpsc::channel();
         let (formula_job_tx, formula_job_rx) = std_mpsc::channel();
         let (formula_event_tx, formula_event_rx) = std_mpsc::channel();
-        let image_fetch: Arc<dyn ImageFetch> = Arc::new(HttpImageFetch(image_client()?));
+        let image_fetch: Arc<dyn ImageFetch> = Arc::new(HttpImageFetch {
+            client: image_client_with_mode(network_mode)?,
+            mode: network_mode,
+        });
         spawn_image_workers(image_fetch, image_job_rx, image_event_tx, image_store);
         spawn_formula_worker(formula_job_rx, formula_event_tx);
         Ok(Self {
@@ -435,7 +450,11 @@ impl ArticleDocumentPresenter {
         }
 
         let mut outcome = PresentOutcome {
-            body_rendered: !document.blocks.is_empty(),
+            // A structural block such as a failed image is not readable body
+            // content. Delayed read marking requires actual text to render.
+            body_rendered: !parser::visible_text(request.source.html, request.source.base_url)
+                .trim()
+                .is_empty(),
             ..PresentOutcome::default()
         };
         if let Some(restore) = request.restore_selection {
@@ -1737,7 +1756,10 @@ impl ArticleDocumentPresenter {
                 source: source.to_owned(),
                 display,
             };
-            if self.formula_job_tx.send(job).is_ok() {
+            if validate_formula_source(source).is_err() {
+                self.formula_cache
+                    .insert(key.clone(), FormulaState::Failed("公式内容过长".to_owned()));
+            } else if self.formula_job_tx.send(job).is_ok() {
                 self.formula_cache
                     .insert(key.clone(), FormulaState::Loading);
             } else {
@@ -1934,19 +1956,21 @@ impl ArticleDocumentPresenter {
     }
 }
 
-fn image_client() -> Result<reqwest::blocking::Client> {
+fn image_client_with_mode(mode: NetworkMode) -> Result<reqwest::blocking::Client> {
     Ok(
-        crate::web_clip::with_public_dns_resolver(reqwest::blocking::Client::builder())
+        crate::web_clip::with_network_dns_resolver(reqwest::blocking::Client::builder(), mode)
             .http1_only()
             .connect_timeout(Duration::from_secs(8))
             .timeout(Duration::from_secs(30))
             .pool_idle_timeout(Duration::from_secs(30))
             .pool_max_idle_per_host(IMAGE_WORKER_COUNT)
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
                 if attempt.previous().len() > 10 {
                     return attempt.error("图片重定向次数过多");
                 }
-                if let Err(message) = crate::web_clip::validate_public_url(attempt.url()) {
+                if let Err(message) =
+                    crate::web_clip::validate_public_url_with_mode(attempt.url(), mode)
+                {
                     return attempt.error(message);
                 }
                 attempt.follow()
@@ -1965,11 +1989,14 @@ trait ImageFetch: Send + Sync {
     fn fetch_once(&self, uri: &str, attempt: u8) -> std::result::Result<Arc<[u8]>, ImageFailure>;
 }
 
-struct HttpImageFetch(reqwest::blocking::Client);
+struct HttpImageFetch {
+    client: reqwest::blocking::Client,
+    mode: NetworkMode,
+}
 
 impl ImageFetch for HttpImageFetch {
     fn fetch_once(&self, uri: &str, attempt: u8) -> std::result::Result<Arc<[u8]>, ImageFailure> {
-        download_image_once(&self.0, uri, attempt)
+        download_image_once_with_mode(&self.client, uri, attempt, self.mode)
     }
 }
 
@@ -1993,6 +2020,13 @@ fn spawn_formula_worker(
                 }
             };
             while let Ok(job) = jobs.recv() {
+                if let Err(error) = validate_formula_source(&job.source) {
+                    let _ = events.send(FormulaEvent::Complete {
+                        key: job.key,
+                        result: Err(error),
+                    });
+                    continue;
+                }
                 let options = mathjax_svg_rs::Options {
                     font_size: if job.display { 19.0 } else { 16.0 },
                     horizontal_align: if job.display {
@@ -2001,12 +2035,24 @@ fn spawn_formula_worker(
                         mathjax_svg_rs::HorizontalAlign::Left
                     },
                 };
+                let started = Instant::now();
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     renderer.render_tex(&job.source, &options)
                 }))
                 .map_err(|_| "公式排版失败".to_owned())
                 .and_then(|value| value.map_err(|error| error.to_string()))
-                .map(|svg| Arc::<[u8]>::from(svg.into_bytes()));
+                .and_then(|svg| {
+                    if started.elapsed() > MAX_FORMULA_RENDER_TIME {
+                        Err("公式排版超时".to_owned())
+                    } else {
+                        let bytes = svg.into_bytes();
+                        if bytes.len() > MAX_FORMULA_SVG_BYTES {
+                            Err("公式输出过大".to_owned())
+                        } else {
+                            Ok(Arc::<[u8]>::from(bytes))
+                        }
+                    }
+                });
                 let _ = events.send(FormulaEvent::Complete {
                     key: job.key,
                     result,
@@ -2136,10 +2182,11 @@ fn download_image_with_retry(
     }))
 }
 
-fn download_image_once(
+fn download_image_once_with_mode(
     client: &reqwest::blocking::Client,
     uri: &str,
     attempt: u8,
+    mode: NetworkMode,
 ) -> std::result::Result<Arc<[u8]>, ImageFailure> {
     let url = reqwest::Url::parse(uri).map_err(|error| ImageFailure {
         message: "图片地址无效，已停止加载".to_owned(),
@@ -2147,7 +2194,7 @@ fn download_image_once(
         attempts: attempt,
         retryable: false,
     })?;
-    crate::web_clip::validate_public_url(&url).map_err(|detail| ImageFailure {
+    crate::web_clip::validate_public_url_with_mode(&url, mode).map_err(|detail| ImageFailure {
         message: "为保护本机数据，已阻止加载该图片".to_owned(),
         detail,
         attempts: attempt,
@@ -2163,6 +2210,7 @@ fn download_image_once(
         .map_err(|error| image_request_failure(error, attempt))?;
     if let Some(peer) = response.remote_addr()
         && !crate::web_clip::is_public_ip(peer.ip())
+        && !mode.allows_synthetic_ip(peer.ip())
     {
         return Err(ImageFailure {
             message: "为保护本机数据，已阻止加载该图片".to_owned(),

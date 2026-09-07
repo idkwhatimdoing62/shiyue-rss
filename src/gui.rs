@@ -28,7 +28,7 @@ use crate::article_library_lifecycle::{
     ChangeDisposition as ArticleChangeDisposition, LifecycleFailure, ProjectionScope,
 };
 use crate::backup::{BackupEntry, BackupProtection, BackupStore, DEFAULT_BACKUP_KEEP};
-use crate::config::Config;
+use crate::config::{Config, NetworkMode};
 use crate::db::Db;
 use crate::desktop_library_projection::{
     DesktopLibraryProjection, DesktopProjectionDemand, DesktopProjectionFact,
@@ -723,8 +723,11 @@ impl GuiApp {
         )?);
         let db = Db::open(&paths.db_file)?;
         let resource_enrichment_config = cfg.resource_enrichment.clone();
-        let knowledge_engine =
-            KnowledgeEngine::start(paths.db_file.clone(), resource_enrichment_config.clone())?;
+        let knowledge_engine = KnowledgeEngine::start_with_network_mode(
+            paths.db_file.clone(),
+            resource_enrichment_config.clone(),
+            cfg.network_mode,
+        )?;
         let desktop_projection = DesktopLibraryProjection::start(
             paths.db_file.clone(),
             knowledge_engine.projection_observer(),
@@ -738,7 +741,8 @@ impl GuiApp {
 
         let image_store = Arc::new(ImageStore::open(&paths.image_cache_dir)?);
         let _ = image_store.prune_to(DEFAULT_LIMIT_BYTES);
-        let web_clipping_lifecycle = WebClippingLifecycle::start(paths.db_file.clone());
+        let web_clipping_lifecycle =
+            WebClippingLifecycle::start_with_mode(paths.db_file.clone(), cfg.network_mode);
         let participants: Vec<Arc<dyn MaintenanceParticipant>> = vec![
             rss_refresh.maintenance_participant(),
             knowledge_engine.maintenance_participant(),
@@ -786,7 +790,7 @@ impl GuiApp {
             body_article_id: None,
             reading_positions,
             delayed_read_marking: DelayedReadMarking::default(),
-            article_document: ArticleDocumentPresenter::new(image_store.clone())?,
+            article_document: ArticleDocumentPresenter::new(image_store.clone(), cfg.network_mode)?,
             image_store,
             backup_store,
             maintenance_engine,
@@ -948,6 +952,11 @@ impl GuiApp {
                         "{error:#}; 重新打开资料库失败: {reopen_error:#}"
                     ));
                 }
+                // The request failed before maintenance became active. Roll
+                // back the projection transition so the UI can schedule
+                // normal loads again instead of remaining blank forever.
+                self.desktop_projection
+                    .accept(DesktopProjectionFact::MaintenanceEnded);
                 Err(error)
             }
         }
@@ -1194,6 +1203,38 @@ impl GuiApp {
                     {
                         Ok(()) => format!("界面缩放已设为 {selected_scale}%"),
                         Err(error) => format!("界面缩放未修改：{error:#}"),
+                    });
+                }
+                let previous_network_mode = self.desktop.settings().network_mode;
+                let mut selected_network_mode = previous_network_mode;
+                ui.horizontal(|ui| {
+                    ui.label("网络访问");
+                    egui::ComboBox::from_id_salt("network-mode")
+                        .selected_text(match selected_network_mode {
+                            NetworkMode::Strict => "严格公网（默认）",
+                            NetworkMode::TunCompatible => "兼容 TUN/代理 DNS",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut selected_network_mode,
+                                NetworkMode::Strict,
+                                "严格公网（默认）",
+                            );
+                            ui.selectable_value(
+                                &mut selected_network_mode,
+                                NetworkMode::TunCompatible,
+                                "兼容 TUN/代理 DNS",
+                            );
+                        });
+                    ui.label("允许代理合成地址；明确内网地址仍会拦截");
+                });
+                if selected_network_mode != previous_network_mode {
+                    self.storage_message = Some(match self
+                        .desktop
+                        .apply(SettingsChange::NetworkMode(selected_network_mode), &ctx)
+                    {
+                        Ok(()) => "网络模式已保存，重启后对后台请求生效".into(),
+                        Err(error) => format!("网络模式未修改：{error:#}"),
                     });
                 }
                 ui.separator();
@@ -4063,8 +4104,10 @@ impl eframe::App for GuiApp {
                             .unwrap_or(0.0);
                         let title_width = (ui.available_width() - action_width - 6.0).max(0.0);
                         let mut retry_clicked = false;
+                        let mut row_layout = *ui.layout();
+                        row_layout.main_align = egui::Align::Min;
                         let response = ui
-                            .horizontal(|ui| {
+                            .with_layout(row_layout, |ui| {
                                 let mut response = ui.add(
                                     egui::Button::new(
                                         egui::RichText::new(format!("{mark} {title} ({unread})"))
