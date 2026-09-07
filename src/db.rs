@@ -682,15 +682,17 @@ impl Db {
         let tx = self.fenced_transaction()?;
         let mut new = 0usize;
         let mut impact = ProjectionImpact::none();
+        let mut existing_urls = std::collections::HashSet::new();
+        let mut rows = tx.prepare("SELECT url FROM articles WHERE url IS NOT NULL")?;
+        for row in rows.query_map([], |row| row.get::<_, String>(0))? {
+            existing_urls.insert(Self::normalize_article_url(&row?));
+        }
+        drop(rows);
         for article in articles {
-            if let Some(url) = article.url.as_deref()
-                && tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM articles WHERE url = ?1)",
-                    [url],
-                    |row| row.get::<_, bool>(0),
-                )?
-            {
-                continue;
+            if let Some(url) = article.url.as_deref() {
+                if !existing_urls.insert(Self::normalize_article_url(url)) {
+                    continue;
+                }
             }
             let inserted = tx.execute(
                 "INSERT OR IGNORE INTO articles \
@@ -717,6 +719,19 @@ impl Db {
         }
         tx.commit()?;
         Ok(new)
+    }
+
+    fn normalize_article_url(url: &str) -> String {
+        let trimmed = url.trim();
+        if let Ok(mut parsed) = reqwest::Url::parse(trimmed) {
+            parsed.set_fragment(None);
+            while parsed.path().len() > 1 && parsed.path().ends_with('/') {
+                let path = parsed.path().trim_end_matches('/').to_owned();
+                parsed.set_path(&path);
+            }
+            return parsed.to_string();
+        }
+        trimmed.to_ascii_lowercase()
     }
 
     /// Replace an article's cached body while retaining all user state.

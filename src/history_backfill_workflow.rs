@@ -405,8 +405,8 @@ fn fetch_article(
         return Err(anyhow!("没有提取到正文"));
     }
     Ok(NewArticle {
-        entry_id: entry.url.clone(),
-        url: Some(entry.url.clone()),
+        entry_id: fetched.final_url.clone(),
+        url: Some(fetched.final_url.clone()),
         title: readable.title.or_else(|| Some(entry.title.clone())),
         author: None,
         published: extract_published(&fetched.html),
