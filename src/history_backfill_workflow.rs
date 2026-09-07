@@ -229,25 +229,49 @@ fn start_state(
     feed_url: String,
     snapshot: &Arc<Mutex<BackfillSnapshot>>,
 ) -> Result<State> {
-    if !feed_url.contains("ruanyifeng.com") {
-        return Err(anyhow!("历史回补目前仅支持阮一峰博客"));
-    }
-    let root =
-        web_clip::fetch_html_with_mode(client, ruanyifeng_archive::DEFAULT_ARCHIVE_URL, mode)?;
-    let page = ruanyifeng_archive::parse_archive_page(&root.html, &root.final_url)?;
-    let month_url = page
-        .month_url
-        .or_else(|| Some(ruanyifeng_archive::DEFAULT_ARCHIVE_URL.into()));
     let mut state = State {
         feed_id,
         entries: Vec::new(),
         seen_urls: HashSet::new(),
         failed_entries: Vec::new(),
         cursor: 0,
-        month_url,
+        month_url: None,
         paused: false,
     };
-    append_page(client, mode, &mut state)?;
+    if ruanyifeng_archive::is_supported_feed_url(&feed_url) {
+        let root =
+            web_clip::fetch_html_with_mode(client, ruanyifeng_archive::DEFAULT_ARCHIVE_URL, mode)?;
+        let page = ruanyifeng_archive::parse_archive_page(&root.html, &root.final_url)?;
+        state.month_url = page
+            .month_url
+            .or_else(|| Some(ruanyifeng_archive::DEFAULT_ARCHIVE_URL.into()));
+        append_page(client, mode, &mut state)?;
+    } else {
+        let root = web_clip::fetch_html_with_mode(client, &feed_url, mode)?;
+        let parsed = feed_rs::parser::parse(std::io::Cursor::new(root.html.as_bytes()))
+            .map_err(|error| anyhow!("解析订阅源失败：{error}"))?;
+        for item in parsed.entries {
+            let Some(link) = item.links.first().map(|link| link.href.clone()) else {
+                continue;
+            };
+            if state.seen_urls.insert(link.clone()) {
+                state.entries.push(ArchiveEntry {
+                    url: link,
+                    title: item
+                        .title
+                        .map(|title| title.content)
+                        .unwrap_or_else(|| "未命名文章".into()),
+                });
+            }
+        }
+        // RSS/Atom feeds commonly expose older pages through rel=next. Keep
+        // the URL in month_url so append_page can continue paging uniformly.
+        state.month_url = parsed
+            .links
+            .iter()
+            .find(|link| link.rel.as_deref() == Some("next"))
+            .map(|link| link.href.clone());
+    }
     let mut current = snapshot.lock().expect("backfill snapshot poisoned");
     current.status = BackfillStatus::Fetching;
     current.feed_id = Some(feed_id);
@@ -269,13 +293,36 @@ fn append_page(
         return Ok(());
     };
     let fetched = web_clip::fetch_html_with_mode(client, &url, mode)?;
-    let page = ruanyifeng_archive::parse_archive_page(&fetched.html, &fetched.final_url)?;
-    for entry in page.entries {
-        if state.seen_urls.insert(entry.url.clone()) {
-            state.entries.push(entry);
+    if let Ok(page) = ruanyifeng_archive::parse_archive_page(&fetched.html, &fetched.final_url) {
+        for entry in page.entries {
+            if state.seen_urls.insert(entry.url.clone()) {
+                state.entries.push(entry);
+            }
         }
+        state.month_url = page.previous_month;
+    } else {
+        let parsed = feed_rs::parser::parse(std::io::Cursor::new(fetched.html.as_bytes()))
+            .map_err(|error| anyhow!("解析分页订阅源失败：{error}"))?;
+        for item in parsed.entries {
+            let Some(link) = item.links.first().map(|link| link.href.clone()) else {
+                continue;
+            };
+            if state.seen_urls.insert(link.clone()) {
+                state.entries.push(ArchiveEntry {
+                    url: link,
+                    title: item
+                        .title
+                        .map(|title| title.content)
+                        .unwrap_or_else(|| "未命名文章".into()),
+                });
+            }
+        }
+        state.month_url = parsed
+            .links
+            .iter()
+            .find(|link| link.rel.as_deref() == Some("next"))
+            .map(|link| link.href.clone());
     }
-    state.month_url = page.previous_month;
     Ok(())
 }
 

@@ -179,7 +179,7 @@ pub(super) fn show_panel(
             .desired_width(f32::INFINITY),
     );
     ui.weak("支持 s / m / h / d；修改间隔不会立刻抓取。");
-    if draft.url.contains("ruanyifeng.com") {
+    {
         ui.separator();
         ui.label(egui::RichText::new("历史文章").strong());
         let history = dependencies.history.snapshot();

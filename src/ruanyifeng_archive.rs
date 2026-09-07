@@ -6,6 +6,11 @@ use scraper::{Html, Selector};
 pub(crate) const DEFAULT_ARCHIVE_URL: &str = "https://www.ruanyifeng.com/blog/archives.html";
 pub(crate) const BATCH_SIZE: usize = 50;
 
+pub(crate) fn is_supported_feed_url(url: &str) -> bool {
+    let normalized = url.trim().to_ascii_lowercase();
+    normalized.contains("ruanyifeng.com") || normalized.contains("feeds.feedburner.com/ruanyifeng")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ArchiveEntry {
     pub(crate) url: String,
@@ -108,6 +113,17 @@ pub(crate) fn next_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognizes_official_and_feedburner_subscriptions() {
+        assert!(is_supported_feed_url(
+            "https://www.ruanyifeng.com/blog/atom.xml"
+        ));
+        assert!(is_supported_feed_url(
+            "http://feeds.feedburner.com/ruanyifeng"
+        ));
+        assert!(!is_supported_feed_url("https://example.com/feed.xml"));
+    }
 
     #[test]
     fn parses_and_deduplicates_article_links_and_previous_month() {
