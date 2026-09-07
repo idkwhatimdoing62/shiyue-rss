@@ -20,16 +20,37 @@ use crate::library_search::{
 };
 use crate::model::SearchHistoryEntry;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct SearchDialog {
     query: String,
     searched_query: String,
+    scope: SearchScope,
     results: Vec<LibrarySearchResult>,
     error: Option<String>,
     focus_input: bool,
     history: Vec<SearchHistoryEntry>,
     searching: bool,
     active_request: Option<u64>,
+    selected_index: Option<usize>,
+}
+
+const DESKTOP_SEARCH_LIMIT: usize = 50;
+
+impl Default for SearchDialog {
+    fn default() -> Self {
+        Self {
+            query: String::new(),
+            searched_query: String::new(),
+            scope: SearchScope::Curated,
+            results: Vec::new(),
+            error: None,
+            focus_input: false,
+            history: Vec::new(),
+            searching: false,
+            active_request: None,
+            selected_index: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,7 +139,7 @@ impl SearchFeature {
                 scope: SearchScope::Curated,
                 result_type: ResultType::All,
                 origin: SearchOrigin::Human,
-                limit: 50,
+                limit: DESKTOP_SEARCH_LIMIT,
             },
             SearchTarget::ResourceRoute,
             context,
@@ -141,6 +162,7 @@ impl SearchFeature {
         let mut submit = false;
         let mut selected_hit = None;
         let mut clear_history = false;
+        let mut scope_changed = false;
 
         let response = gui_modal::show(context, ModalKind::Search, false, |ui, focus| {
             ui.horizontal(|ui| {
@@ -157,6 +179,17 @@ impl SearchFeature {
                 if input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     submit = true;
                 }
+                if input.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    if dialog.searched_query == dialog.query.trim()
+                        && dialog.selected_index.is_some()
+                    {
+                        selected_hit = dialog
+                            .selected_index
+                            .and_then(|index| dialog.results.get(index).cloned());
+                    } else {
+                        submit = true;
+                    }
+                }
                 if ui
                     .add_sized(
                         egui::vec2(68.0, 34.0),
@@ -170,12 +203,42 @@ impl SearchFeature {
                 }
             });
             ui.add_space(7.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "支持标题、作者、正文、网址、摘录原文和想法内容；最多显示 {DESKTOP_SEARCH_LIMIT} 条。"
+                    ))
+                    .size(13.0)
+                    .color(theme.muted),
+                );
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("范围").size(13.0).color(theme.muted));
+                let previous_scope = dialog.scope;
+                egui::ComboBox::from_id_salt("library-search-scope")
+                    .selected_text(search_scope_label(dialog.scope))
+                    .width(112.0)
+                    .show_ui(ui, |ui| {
+                        for scope in [
+                            SearchScope::Curated,
+                            SearchScope::AllArticles,
+                            SearchScope::Archive,
+                        ] {
+                            ui.selectable_value(
+                                &mut dialog.scope,
+                                scope,
+                                search_scope_label(scope),
+                            );
+                        }
+                    });
+                if dialog.scope != previous_scope {
+                    dialog.selected_index = None;
+                    scope_changed = true;
+                }
+            });
             ui.label(
-                egui::RichText::new(
-                    "支持标题、作者、正文、网址、摘录原文和想法内容；最多显示 200 条。",
-                )
-                .size(13.0)
-                .color(theme.muted),
+                egui::RichText::new("↑↓ 选择结果 · Enter 打开 · Esc 关闭")
+                    .size(12.0)
+                    .color(theme.muted),
             );
             ui.add_space(8.0);
             ui.separator();
@@ -282,10 +345,38 @@ impl SearchFeature {
                 return;
             }
 
+            if dialog.searched_query == dialog.query.trim() {
+                let (up, down, enter) = ui.input(|input| {
+                    (
+                        input.key_pressed(egui::Key::ArrowUp),
+                        input.key_pressed(egui::Key::ArrowDown),
+                        input.key_pressed(egui::Key::Enter),
+                    )
+                });
+                if down {
+                    let next = dialog
+                        .selected_index
+                        .map_or(0, |index| (index + 1) % dialog.results.len());
+                    dialog.selected_index = Some(next);
+                } else if up {
+                    let next = dialog
+                        .selected_index
+                        .map_or(dialog.results.len().saturating_sub(1), |index| {
+                            index.checked_sub(1).unwrap_or(dialog.results.len() - 1)
+                        });
+                    dialog.selected_index = Some(next);
+                }
+                if enter && !ui.ctx().egui_wants_keyboard_input() {
+                    selected_hit = dialog
+                        .selected_index
+                        .and_then(|index| dialog.results.get(index).cloned());
+                }
+            }
+
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    for hit in &dialog.results {
+                    for (index, hit) in dialog.results.iter().enumerate() {
                         let (kind, kind_color) = match hit.primary {
                             PrimaryIdentity::Resource(_) => ("资源", theme.accent),
                             PrimaryIdentity::Article(_) => ("文章", theme.link),
@@ -362,7 +453,14 @@ impl SearchFeature {
                             })
                             .response
                             .interact(egui::Sense::click());
-                        if response.hovered() {
+                        if dialog.selected_index == Some(index) {
+                            ui.painter().rect_stroke(
+                                response.rect,
+                                egui::CornerRadius::same(7),
+                                egui::Stroke::new(2.0, theme.accent),
+                                egui::StrokeKind::Inside,
+                            );
+                        } else if response.hovered() {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                             ui.painter().rect_stroke(
                                 response.rect,
@@ -387,6 +485,9 @@ impl SearchFeature {
             dialog.history.clear();
         }
         if submit {
+            self.run_modal_search(dialog, context, db_path);
+        }
+        if scope_changed && !submit {
             self.run_modal_search(dialog, context, db_path);
         }
         ModalOutcome {
@@ -428,6 +529,7 @@ impl SearchFeature {
                                     notices.push("搜索完成，但搜索历史没有保存".to_owned());
                                 }
                                 dialog.results = outcome.results;
+                                dialog.selected_index = None;
                                 dialog.history = refreshed_history.unwrap_or_default();
                             }
                             Err(error) => {
@@ -469,6 +571,7 @@ impl SearchFeature {
             dialog.searched_query.clear();
             dialog.error = None;
             dialog.results.clear();
+            dialog.selected_index = None;
             dialog.searching = false;
             dialog.active_request = None;
             return;
@@ -476,10 +579,10 @@ impl SearchFeature {
         let request_id = self.start_search_job(
             SearchRequest {
                 query: query.clone(),
-                scope: SearchScope::Curated,
+                scope: dialog.scope,
                 result_type: ResultType::All,
                 origin: SearchOrigin::Human,
-                limit: 50,
+                limit: DESKTOP_SEARCH_LIMIT,
             },
             SearchTarget::Modal,
             context,
@@ -488,6 +591,7 @@ impl SearchFeature {
         dialog.searched_query = query;
         dialog.error = None;
         dialog.results.clear();
+        dialog.selected_index = None;
         dialog.searching = true;
         dialog.active_request = Some(request_id);
     }
@@ -532,6 +636,14 @@ fn accepts_search_response(active_request: Option<u64>, incoming_request: u64) -
     active_request == Some(incoming_request)
 }
 
+fn search_scope_label(scope: SearchScope) -> &'static str {
+    match scope {
+        SearchScope::Curated => "当前资料",
+        SearchScope::AllArticles => "全部未归档",
+        SearchScope::Archive => "已归档",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,6 +653,16 @@ mod tests {
         assert!(accepts_search_response(Some(9), 9));
         assert!(!accepts_search_response(Some(10), 9));
         assert!(!accepts_search_response(None, 9));
+    }
+
+    #[test]
+    fn desktop_search_defaults_to_curated_scope_and_bounded_limit() {
+        let dialog = SearchDialog::default();
+        assert_eq!(dialog.scope, SearchScope::Curated);
+        assert_eq!(DESKTOP_SEARCH_LIMIT, 50);
+        assert_eq!(search_scope_label(SearchScope::Curated), "当前资料");
+        assert_eq!(search_scope_label(SearchScope::AllArticles), "全部未归档");
+        assert_eq!(search_scope_label(SearchScope::Archive), "已归档");
     }
 
     #[test]

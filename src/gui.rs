@@ -1175,6 +1175,10 @@ impl GuiApp {
                     .inner_margin(egui::Margin::symmetric(24, 18)),
             )
             .show(root_ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("storage-page-scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
                 ui.heading("资料库与离线缓存");
                 ui.label("资料默认保存在本机；图片缓存和备份均可独立清理。所有恢复都会先创建安全副本。");
                 ui.add_space(8.0);
@@ -1227,6 +1231,7 @@ impl GuiApp {
                             );
                         });
                     ui.label("允许代理合成地址；明确内网地址仍会拦截");
+                    ui.colored_label(theme.muted, "重启后生效");
                 });
                 if selected_network_mode != previous_network_mode {
                     self.storage_message = Some(match self
@@ -1393,6 +1398,7 @@ impl GuiApp {
                         }
                     }
                 });
+                    });
             });
         if let Some(action) = action {
             self.execute_storage_action(action);
@@ -2266,7 +2272,12 @@ impl GuiApp {
                         .size_range(360.0..=720.0)
                         .show(ui, |ui| {
                             ui.set_min_width(ui.available_width());
-                            self.show_resource_editor(ui);
+                            egui::ScrollArea::vertical()
+                                .id_salt("resource-editor-scroll")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    self.show_resource_editor(ui);
+                                });
                         });
                 }
                 ui.label(
@@ -3308,17 +3319,20 @@ impl GuiApp {
                                                 {
                                                     remove_thought = Some(excerpt.id);
                                                 }
-                                                if excerpt.thought.is_some()
-                                                    && ui
-                                                        .add(
-                                                            egui::Button::new(
-                                                                egui::RichText::new("编辑想法")
-                                                                    .size(13.0)
-                                                                    .color(theme.link),
-                                                            )
-                                                            .stroke(egui::Stroke::NONE),
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            egui::RichText::new(if excerpt.thought.is_some() {
+                                                                "编辑想法"
+                                                            } else {
+                                                                "写想法"
+                                                            })
+                                                            .size(13.0)
+                                                            .color(theme.link),
                                                         )
-                                                        .clicked()
+                                                        .stroke(egui::Stroke::NONE),
+                                                    )
+                                                    .clicked()
                                                 {
                                                     edit_thought = Some(excerpt.clone());
                                                 }
@@ -3552,13 +3566,19 @@ impl GuiApp {
         let Some(notice) = self.ui_state.notice() else {
             return;
         };
-        if notice.created.elapsed() > Duration::from_secs(4) {
-            self.ui_state.reduce(UiAction::ClearNotice);
-            return;
-        }
         let message = notice.message.clone();
         let theme = ReaderTheme::sspai();
         let failed = message.contains("失败") || message.contains("错误");
+        let timeout = if failed {
+            Duration::from_secs(12)
+        } else {
+            Duration::from_secs(4)
+        };
+        if notice.created.elapsed() > timeout {
+            self.ui_state.reduce(UiAction::ClearNotice);
+            return;
+        }
+        let mut dismiss = false;
         egui::Area::new(egui::Id::new("selection-notice"))
             .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 24.0))
             .order(egui::Order::Foreground)
@@ -3589,9 +3609,24 @@ impl GuiApp {
                                 )
                                 .wrap(),
                             );
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("×").size(16.0).color(theme.muted),
+                                    )
+                                    .stroke(egui::Stroke::NONE),
+                                )
+                                .on_hover_text("关闭提示")
+                                .clicked()
+                            {
+                                dismiss = true;
+                            }
                         });
                     });
             });
+        if dismiss {
+            self.ui_state.reduce(UiAction::ClearNotice);
+        }
         ctx.request_repaint_after(Duration::from_millis(100));
     }
 
@@ -3741,8 +3776,9 @@ impl eframe::App for GuiApp {
         let mut feed_settings_click = None;
         let mut retry_feed_id = None;
         egui::Panel::left("feeds")
-            .exact_size(FEED_PANEL_WIDTH)
-            .resizable(false)
+            .default_size(FEED_PANEL_WIDTH)
+            .size_range(200.0..=360.0)
+            .resizable(true)
             .frame(
                 egui::Frame::new()
                     .fill(theme.panel)
@@ -3795,7 +3831,7 @@ impl eframe::App for GuiApp {
                     NavigationButton {
                         icon: RemixIcon::Search,
                         selected: search_selected,
-                        label: "全文搜索",
+                        label: "资料搜索",
                         trailing: Some("Ctrl+F".into()),
                         color: if search_selected {
                             theme.text
@@ -4278,8 +4314,9 @@ impl eframe::App for GuiApp {
                 Some(ProjectionFreshness::Loading | ProjectionFreshness::Refreshing)
             );
         egui::Panel::left("articles")
-            .exact_size(ARTICLE_PANEL_WIDTH)
-            .resizable(false)
+            .default_size(ARTICLE_PANEL_WIDTH)
+            .size_range(280.0..=520.0)
+            .resizable(true)
             .frame(
                 egui::Frame::new()
                     .fill(theme.panel)
