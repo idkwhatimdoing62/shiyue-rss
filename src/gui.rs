@@ -23,6 +23,7 @@ use crate::article_document_presentation::{
     ArticleDocumentPresenter, ArticleDocumentSource, PresentOutcome, PresentRequest,
     PresentationIntent, RestoreSelection, SelectedQuote, article_visible_text,
 };
+use crate::article_fulltext_workflow::{ArticleFullTextWorkflow, FullTextStatus};
 use crate::article_library_lifecycle::{
     ArticleBatchAction, ArticleLibraryLifecycle, ArticleLibraryProjection, ArticleLifecycleChange,
     ChangeDisposition as ArticleChangeDisposition, LifecycleFailure, ProjectionScope,
@@ -47,6 +48,7 @@ use crate::gui_state::{
     UiEffect, UiState,
 };
 use crate::gui_theme::ReaderTheme;
+use crate::history_backfill_workflow::{BackfillStatus, HistoryBackfillWorkflow};
 use crate::image_store::{CacheStats, DEFAULT_LIMIT_BYTES, ImageStore};
 use crate::knowledge_workflow::{
     ConnectionState, KnowledgeEngine, TaskKey, TaskKind as KnowledgeTaskKind, TaskSnapshot,
@@ -78,6 +80,8 @@ const FEED_ROW_HEIGHT: f32 = 38.0;
 pub(crate) struct GuiApp {
     db_path: PathBuf,
     rss_refresh: RssRefreshWorkflow,
+    history_backfill: HistoryBackfillWorkflow,
+    fulltext_workflow: ArticleFullTextWorkflow,
     rss_last_terminal_notice: Option<RunId>,
     feeds: Vec<Feed>,
     batch_mode: bool,
@@ -738,6 +742,16 @@ impl GuiApp {
             RssRefreshWorkflow::start_scheduled(paths.db_file.clone(), cfg.clone(), move || {
                 repaint.request_repaint()
             })?;
+        let repaint = cc.egui_ctx.clone();
+        let history_backfill =
+            HistoryBackfillWorkflow::start(paths.db_file.clone(), cfg.network_mode, move || {
+                repaint.request_repaint()
+            })?;
+        let repaint = cc.egui_ctx.clone();
+        let fulltext_workflow =
+            ArticleFullTextWorkflow::start(paths.db_file.clone(), cfg.network_mode, move || {
+                repaint.request_repaint()
+            })?;
 
         let image_store = Arc::new(ImageStore::open(&paths.image_cache_dir)?);
         let _ = image_store.prune_to(DEFAULT_LIMIT_BYTES);
@@ -777,6 +791,8 @@ impl GuiApp {
         let mut app = GuiApp {
             db_path: paths.db_file.clone(),
             rss_refresh,
+            history_backfill,
+            fulltext_workflow,
             rss_last_terminal_notice: None,
             feeds: Vec::new(),
             batch_mode: false,
@@ -1078,6 +1094,46 @@ impl GuiApp {
                     self.notice(user_message);
                 }
             }
+        }
+    }
+
+    fn receive_backfill_updates(&mut self) {
+        let mut changed = false;
+        for _ in self.history_backfill.try_notices() {
+            changed = true;
+        }
+        if !changed {
+            return;
+        }
+        let snapshot = self.history_backfill.snapshot();
+        if self.db.is_open() && matches!(snapshot.status, BackfillStatus::Completed) {
+            self.reload();
+            self.notice(format!("历史回补完成，新增 {} 篇", snapshot.inserted));
+        } else if let Some(error) = snapshot.last_error {
+            self.notice(format!("历史回补失败：{error}"));
+        }
+    }
+
+    fn receive_fulltext_updates(&mut self) {
+        let mut changed = false;
+        for _ in self.fulltext_workflow.try_notices() {
+            changed = true;
+        }
+        if !changed {
+            return;
+        }
+        let snapshot = self.fulltext_workflow.snapshot();
+        match snapshot.status {
+            FullTextStatus::Succeeded => {
+                self.reload();
+                self.notice("全文已抓取并缓存到本地");
+            }
+            FullTextStatus::Failed => {
+                if let Some(error) = snapshot.error {
+                    self.notice(format!("全文抓取失败：{error}"));
+                }
+            }
+            FullTextStatus::Idle | FullTextStatus::Fetching => {}
         }
     }
 
@@ -1496,6 +1552,7 @@ impl GuiApp {
         let dependencies = feed_subscription_feature::Dependencies {
             database: self.db_path.as_path(),
             refresh: &self.rss_refresh,
+            history: &self.history_backfill,
         };
         let outcome = match self.ui_state.modal_mut() {
             Some(ModalState::AddFeed(draft)) => feed_subscription_feature::show_modal(
@@ -3104,6 +3161,7 @@ impl GuiApp {
             let dependencies = feed_subscription_feature::Dependencies {
                 database: self.db_path.as_path(),
                 refresh: &self.rss_refresh,
+                history: &self.history_backfill,
             };
             feed_subscription_feature::show_panel(ui, draft, show_discard, &dependencies)
         };
@@ -3738,6 +3796,8 @@ impl eframe::App for GuiApp {
         }
         self.receive_maintenance_updates(&ctx);
         self.receive_rss_refresh_updates();
+        self.receive_backfill_updates();
+        self.receive_fulltext_updates();
         if !self.db.is_open() {
             self.show_maintenance_page(ui);
             return;
@@ -4247,6 +4307,7 @@ impl eframe::App for GuiApp {
                 let dependencies = feed_subscription_feature::Dependencies {
                     database: self.db_path.as_path(),
                     refresh: &self.rss_refresh,
+                    history: &self.history_backfill,
                 };
                 feed_subscription_feature::retry_disabled_feed(feed_id, &dependencies)
             };
@@ -4686,6 +4747,8 @@ impl eframe::App for GuiApp {
                 let mut archive_selected_article = false;
                 let mut edit_article_tags = false;
                 let mut generate_article_ai = false;
+                let mut fetch_full_text = false;
+                let fulltext_snapshot = self.fulltext_workflow.snapshot();
                 let restore_selection = self
                     .pending_selection_anchor
                     .as_ref()
@@ -4846,6 +4909,36 @@ impl eframe::App for GuiApp {
                                             .clicked()
                                             {
                                                 toggle_article_read = true;
+                                            }
+                                            if !is_web_clipping && url.is_some() {
+                                                let fulltext_busy = matches!(
+                                                    fulltext_snapshot.status,
+                                                    FullTextStatus::Fetching
+                                                ) && fulltext_snapshot
+                                                    .article_id
+                                                    == Some(article_id);
+                                                let fulltext_label = if fulltext_busy {
+                                                    "正在抓取全文…"
+                                                } else if fulltext_snapshot.status
+                                                    == FullTextStatus::Failed
+                                                    && fulltext_snapshot.article_id
+                                                        == Some(article_id)
+                                                {
+                                                    "重试抓取全文"
+                                                } else {
+                                                    "抓取全文"
+                                                };
+                                                if ui
+                                                    .add_enabled(
+                                                        !fulltext_busy,
+                                                        egui::Button::new(fulltext_label).stroke(
+                                                            egui::Stroke::new(1.0, theme.border),
+                                                        ),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    fetch_full_text = true;
+                                                }
                                             }
                                             let archive_label = if article_archived {
                                                 "已归档"
@@ -5154,6 +5247,15 @@ impl eframe::App for GuiApp {
                         Ok(()) => {}
                         Err(error) => {
                             self.notice(format!("无法提交文章 AI 任务：{error:#}"));
+                        }
+                    }
+                }
+                if fetch_full_text {
+                    if let Some(url) = url {
+                        if let Err(error) = self.fulltext_workflow.request(article_id, url) {
+                            self.notice(format!("无法启动全文抓取：{error}"));
+                        } else {
+                            self.notice("正在抓取原网页全文");
                         }
                     }
                 }

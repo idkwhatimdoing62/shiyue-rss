@@ -669,6 +669,70 @@ impl Db {
         Ok(new)
     }
 
+    /// Insert articles discovered by a historical backfill. Historical rows
+    /// start as read so a large archive import does not flood the unread
+    /// counter. URL uniqueness is checked across the library before insert;
+    /// existing rows keep their current read/star/archive state.
+    pub(crate) fn record_historical_articles(
+        &self,
+        feed: &Feed,
+        now: i64,
+        articles: &[NewArticle],
+    ) -> Result<usize> {
+        let tx = self.fenced_transaction()?;
+        let mut new = 0usize;
+        let mut impact = ProjectionImpact::none();
+        for article in articles {
+            if let Some(url) = article.url.as_deref()
+                && tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM articles WHERE url = ?1)",
+                    [url],
+                    |row| row.get::<_, bool>(0),
+                )?
+            {
+                continue;
+            }
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO articles \
+                 (feed_id, entry_id, url, title, author, published, content, is_read, fetched_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8)",
+                params![
+                    feed.id,
+                    article.entry_id,
+                    article.url,
+                    article.title,
+                    article.author,
+                    article.published,
+                    article.content,
+                    now,
+                ],
+            )?;
+            if inserted > 0 {
+                new += inserted;
+                impact = impact.with(ProjectionFamily::Article);
+            }
+        }
+        if new > 0 {
+            library_projection_revision::record(&tx, impact)?;
+        }
+        tx.commit()?;
+        Ok(new)
+    }
+
+    /// Replace an article's cached body while retaining all user state.
+    pub(crate) fn update_article_content(&self, article_id: i64, content: &str) -> Result<bool> {
+        let tx = self.fenced_transaction()?;
+        let changed = tx.execute(
+            "UPDATE articles SET content = ?2 WHERE id = ?1 AND content IS NOT ?2",
+            params![article_id, content],
+        )?;
+        if changed > 0 {
+            library_projection_revision::record(&tx, ProjectionImpact::article())?;
+        }
+        tx.commit()?;
+        Ok(changed > 0)
+    }
+
     /// 抓取失败：记录错误、指数退避、超阈值自动禁用。
     #[cfg(test)]
     pub fn record_failure(&self, feed: &Feed, now: i64, cfg: &Config, err: &str) -> Result<()> {
@@ -1154,6 +1218,42 @@ mod tests {
             .unwrap();
         assert_eq!(n, 1);
         assert_eq!(db.feeds_with_unread().unwrap()[0].1, 3);
+    }
+
+    #[test]
+    fn historical_articles_are_read_and_deduplicated_by_url() {
+        let db = mem();
+        let feed_id = db
+            .add_feed("https://www.ruanyifeng.com/blog/atom.xml", 0)
+            .unwrap();
+        let feed = db.get_feed(feed_id).unwrap();
+        let article = NewArticle {
+            entry_id: "https://example.test/history".into(),
+            url: Some("https://example.test/history".into()),
+            title: Some("历史文章".into()),
+            author: None,
+            published: None,
+            content: Some("正文".into()),
+        };
+        assert_eq!(
+            db.record_historical_articles(&feed, 1, std::slice::from_ref(&article))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.record_historical_articles(&feed, 2, std::slice::from_ref(&article))
+                .unwrap(),
+            0
+        );
+        let saved = feed_articles(&db, feed_id);
+        assert_eq!(saved.len(), 1);
+        assert!(saved[0].is_read);
+        db.update_article_content(saved[0].id, "全文").unwrap();
+        assert_eq!(
+            db.get_article(saved[0].id).unwrap().content.as_deref(),
+            Some("全文")
+        );
+        assert!(db.get_article(saved[0].id).unwrap().is_read);
     }
 
     #[test]

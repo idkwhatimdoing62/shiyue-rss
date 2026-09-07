@@ -16,12 +16,14 @@ use crate::feed_subscription::{
 };
 use crate::gui_modal::{self, InitialFocus, ModalHostAction};
 use crate::gui_state::ModalKind;
+use crate::history_backfill_workflow::{BackfillStatus, HistoryBackfillWorkflow};
 use crate::model::Feed;
 use crate::rss_refresh_workflow::RssRefreshWorkflow;
 
 pub(super) struct Dependencies<'a> {
     pub(super) database: &'a Path,
     pub(super) refresh: &'a RssRefreshWorkflow,
+    pub(super) history: &'a HistoryBackfillWorkflow,
 }
 
 #[derive(Debug)]
@@ -154,6 +156,7 @@ pub(super) fn show_panel(
 ) -> Outcome {
     let mut save = false;
     let mut close = false;
+    let mut history_action = None;
     ui.horizontal(|ui| {
         ui.heading("订阅设置");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -176,6 +179,53 @@ pub(super) fn show_panel(
             .desired_width(f32::INFINITY),
     );
     ui.weak("支持 s / m / h / d；修改间隔不会立刻抓取。");
+    if draft.url.contains("ruanyifeng.com") {
+        ui.separator();
+        ui.label(egui::RichText::new("历史文章").strong());
+        let history = dependencies.history.snapshot();
+        ui.weak(format!(
+            "按每批 {} 篇抓取，历史文章默认标记为已读。",
+            history.batch_size
+        ));
+        ui.label(format!(
+            "已发现 {} · 已处理 {} · 新增 {} · 失败 {}",
+            history.discovered, history.processed, history.inserted, history.failed
+        ));
+        ui.horizontal_wrapped(|ui| {
+            match history.status {
+                BackfillStatus::Idle | BackfillStatus::Completed | BackfillStatus::Failed => {
+                    if ui.button("开始历史回补").clicked() {
+                        history_action = Some(HistoryAction::Start);
+                    }
+                }
+                BackfillStatus::WaitingNextBatch => {
+                    if history.has_more && ui.button("抓取下一批（50 篇）").clicked() {
+                        history_action = Some(HistoryAction::Next);
+                    }
+                    if ui.button("暂停").clicked() {
+                        history_action = Some(HistoryAction::Pause);
+                    }
+                }
+                BackfillStatus::Fetching => {
+                    ui.spinner();
+                    if ui.button("暂停").clicked() {
+                        history_action = Some(HistoryAction::Pause);
+                    }
+                }
+                BackfillStatus::Paused => {
+                    if ui.button("继续").clicked() {
+                        history_action = Some(HistoryAction::Resume);
+                    }
+                }
+            }
+            if history.failed > 0 && ui.button("重试失败").clicked() {
+                history_action = Some(HistoryAction::Retry);
+            }
+        });
+        if let Some(error) = &history.last_error {
+            ui.colored_label(egui::Color32::RED, error);
+        }
+    }
     if let Some(error) = &draft.error {
         ui.add_space(8.0);
         ui.colored_label(egui::Color32::RED, error);
@@ -188,6 +238,24 @@ pub(super) fn show_panel(
     if let Some(intent) = discard_guard_controls(ui, show_discard) {
         return Outcome {
             interaction: intent,
+            ..Outcome::idle(ModalHostAction::None)
+        };
+    }
+    if let Some(action) = history_action {
+        let result = match action {
+            HistoryAction::Start => dependencies
+                .history
+                .start_feed(draft.feed_id, draft.url.clone()),
+            HistoryAction::Next => dependencies.history.next_batch(),
+            HistoryAction::Pause => dependencies.history.pause(),
+            HistoryAction::Resume => dependencies.history.resume(),
+            HistoryAction::Retry => dependencies.history.retry_failed(),
+        };
+        return Outcome {
+            notice: Some(match result {
+                Ok(()) => "历史回补任务已更新".into(),
+                Err(error) => format!("无法更新历史回补：{error}"),
+            }),
             ..Outcome::idle(ModalHostAction::None)
         };
     }
@@ -257,6 +325,15 @@ pub(super) fn show_panel(
             Outcome::idle(ModalHostAction::None)
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum HistoryAction {
+    Start,
+    Next,
+    Pause,
+    Resume,
+    Retry,
 }
 
 fn subscriptions<'a>(dependencies: &'a Dependencies<'a>) -> FeedSubscriptions<'a> {
