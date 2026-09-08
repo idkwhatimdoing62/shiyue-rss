@@ -304,12 +304,33 @@ fn append_entries(state: &mut State, entries: Vec<Entry>) {
         let identity = entry
             .article
             .url
-            .clone()
-            .unwrap_or_else(|| entry.article.entry_id.clone());
+            .as_deref()
+            .map(canonical_article_identity)
+            .unwrap_or_else(|| format!("id:{}", entry.article.entry_id));
         if state.seen_urls.insert(identity) {
             state.entries.push(entry);
         }
     }
+}
+
+/// Treat equivalent feed/archive representations as one article.
+///
+/// Archive pages commonly link to `/post`, `/post/` or `/post/index.html`,
+/// while an Atom feed may use a fragment or a redirect URL. Those are the
+/// same article for backfill purposes and must not consume another batch slot.
+fn canonical_article_identity(raw: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(raw.trim()) else {
+        return raw.trim().to_ascii_lowercase();
+    };
+    url.set_fragment(None);
+    if let Some(host) = url.host_str().map(str::to_ascii_lowercase) {
+        let _ = url.set_host(Some(&host));
+    }
+    let path = url.path().trim_end_matches('/');
+    let path = path.strip_suffix("/index.html").unwrap_or(path);
+    let path = if path.is_empty() { "/" } else { path }.to_owned();
+    url.set_path(&path);
+    url.to_string().trim_end_matches('/').to_ascii_lowercase()
 }
 
 fn append_page(
