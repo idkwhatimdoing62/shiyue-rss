@@ -72,6 +72,35 @@ pub(crate) fn discover(
         Ok(homepage) => candidates.extend(archive_candidates(&homepage.html, &homepage.final_url)),
         Err(_) => detection_failed = true,
     }
+    // Some publishers block their home page while leaving the static archive
+    // reachable. Probe a small, same-site set of conventional paths; every
+    // candidate still has to pass the article-list validation below.
+    let mut hosts = vec![base.clone()];
+    if let Some(article) = feed_page
+        .entries
+        .first()
+        .and_then(|e| e.article.url.as_deref())
+    {
+        if let Ok(article) = Url::parse(article) {
+            hosts.push(article);
+        }
+    }
+    for host in hosts {
+        for path in [
+            "/archives.html",
+            "/archive.html",
+            "/archives",
+            "/archive",
+            "/blog/archives.html",
+        ] {
+            if let Ok(candidate) = host.join(path) {
+                let candidate = candidate.to_string();
+                if same_site(&base, &candidate) && !candidates.contains(&candidate) {
+                    candidates.push_back(candidate);
+                }
+            }
+        }
+    }
     // Discovery never guesses a fixed path or recursively crawls an entire site.
     for _ in 0..6 {
         let Some(candidate) = candidates.pop_front() else {
