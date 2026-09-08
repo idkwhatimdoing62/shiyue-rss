@@ -745,6 +745,15 @@ impl Db {
         let trimmed = url.trim();
         if let Ok(mut parsed) = reqwest::Url::parse(trimmed) {
             parsed.set_fragment(None);
+            if parsed.host_str().is_some_and(|h| h.starts_with("www.")) {
+                let host = parsed
+                    .host_str()
+                    .unwrap()
+                    .trim_start_matches("www.")
+                    .to_owned();
+                let _ = parsed.set_host(Some(&host));
+            }
+            let _ = parsed.set_scheme("https");
             while parsed.path().len() > 1 && parsed.path().ends_with('/') {
                 let path = parsed.path().trim_end_matches('/').to_owned();
                 parsed.set_path(&path);

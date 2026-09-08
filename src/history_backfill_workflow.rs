@@ -472,9 +472,19 @@ fn fetch_article(
         url: Some(fetched.final_url.clone()),
         title: readable.title.or_else(|| entry.article.title.clone()),
         author: None,
-        published: extract_published(&fetched.html),
+        published: extract_published(&fetched.html).or_else(|| date_from_url(url)),
         content: Some(readable.content),
     })
+}
+
+fn date_from_url(raw: &str) -> Option<i64> {
+    let url = reqwest::Url::parse(raw).ok()?;
+    let parts: Vec<_> = url.path_segments()?.collect();
+    let year: i32 = parts.iter().find(|p| p.len() == 4)?.parse().ok()?;
+    let month: u32 = parts.iter().find(|p| p.len() == 2)?.parse().ok()?;
+    chrono::NaiveDate::from_ymd_opt(year, month, 1)?
+        .and_hms_opt(0, 0, 0)
+        .map(|d| d.and_utc().timestamp())
 }
 
 fn extract_published(html: &str) -> Option<i64> {
