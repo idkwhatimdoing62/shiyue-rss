@@ -82,11 +82,16 @@ pub(crate) fn discover(
         .and_then(|e| e.article.url.as_deref())
     {
         if let Ok(article) = Url::parse(article) {
-            hosts.push(article);
+            if !is_feed_mirror(&article) {
+                hosts.push(article);
+            }
         }
     }
-    // A mirror such as feeds.feedburner.com is not the publisher's website.
-    // Only probe the feed host when no article host is available.
+    if !is_feed_mirror(&base) && !hosts.iter().any(|host| host.host_str() == base.host_str()) {
+        hosts.push(base.clone());
+    }
+    // If the source exposes only a mirror URL, still use the source's final
+    // host as a last resort; all candidates must pass page validation.
     if hosts.is_empty() {
         hosts.push(base.clone());
     }
@@ -481,6 +486,13 @@ fn same_site(base: &Url, url: &str) -> bool {
     Url::parse(url).ok().is_some_and(|u| {
         u.host_str().map(|h| h.trim_start_matches("www."))
             == base.host_str().map(|h| h.trim_start_matches("www."))
+    })
+}
+
+fn is_feed_mirror(url: &Url) -> bool {
+    url.host_str().is_some_and(|host| {
+        let host = host.trim_start_matches("www.");
+        host == "feeds.feedburner.com" || host.starts_with("feeds.") || host.contains("feedburner")
     })
 }
 
