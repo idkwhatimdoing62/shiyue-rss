@@ -68,9 +68,13 @@ pub(crate) fn discover(
     let mut candidates = VecDeque::new();
     let mut checked = HashSet::new();
     let mut detection_failed = false;
+    let mut failures = Vec::new();
     match fetch(&home, SourceKind::Archive) {
         Ok(homepage) => candidates.extend(archive_candidates(&homepage.html, &homepage.final_url)),
-        Err(_) => detection_failed = true,
+        Err(error) => {
+            detection_failed = true;
+            failures.push(format!("{}：{}", home, error));
+        }
     }
     // Some publishers block their home page while leaving the static archive
     // reachable. Probe a small, same-site set of conventional paths; every
@@ -121,13 +125,15 @@ pub(crate) fn discover(
         }
         let document = match fetch(&candidate, SourceKind::Archive) {
             Ok(page) => page,
-            Err(_) => {
+            Err(error) => {
                 detection_failed = true;
+                failures.push(format!("{}：{}", candidate, error));
                 continue;
             }
         };
         if !same_site(&Url::parse(&candidate)?, &document.final_url) {
             detection_failed = true;
+            failures.push(format!("{}：跳转到不同站点 {}", candidate, document.final_url));
             continue;
         }
         let Ok(page) = parse_archive(&document, &samples) else {
@@ -151,11 +157,18 @@ pub(crate) fn discover(
     } else {
         "未发现可验证的归档页"
     };
-    let description = if feed_page.pages.is_empty() {
+    let mut description = if feed_page.pages.is_empty() {
         format!("{reason}；订阅源未提供历史分页，只能读取当前条目。")
     } else {
         format!("{reason}；使用 RSS/Atom 历史分页。")
     };
+    if !failures.is_empty() {
+        let details = failures.iter().take(3).cloned().collect::<Vec<_>>().join("；");
+        description.push_str(&format!(" 检测详情：{}", details));
+        if failures.len() > 3 {
+            description.push_str(&format!("；另有 {} 个候选未显示", failures.len() - 3));
+        }
+    }
     Ok((
         Pager {
             kind: SourceKind::Feed,
