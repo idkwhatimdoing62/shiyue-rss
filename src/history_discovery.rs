@@ -75,7 +75,7 @@ pub(crate) fn discover(
     // Some publishers block their home page while leaving the static archive
     // reachable. Probe a small, same-site set of conventional paths; every
     // candidate still has to pass the article-list validation below.
-    let mut hosts = vec![base.clone()];
+    let mut hosts = Vec::new();
     if let Some(article) = feed_page
         .entries
         .first()
@@ -84,6 +84,11 @@ pub(crate) fn discover(
         if let Ok(article) = Url::parse(article) {
             hosts.push(article);
         }
+    }
+    // A mirror such as feeds.feedburner.com is not the publisher's website.
+    // Only probe the feed host when no article host is available.
+    if hosts.is_empty() {
+        hosts.push(base.clone());
     }
     for host in hosts {
         for path in [
