@@ -295,7 +295,27 @@ fn fetch_source(
             }
             Err(last_error.unwrap_or_else(|| anyhow!("订阅源地址为空")))
         }
-        SourceKind::Archive => web_clip::fetch_html_with_mode(client, url, mode),
+        SourceKind::Archive => {
+            // Archive pages are frequently advertised as HTTP but redirect
+            // or block non-TLS clients. Try the secure equivalent first while
+            // retaining the discovered URL as a fallback for legacy sites.
+            let mut candidates = Vec::with_capacity(2);
+            if let Ok(mut secure) = reqwest::Url::parse(url) {
+                if secure.scheme() == "http" {
+                    let _ = secure.set_scheme("https");
+                    candidates.push(secure.to_string());
+                }
+            }
+            candidates.push(url.to_owned());
+            let mut last_error = None;
+            for candidate in candidates {
+                match web_clip::fetch_html_with_mode(client, &candidate, mode) {
+                    Ok(document) => return Ok(document),
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            Err(last_error.unwrap_or_else(|| anyhow!("归档地址为空")))
+        }
     }
 }
 
