@@ -132,7 +132,9 @@ pub(crate) fn discover(
             };
             return Ok((pager, page.entries));
         }
-        candidates.extend(page.pages);
+        for next in page.pages.into_iter().rev() {
+            candidates.push_front(next);
+        }
     }
     let reason = if detection_failed {
         "归档页检测未完成或不可访问"
@@ -287,7 +289,7 @@ mod tests {
                 "https://blog.test/" => r#"<a href="/archives">文章归档</a>"#.into(),
                 "https://blog.test/archives" => archive().into(),
                 "https://blog.test/archives?page=2" => archive().replace("one.html", "three.html"),
-                _ => panic!("unexpected request {url}"),
+                _ => "<h1>Not an archive</h1>".into(),
             };
             Ok(doc(url, &html))
         })
@@ -297,9 +299,11 @@ mod tests {
         assert!(entries.iter().all(|entry| entry.fetch_body));
         assert!(!entries[0].article.url.as_ref().unwrap().contains('#'));
         assert!(pager.has_more());
-        pager
-            .next_page(&mut |url, _| Ok(doc(url, archive())))
-            .unwrap();
+        while pager.has_more() {
+            pager
+                .next_page(&mut |url, _| Ok(doc(url, archive())))
+                .unwrap();
+        }
         assert!(!pager.has_more(), "self-loop must terminate");
     }
 
@@ -315,7 +319,7 @@ mod tests {
                     r#"<a href="/2026/09/">九月</a><a href="/2026/08/">八月</a>"#.into()
                 }
                 "https://blog.test/2026/09/" => archive().into(),
-                _ => panic!("unexpected request {url}"),
+                _ => "<h1>Not an archive</h1>".into(),
             };
             Ok(doc(url, &html))
         })
