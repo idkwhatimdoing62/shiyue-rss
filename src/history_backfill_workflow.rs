@@ -414,7 +414,7 @@ fn process_batch(
         current.cursor += 1;
         match result {
             Ok(article) => match Db::open(db_path).and_then(|db| {
-                db.record_historical_articles(
+                db.record_historical_articles_unread(
                     &db.get_feed(current.feed_id)?,
                     chrono::Utc::now().timestamp(),
                     &[article],
@@ -516,7 +516,7 @@ fn retry_failed(
     for entry in failed {
         match fetch_article(client, mode, &entry).and_then(|article| {
             Db::open(db_path).and_then(|db| {
-                db.record_historical_articles(
+                db.record_historical_articles_unread(
                     &db.get_feed(current.feed_id)?,
                     Utc::now().timestamp(),
                     &[article],

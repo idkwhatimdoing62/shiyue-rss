@@ -679,6 +679,25 @@ impl Db {
         now: i64,
         articles: &[NewArticle],
     ) -> Result<usize> {
+        self.record_historical_articles_with_read_state(feed, now, articles, true)
+    }
+
+    pub(crate) fn record_historical_articles_unread(
+        &self,
+        feed: &Feed,
+        now: i64,
+        articles: &[NewArticle],
+    ) -> Result<usize> {
+        self.record_historical_articles_with_read_state(feed, now, articles, false)
+    }
+
+    fn record_historical_articles_with_read_state(
+        &self,
+        feed: &Feed,
+        now: i64,
+        articles: &[NewArticle],
+        is_read: bool,
+    ) -> Result<usize> {
         let tx = self.fenced_transaction()?;
         let mut new = 0usize;
         let mut impact = ProjectionImpact::none();
@@ -697,7 +716,7 @@ impl Db {
             let inserted = tx.execute(
                 "INSERT OR IGNORE INTO articles \
                  (feed_id, entry_id, url, title, author, published, content, is_read, fetched_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     feed.id,
                     article.entry_id,
@@ -706,6 +725,7 @@ impl Db {
                     article.author,
                     article.published,
                     article.content,
+                    is_read,
                     now,
                 ],
             )?;
@@ -729,7 +749,11 @@ impl Db {
                 let path = parsed.path().trim_end_matches('/').to_owned();
                 parsed.set_path(&path);
             }
-            return parsed.to_string();
+            let path = parsed.path().trim_end_matches('/');
+            let path = path.strip_suffix("/index.html").unwrap_or(path);
+            let path = if path.is_empty() { "/" } else { path }.to_owned();
+            parsed.set_path(&path);
+            return parsed.to_string().to_ascii_lowercase();
         }
         trimmed.to_ascii_lowercase()
     }
