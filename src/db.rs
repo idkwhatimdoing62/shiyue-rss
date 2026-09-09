@@ -702,8 +702,9 @@ impl Db {
         let mut new = 0usize;
         let mut impact = ProjectionImpact::none();
         let mut existing_urls = std::collections::HashSet::new();
-        let mut rows = tx.prepare("SELECT url FROM articles WHERE url IS NOT NULL")?;
-        for row in rows.query_map([], |row| row.get::<_, String>(0))? {
+        let mut rows =
+            tx.prepare("SELECT url FROM articles WHERE feed_id = ?1 AND url IS NOT NULL")?;
+        for row in rows.query_map([feed.id], |row| row.get::<_, String>(0))? {
             existing_urls.insert(Self::normalize_article_url(&row?));
         }
         drop(rows);
