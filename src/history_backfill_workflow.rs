@@ -309,9 +309,20 @@ fn fetch_source(
             candidates.push(url.to_owned());
             let mut last_error = None;
             for candidate in candidates {
-                match web_clip::fetch_html_with_mode(client, &candidate, mode) {
-                    Ok(document) => return Ok(document),
-                    Err(error) => last_error = Some(error),
+                for attempt in 0..4 {
+                    match web_clip::fetch_html_with_mode(client, &candidate, mode) {
+                        Ok(document) => return Ok(document),
+                        Err(error) => {
+                            let retryable = error.to_string().contains("HTTP 429");
+                            last_error = Some(error);
+                            if !retryable || attempt == 3 {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_secs(
+                                2_u64.saturating_pow(attempt + 1),
+                            ));
+                        }
+                    }
                 }
             }
             Err(last_error.unwrap_or_else(|| anyhow!("归档地址为空")))
