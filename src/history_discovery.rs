@@ -133,7 +133,10 @@ pub(crate) fn discover(
         };
         if !same_site(&Url::parse(&candidate)?, &document.final_url) {
             detection_failed = true;
-            failures.push(format!("{}：跳转到不同站点 {}", candidate, document.final_url));
+            failures.push(format!(
+                "{}：跳转到不同站点 {}",
+                candidate, document.final_url
+            ));
             continue;
         }
         let Ok(page) = parse_archive(&document, &samples) else {
@@ -163,7 +166,12 @@ pub(crate) fn discover(
         format!("{reason}；使用 RSS/Atom 历史分页。")
     };
     if !failures.is_empty() {
-        let details = failures.iter().take(3).cloned().collect::<Vec<_>>().join("；");
+        let details = failures
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("；");
         description.push_str(&format!(" 检测详情：{}", details));
         if failures.len() > 3 {
             description.push_str(&format!("；另有 {} 个候选未显示", failures.len() - 3));
@@ -447,6 +455,44 @@ mod tests {
     }
 
     #[test]
+    fn discovers_daily_archive_and_compact_date_articles() {
+        let links = archive_candidates(
+            r#"<nav><a href="/">Home</a><a href="/Daily/">Daily</a></nav>"#,
+            "https://blog.test/",
+        );
+        assert_eq!(links, vec!["https://blog.test/Daily/"]);
+
+        let page = parse_archive(
+            &doc(
+                "https://blog.test/Daily/",
+                r#"<ul>
+                    <li><a href="/20260826/">First post</a></li>
+                    <li><a href="/20260825/">Second post</a></li>
+                </ul>"#,
+            ),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(page.entries.len(), 2);
+        assert!(page.pages.is_empty());
+        assert_eq!(
+            page.entries[0].article.published,
+            Some(
+                chrono::NaiveDate::from_ymd_opt(2026, 8, 26)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap()
+                    .and_utc()
+                    .timestamp()
+            )
+        );
+        assert_eq!(
+            date_path(&Url::parse("https://blog.test/20260826/").unwrap()),
+            (true, false)
+        );
+    }
+
+    #[test]
     fn keeps_the_single_article_on_a_final_archive_page() {
         let page = parse_archive(
             &doc(
@@ -467,7 +513,12 @@ fn archive_label(text: &str) -> bool {
         "归档",
         "历史文章",
         "按日期",
+        "日志",
+        "日记",
         "archive",
+        "daily",
+        "diary",
+        "journal",
         "所有文章",
         "全部文章",
         "往期文章",
@@ -511,6 +562,14 @@ fn is_feed_mirror(url: &Url) -> bool {
 
 fn date_path(url: &Url) -> (bool, bool) {
     let parts: Vec<_> = url.path().trim_matches('/').split('/').collect();
+    // A number of static blog generators use `/YYYYMMDD/` for article URLs
+    // (for example `/20260826/`). It is an article date, not an archive page.
+    if parts
+        .iter()
+        .any(|part| part.len() == 8 && chrono::NaiveDate::parse_from_str(part, "%Y%m%d").is_ok())
+    {
+        return (true, false);
+    }
     let date = parts.iter().position(|part| {
         part.len() == 4
             && part
@@ -523,6 +582,32 @@ fn date_path(url: &Url) -> (bool, bool) {
         part.is_empty() || *part == "index.html" || (part.len() <= 2 && part.parse::<u8>().is_ok())
     });
     (true, index)
+}
+
+fn article_date_from_path(url: &Url) -> Option<i64> {
+    let parts = url
+        .path()
+        .trim_matches('/')
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    for part in &parts {
+        if part.len() == 8 {
+            if let Ok(date) = chrono::NaiveDate::parse_from_str(part, "%Y%m%d") {
+                return date
+                    .and_hms_opt(0, 0, 0)
+                    .map(|time| time.and_utc().timestamp());
+            }
+        }
+    }
+    parts.windows(3).find_map(|window| {
+        let year = window[0].parse::<i32>().ok()?;
+        let month = window[1].parse::<u32>().ok()?;
+        let day = window[2].parse::<u32>().ok()?;
+        chrono::NaiveDate::from_ymd_opt(year, month, day)
+            .and_then(|date| date.and_hms_opt(0, 0, 0))
+            .map(|time| time.and_utc().timestamp())
+    })
 }
 
 fn parse_archive(document: &FetchedWebClip, samples: &HashSet<String>) -> Result<Page> {
@@ -610,7 +695,7 @@ fn parse_archive(document: &FetchedWebClip, samples: &HashSet<String>) -> Result
                 url: Some(url),
                 title: Some(title),
                 author: None,
-                published: None,
+                published: article_date_from_path(&parsed),
                 content: None,
             },
             fetch_body: true,

@@ -563,6 +563,7 @@ fn build_projection(
     operation: StorageOperation,
 ) -> Result<ArticleLibraryProjection, LifecycleFailure> {
     let (mut articles, fixed_bookmark_ids) = load_articles(conn, scope, operation)?;
+    sort_articles_for_display(&mut articles);
     if matches!(scope, ProjectionScope::Article(_)) && articles.is_empty() {
         let ProjectionScope::Article(id) = scope else {
             unreachable!()
@@ -591,6 +592,45 @@ fn build_projection(
         fixed_bookmark_ids,
         counts,
         feed_unread,
+    })
+}
+
+/// Keep every article collection in the same deterministic order.
+///
+/// Most feeds provide `published`, but historical pages often only expose a
+/// date in the article URL.  Falling back to that URL date prevents a batch
+/// imported later from jumping ahead of newer articles merely because its
+/// `fetched_at` is newer.
+fn sort_articles_for_display(articles: &mut [Article]) {
+    articles.sort_by(|left, right| {
+        article_sort_timestamp(right)
+            .cmp(&article_sort_timestamp(left))
+            .then_with(|| right.id.cmp(&left.id))
+    });
+}
+
+fn article_sort_timestamp(article: &Article) -> i64 {
+    article
+        .published
+        .or_else(|| article_url_month(article.url.as_deref()))
+        .unwrap_or(article.fetched_at)
+}
+
+fn article_url_month(raw: Option<&str>) -> Option<i64> {
+    let url = reqwest::Url::parse(raw?).ok()?;
+    let segments = url.path_segments()?.collect::<Vec<_>>();
+    segments.windows(2).find_map(|window| {
+        let year = window[0]
+            .parse::<i32>()
+            .ok()
+            .filter(|year| (1900..=2100).contains(year))?;
+        let month = window[1]
+            .parse::<u32>()
+            .ok()
+            .filter(|month| (1..=12).contains(month))?;
+        chrono::NaiveDate::from_ymd_opt(year, month, 1)
+            .and_then(|date| date.and_hms_opt(0, 0, 0))
+            .map(|date| date.and_utc().timestamp())
     })
 }
 
@@ -889,6 +929,41 @@ mod tests {
             self.db.take();
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn display_order_uses_article_date_before_fetch_time() {
+        let article =
+            |id: i64, url: Option<&str>, published: Option<i64>, fetched_at: i64| Article {
+                id,
+                feed_id: 1,
+                entry_id: id.to_string(),
+                url: url.map(str::to_owned),
+                title: None,
+                author: None,
+                published,
+                content: None,
+                is_read: false,
+                starred: false,
+                read_later: false,
+                archived: false,
+                fetched_at,
+            };
+        let mut articles = vec![
+            article(1, Some("https://example.com/2026/08/old"), None, 900),
+            article(2, Some("https://example.com/2026/09/new"), None, 100),
+            article(3, None, Some(1_800_000_000), 1_000),
+        ];
+
+        sort_articles_for_display(&mut articles);
+
+        assert_eq!(
+            articles
+                .iter()
+                .map(|article| article.id)
+                .collect::<Vec<_>>(),
+            vec![3, 2, 1]
+        );
     }
 
     #[test]

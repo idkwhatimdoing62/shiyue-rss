@@ -32,7 +32,10 @@ pub(super) fn native_options() -> eframe::NativeOptions {
             .with_app_id("rrss-reading-optimized")
             .with_icon(application_icon())
             .with_inner_size([1440.0, 860.0])
-            .with_min_inner_size([1120.0, 680.0]),
+            // Keep the three-column reader usable on smaller laptop windows.
+            // Individual panels remain resizable, so this is a safety floor rather
+            // than a fixed desktop composition.
+            .with_min_inner_size([980.0, 620.0]),
         ..Default::default()
     }
 }
@@ -50,11 +53,16 @@ pub(super) fn install(ctx: &egui::Context) {
             egui::FontData::from_owned(bytes.to_vec()).into(),
         );
     }
-    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        let names = fonts.families.entry(family).or_default();
-        names.insert(0, "lxgw-wenkai-medium".to_owned());
-        names.insert(0, "jb-mono".to_owned());
-    }
+    // JetBrains Mono owns Latin glyphs; LXGW WenKai is the CJK fallback.
+    // Keep the order explicit instead of relying on repeated `insert(0, ...)`
+    // calls, which made this easy to regress when another fallback was added.
+    let reader_fallback = vec!["jb-mono".to_owned(), "lxgw-wenkai".to_owned()];
+    fonts
+        .families
+        .insert(egui::FontFamily::Proportional, reader_fallback.clone());
+    fonts
+        .families
+        .insert(egui::FontFamily::Monospace, reader_fallback);
     fonts.families.insert(
         egui::FontFamily::Name("cjk-bold".into()),
         vec!["jb-mono-bold".to_owned(), "lxgw-wenkai-medium".to_owned()],

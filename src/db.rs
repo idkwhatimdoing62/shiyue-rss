@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
@@ -702,15 +703,57 @@ impl Db {
         let mut new = 0usize;
         let mut impact = ProjectionImpact::none();
         let mut existing_urls = std::collections::HashSet::new();
-        let mut rows =
-            tx.prepare("SELECT url FROM articles WHERE feed_id = ?1 AND url IS NOT NULL")?;
-        for row in rows.query_map([feed.id], |row| row.get::<_, String>(0))? {
-            existing_urls.insert(Self::normalize_article_url(&row?));
+        let mut existing_articles = HashMap::new();
+        let mut rows = tx.prepare(
+            "SELECT id, url, published, author FROM articles WHERE feed_id = ?1 AND url IS NOT NULL",
+        )?;
+        for row in rows.query_map([feed.id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })? {
+            let (id, url, published, author) = row?;
+            let normalized = Self::normalize_article_url(&url);
+            existing_urls.insert(normalized.clone());
+            existing_articles.insert(normalized, (id, published, author));
         }
         drop(rows);
         for article in articles {
             if let Some(url) = article.url.as_deref() {
-                if !existing_urls.insert(Self::normalize_article_url(url)) {
+                let normalized = Self::normalize_article_url(url);
+                if let Some((id, published, author)) = existing_articles.get_mut(&normalized) {
+                    if let Some(article_published) = article.published
+                        && *published != Some(article_published)
+                    {
+                        tx.execute(
+                            "UPDATE articles SET published = ?2 WHERE id = ?1",
+                            params![*id, article_published],
+                        )?;
+                        *published = Some(article_published);
+                        impact = impact.with(ProjectionFamily::Article);
+                    }
+                    if author
+                        .as_deref()
+                        .is_none_or(|author| author.trim().is_empty())
+                        && let Some(new_author) = article
+                            .author
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|author| !author.is_empty())
+                    {
+                        tx.execute(
+                            "UPDATE articles SET author = ?2 WHERE id = ?1",
+                            params![*id, new_author],
+                        )?;
+                        *author = Some(new_author.to_owned());
+                        impact = impact.with(ProjectionFamily::Article);
+                    }
+                    continue;
+                }
+                if !existing_urls.insert(normalized) {
                     continue;
                 }
             }
@@ -735,7 +778,7 @@ impl Db {
                 impact = impact.with(ProjectionFamily::Article);
             }
         }
-        if new > 0 {
+        if !impact.is_empty() {
             library_projection_revision::record(&tx, impact)?;
         }
         tx.commit()?;
@@ -1290,13 +1333,34 @@ mod tests {
             1
         );
         assert_eq!(
-            db.record_historical_articles(&feed, 2, std::slice::from_ref(&article))
-                .unwrap(),
+            db.record_historical_articles(
+                &feed,
+                2,
+                std::slice::from_ref(&NewArticle {
+                    published: Some(123),
+                    ..article.clone()
+                }),
+            )
+            .unwrap(),
             0
         );
         let saved = feed_articles(&db, feed_id);
         assert_eq!(saved.len(), 1);
         assert!(saved[0].is_read);
+        assert_eq!(saved[0].published, Some(123));
+        assert_eq!(
+            db.record_historical_articles(
+                &feed,
+                3,
+                std::slice::from_ref(&NewArticle {
+                    published: Some(456),
+                    ..article.clone()
+                }),
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(feed_articles(&db, feed_id)[0].published, Some(456));
         db.update_article_content(saved[0].id, "全文").unwrap();
         assert_eq!(
             db.get_article(saved[0].id).unwrap().content.as_deref(),

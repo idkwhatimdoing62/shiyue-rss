@@ -491,52 +491,181 @@ fn fetch_article(
             },
         )
         .ok_or_else(|| last_error.unwrap_or_else(|| anyhow!("正文抓取失败")))?;
+    article_from_document(entry, &fetched)
+}
+
+fn article_from_document(entry: &Entry, fetched: &web_clip::FetchedWebClip) -> Result<NewArticle> {
     let readable = prepare_article_html(&fetched.html);
     if readable.content.trim().is_empty() {
         return Err(anyhow!("没有提取到正文"));
     }
+    let (author, published) = extract_metadata(&fetched.html);
     Ok(NewArticle {
         entry_id: fetched.final_url.clone(),
         url: Some(fetched.final_url.clone()),
         title: readable.title.or_else(|| entry.article.title.clone()),
-        author: None,
-        published: extract_published(&fetched.html).or_else(|| date_from_url(url)),
+        author: author.or_else(|| entry.article.author.clone()),
+        // Preserve archive metadata when a page omits it; a month alone is not a publication date.
+        published: published
+            .or(entry.article.published)
+            .or_else(|| date_from_url(&fetched.final_url))
+            .or_else(|| entry.article.url.as_deref().and_then(date_from_url)),
         content: Some(readable.content),
     })
 }
 
 fn date_from_url(raw: &str) -> Option<i64> {
     let url = reqwest::Url::parse(raw).ok()?;
-    let parts: Vec<_> = url.path_segments()?.collect();
-    let year: i32 = parts.iter().find(|p| p.len() == 4)?.parse().ok()?;
-    let month: u32 = parts.iter().find(|p| p.len() == 2)?.parse().ok()?;
-    chrono::NaiveDate::from_ymd_opt(year, month, 1)?
-        .and_hms_opt(0, 0, 0)
-        .map(|d| d.and_utc().timestamp())
+    let parts: Vec<_> = url
+        .path_segments()?
+        .filter(|part| !part.is_empty())
+        .collect();
+    for part in &parts {
+        if part.len() == 8 {
+            if let Ok(date) = chrono::NaiveDate::parse_from_str(part, "%Y%m%d") {
+                return date
+                    .and_hms_opt(0, 0, 0)
+                    .map(|time| time.and_utc().timestamp());
+            }
+        }
+    }
+    if let Some(date) = parts.windows(3).find_map(|window| {
+        let year = window[0].parse::<i32>().ok()?;
+        let month = window[1].parse::<u32>().ok()?;
+        let day = window[2].parse::<u32>().ok()?;
+        chrono::NaiveDate::from_ymd_opt(year, month, day)
+    }) {
+        return date
+            .and_hms_opt(0, 0, 0)
+            .map(|time| time.and_utc().timestamp());
+    }
+    None
 }
 
-fn extract_published(html: &str) -> Option<i64> {
+fn extract_metadata(html: &str) -> (Option<String>, Option<i64>) {
     let document = scraper::Html::parse_document(html);
-    let meta =
-        scraper::Selector::parse("meta[property='article:published_time'], meta[name='date']")
-            .ok()?;
-    let time = scraper::Selector::parse("time[datetime]").ok()?;
-    document
-        .select(&meta)
-        .filter_map(|node| node.value().attr("content"))
-        .chain(
-            document
-                .select(&time)
-                .filter_map(|node| node.value().attr("datetime")),
-        )
-        .find_map(|value| {
-            chrono::DateTime::parse_from_rfc3339(value)
-                .map(|date| date.timestamp())
-                .or_else(|_| {
-                    chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
-                        .map(|date| date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp())
+    let date_selectors = [
+        "meta[property='article:published_time'], meta[name='date']",
+        "[itemprop~='datePublished']",
+        "abbr.published, .dt-published, time.published, .published[datetime], .published[title]",
+        "time[datetime]:not(.updated):not([itemprop~='dateModified'])",
+    ];
+    let published = date_selectors.iter().find_map(|selector| {
+        let selector = scraper::Selector::parse(selector).unwrap();
+        document
+            .select(&selector)
+            .filter(is_article_metadata)
+            .find_map(|node| parse_published_value(&metadata_value(node)))
+    });
+    let author_selectors = [
+        "meta[name='author']",
+        "[itemprop~='author'] [itemprop~='name'], .author .fn",
+        "[rel~='author'], .p-author, [itemprop~='author']",
+    ];
+    let author = author_selectors.iter().find_map(|selector| {
+        let selector = scraper::Selector::parse(selector).unwrap();
+        document
+            .select(&selector)
+            .filter(is_article_metadata)
+            .find_map(|node| clean_author(&metadata_value(node)))
+    });
+    let json_selector = scraper::Selector::parse("script[type='application/ld+json']").unwrap();
+    let mut json_author = None;
+    let mut json_date = None;
+    for node in document.select(&json_selector) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&node.inner_html()) {
+            if let Some(article) = json_article(&value) {
+                json_author =
+                    json_author.or_else(|| article.get("author").and_then(json_author_name));
+                json_date = json_date.or_else(|| {
+                    article
+                        .get("datePublished")?
+                        .as_str()
+                        .and_then(parse_published_value)
+                });
+            }
+        }
+    }
+    (author.or(json_author), published.or(json_date))
+}
+
+fn is_article_metadata(node: &scraper::ElementRef<'_>) -> bool {
+    !node
+        .ancestors()
+        .filter_map(scraper::ElementRef::wrap)
+        .any(|ancestor| {
+            ancestor
+                .value()
+                .classes()
+                .chain(ancestor.value().id())
+                .any(|token| {
+                    let token = token.to_ascii_lowercase();
+                    token.contains("comment") || token.contains("reply") || token == "related-posts"
                 })
+        })
+}
+
+fn metadata_value(node: scraper::ElementRef<'_>) -> String {
+    ["content", "datetime", "title"]
+        .iter()
+        .find_map(|attribute| node.value().attr(attribute))
+        .map(str::to_owned)
+        .unwrap_or_else(|| node.text().collect::<String>())
+}
+
+fn clean_author(value: &str) -> Option<String> {
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!value.is_empty() && value.chars().count() <= 120 && !value.starts_with("http"))
+        .then_some(value)
+}
+
+fn json_article(value: &serde_json::Value) -> Option<&serde_json::Value> {
+    if let Some(values) = value.as_array() {
+        return values.iter().find_map(json_article);
+    }
+    let article_type = |kind: &str| {
+        let kind = kind.to_ascii_lowercase();
+        kind.ends_with("article") || kind == "blogposting"
+    };
+    if value.get("@type").is_some_and(|kind| {
+        kind.as_str().is_some_and(article_type)
+            || kind.as_array().is_some_and(|kinds| {
+                kinds
+                    .iter()
+                    .filter_map(|kind| kind.as_str())
+                    .any(article_type)
+            })
+    }) {
+        return Some(value);
+    }
+    value.get("@graph").and_then(json_article)
+}
+
+fn json_author_name(value: &serde_json::Value) -> Option<String> {
+    if let Some(values) = value.as_array() {
+        return values.iter().find_map(json_author_name);
+    }
+    value
+        .as_str()
+        .or_else(|| value.get("name")?.as_str())
+        .and_then(clean_author)
+}
+
+fn parse_published_value(value: &str) -> Option<i64> {
+    let value = value.trim();
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|date| date.timestamp())
+        .or_else(|| {
+            chrono::DateTime::parse_from_str(value, "%Y-%m-%dT%H:%M%#z")
                 .ok()
+                .map(|date| date.timestamp())
+        })
+        .or_else(|| {
+            chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                .ok()
+                .and_then(|date| date.and_hms_opt(0, 0, 0))
+                .map(|date| date.and_utc().timestamp())
         })
 }
 
@@ -619,4 +748,58 @@ fn fail_snapshot(snapshot: &Arc<Mutex<BackfillSnapshot>>, error: String) {
 fn notify(notice_tx: &Sender<BackfillNotice>, repaint: &Arc<dyn Fn() + Send + Sync>) {
     let _ = notice_tx.send(BackfillNotice::Changed);
     repaint();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{date_from_url, extract_metadata};
+
+    #[test]
+    fn date_from_url_supports_compact_article_dates() {
+        let expected = chrono::NaiveDate::from_ymd_opt(2026, 8, 26)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        assert_eq!(
+            date_from_url("https://blog.solazy.me/20260826/"),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn date_from_url_supports_segmented_article_dates() {
+        let expected = chrono::NaiveDate::from_ymd_opt(2026, 8, 26)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        assert_eq!(
+            date_from_url("https://example.com/2026/08/26/article"),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn date_from_url_does_not_fabricate_a_day_from_year_and_month() {
+        assert_eq!(date_from_url("https://example.com/2026/08/article"), None);
+    }
+
+    #[test]
+    fn metadata_parser_reads_common_author_and_published_markup() {
+        let (author, published) = extract_metadata(
+            r#"<p class="vcard author">作者：<a class="fn">阮一峰</a></p>
+               <abbr class="published" title="2026-08-07T08:08:27+08:00">2026年8月7日</abbr>"#,
+        );
+        assert_eq!(author.as_deref(), Some("阮一峰"));
+        assert_eq!(published, Some(1786061307));
+    }
+
+    #[test]
+    fn metadata_parser_reads_minute_precision_datetime() {
+        let (_, published) = extract_metadata(r#"<time datetime="2026-08-26T15:00Z">"#);
+        assert_eq!(published, Some(1787756400));
+    }
 }

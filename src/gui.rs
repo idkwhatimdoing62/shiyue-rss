@@ -68,11 +68,11 @@ use crate::web_clipping_lifecycle::{
     CaptureFailureKind, CaptureId, CaptureSnapshot, CaptureState, WebClippingLifecycle,
 };
 
-const FEED_PANEL_WIDTH: f32 = 240.0;
-const ARTICLE_PANEL_WIDTH: f32 = 340.0;
-const ARTICLE_MAX_WIDTH: f32 = 820.0;
+const FEED_PANEL_WIDTH: f32 = 224.0;
+const ARTICLE_PANEL_WIDTH: f32 = 320.0;
+const ARTICLE_MAX_WIDTH: f32 = 780.0;
 const RESOURCE_CARD_HEIGHT: f32 = 216.0;
-const ARTICLE_ROW_HEIGHT: f32 = 68.0;
+const ARTICLE_ROW_HEIGHT: f32 = 60.0;
 const FEED_ROW_HEIGHT: f32 = 38.0;
 
 // ---------- App ----------
@@ -3921,7 +3921,7 @@ impl eframe::App for GuiApp {
                         color: if saved_articles_visible {
                             theme.text
                         } else {
-                            theme.accent
+                            theme.muted
                         },
                         selected_fill: theme.selected_bg,
                         width: navigation_width,
@@ -3944,7 +3944,7 @@ impl eframe::App for GuiApp {
                         color: if resources_visible {
                             theme.text
                         } else {
-                            theme.accent
+                            theme.muted
                         },
                         selected_fill: theme.selected_bg,
                         width: navigation_width,
@@ -3993,7 +3993,7 @@ impl eframe::App for GuiApp {
                         color: if excerpts_visible {
                             theme.text
                         } else {
-                            theme.accent
+                            theme.muted
                         },
                         selected_fill: theme.selected_bg,
                         width: navigation_width,
@@ -4374,6 +4374,15 @@ impl eframe::App for GuiApp {
                 article_freshness,
                 Some(ProjectionFreshness::Loading | ProjectionFreshness::Refreshing)
             );
+        let feed_name_by_id = self
+            .feeds
+            .iter()
+            .filter_map(|feed| {
+                feed.title
+                    .as_deref()
+                    .map(|title| (feed.id, title.to_owned()))
+            })
+            .collect::<HashMap<_, _>>();
         egui::Panel::left("articles")
             .default_size(ARTICLE_PANEL_WIDTH)
             .size_range(280.0..=520.0)
@@ -4616,28 +4625,33 @@ impl eframe::App for GuiApp {
                                     }
                                 }
                             });
-                            let meta = match (a.author.as_deref(), a.published) {
-                                (Some(author), Some(ts)) => {
+                            let source_name = feed_name_by_id.get(&a.feed_id).map(String::as_str);
+                            let meta = match (a.author.as_deref(), a.published, source_name) {
+                                (Some(author), Some(ts), _) => {
                                     format!("{author}  ·  {}", format_timestamp(ts))
                                 }
-                                (Some(author), None) => author.to_string(),
-                                (None, Some(ts)) => format_timestamp(ts),
-                                (None, None) => String::new(),
+                                (Some(author), None, _) => author.to_string(),
+                                (None, Some(ts), Some(source)) => {
+                                    format!("{source}  ·  {}", format_timestamp(ts))
+                                }
+                                (None, Some(ts), None) => format_timestamp(ts),
+                                (None, None, Some(source)) => source.to_owned(),
+                                (None, None, None) => String::new(),
                             };
                             if !meta.is_empty() {
                                 ui.add_sized(
                                     egui::vec2(ui.available_width(), 18.0),
                                     egui::Label::new(
-                                        egui::RichText::new(meta).size(12.5).color(theme.subtle),
+                                        egui::RichText::new(meta).size(12.0).color(theme.subtle),
                                     )
                                     .truncate(),
                                 );
                             } else {
-                                // show_rows assumes 68 points for every row, including
-                                // historical entries whose source has no date or author.
-                                ui.add_space(18.0);
+                                // Keep the virtual row height stable even when a source
+                                // has no author/date metadata.
+                                ui.add_space(16.0);
                             }
-                            ui.add_space(ARTICLE_ROW_HEIGHT - 38.0 - 18.0);
+                            ui.add_space(ARTICLE_ROW_HEIGHT - 38.0 - 16.0);
                         }
                     });
             });

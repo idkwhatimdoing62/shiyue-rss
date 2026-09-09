@@ -27,11 +27,12 @@ impl ReaderTheme {
             canvas: egui::Color32::from_rgb(247, 248, 250),
             panel: egui::Color32::from_rgb(255, 255, 255),
             text: egui::Color32::from_rgb(31, 41, 51),
-            muted: egui::Color32::from_rgb(91, 103, 115),
-            // Metadata should recede behind titles without becoming disabled-looking.
-            subtle: egui::Color32::from_rgb(132, 143, 155),
-            accent: egui::Color32::from_rgb(235, 103, 93),
-            link: egui::Color32::from_rgb(201, 67, 58),
+            muted: egui::Color32::from_rgb(82, 94, 106),
+            // Metadata stays quiet, but remains readable at small sizes on white.
+            subtle: egui::Color32::from_rgb(99, 110, 122),
+            // The accent is intentionally dark enough for text and focus indicators.
+            accent: egui::Color32::from_rgb(183, 70, 62),
+            link: egui::Color32::from_rgb(177, 58, 49),
             border: egui::Color32::from_rgb(218, 224, 230),
             code_bg: egui::Color32::from_rgb(241, 244, 247),
             selected_bg: egui::Color32::from_rgb(255, 239, 236),
