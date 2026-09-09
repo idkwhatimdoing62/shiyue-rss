@@ -473,7 +473,24 @@ fn fetch_article(
         .url
         .as_deref()
         .ok_or_else(|| anyhow!("文章地址缺失"))?;
-    let fetched = web_clip::fetch_html_with_mode(client, url, mode)?;
+    let mut last_error = None;
+    let fetched = (0..4)
+        .find_map(
+            |attempt| match web_clip::fetch_html_with_mode(client, url, mode) {
+                Ok(document) => Some(document),
+                Err(error) => {
+                    let retryable = error.to_string().contains("HTTP 429");
+                    last_error = Some(error);
+                    if retryable && attempt < 3 {
+                        std::thread::sleep(std::time::Duration::from_secs(
+                            2_u64.saturating_pow(attempt + 1),
+                        ));
+                    }
+                    None
+                }
+            },
+        )
+        .ok_or_else(|| last_error.unwrap_or_else(|| anyhow!("正文抓取失败")))?;
     let readable = prepare_article_html(&fetched.html);
     if readable.content.trim().is_empty() {
         return Err(anyhow!("没有提取到正文"));
